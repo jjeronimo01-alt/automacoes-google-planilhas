@@ -807,7 +807,7 @@ function carregarIdsExcluidos(ss) {
 
 /**
  * FORMATAÇÃO VISUAL EXECUTIVA DA MATRIZ OPERACIONAL
- * Aplica tipografia uniforme, centraliza percentuais e colore a Coluna V.
+ * Aplica negrito e cores de fundo destacadas nas colunas-chave: A, C, H, M, P, S, T.
  */
 function aplicarEstiloVisualMatriz(sheet, startRow, numRows) {
   if (numRows <= 0) return;
@@ -815,7 +815,7 @@ function aplicarEstiloVisualMatriz(sheet, startRow, numRows) {
   const totalColunas = 22;
   const rangeTotal = sheet.getRange(startRow, 1, numRows, totalColunas);
 
-  // 1. Higienização Base (limpa resquícios visuais e define padrão tipográfico)
+  // 1. Higienização Base: limpa resquícios e define o padrão das colunas comuns
   rangeTotal
     .setFontFamily("Segoe UI")
     .setFontSize(10)
@@ -834,7 +834,7 @@ function aplicarEstiloVisualMatriz(sheet, startRow, numRows) {
   sheet.getRange(startRow, 4, numRows, 1).setHorizontalAlignment("left");   // Título do Anúncio (D)
   sheet.getRange(startRow, 21, numRows, 1).setHorizontalAlignment("left");  // Plano de Ação 5W2H (U)
 
-  // Métricas Financeiras e Volumes Inteiros: Direita
+  // Métricas Financeiras e Volumes: Direita
   sheet.getRange(startRow, 8, numRows, 4).setHorizontalAlignment("right");  // Preço (H), CMV (I), Comissão (J), Frete (K)
   sheet.getRange(startRow, 12, numRows, 1).setHorizontalAlignment("right"); // Margem R$ (L)
   sheet.getRange(startRow, 14, numRows, 2).setHorizontalAlignment("right"); // Visitas (N), Vendas (O)
@@ -856,12 +856,46 @@ function aplicarEstiloVisualMatriz(sheet, startRow, numRows) {
   sheet.getRange(startRow, 18, numRows, 1).setNumberFormat("#,##0");        // Coluna R
   sheet.getRange(startRow, 19, numRows, 1).setNumberFormat("0.00%");        // Coluna S
 
-  // 4. Negritos Estratégicos (Colunas-Chave para Tomada de Decisão)
-  sheet.getRange(startRow, 3, numRows, 1).setFontWeight("bold");            // SKU Principal (C)
-  sheet.getRange(startRow, 12, numRows, 1).setFontWeight("bold");           // Margem R$ (L)
-  sheet.getRange(startRow, 15, numRows, 2).setFontWeight("bold");           // Vendas (O) e CVR % (P)
-  sheet.getRange(startRow, 20, numRows, 1).setFontWeight("bold");           // Classificação CX (T)
-  sheet.getRange(startRow, 22, numRows, 1).setFontWeight("bold");           // Situação (V)
+  // 4. DESTAQUE VISUAL DAS COLUNAS-CHAVE (Negrito + Cor de Fundo Chamativa)
+  // Coluna A (1): Canal
+  sheet.getRange(startRow, 1, numRows, 1)
+    .setFontWeight("bold")
+    .setBackground("#F1F5F9"); // Cinza ardósia suave
+
+  // Coluna C (3): SKU Principal
+  sheet.getRange(startRow, 3, numRows, 1)
+    .setFontWeight("bold")
+    .setBackground("#E0E7FF"); // Azul anil suave
+
+  // Coluna H (8): Preço de Venda (R$)
+  sheet.getRange(startRow, 8, numRows, 1)
+    .setFontWeight("bold")
+    .setBackground("#DCFCE7"); // Verde esmeralda suave
+
+  // Coluna M (13): Margem Contribuição (%)
+  sheet.getRange(startRow, 13, numRows, 1)
+    .setFontWeight("bold")
+    .setBackground("#D1FAE5"); // Verde menta vibrante
+
+  // Coluna P (16): Taxa Conversão (CVR %)
+  sheet.getRange(startRow, 16, numRows, 1)
+    .setFontWeight("bold")
+    .setBackground("#FEF3C7"); // Âmbar/Dourado suave
+
+  // Coluna S (19): Taxa Devolução (%)
+  sheet.getRange(startRow, 19, numRows, 1)
+    .setFontWeight("bold")
+    .setBackground("#FEE2E2"); // Coral/Vermelho suave para alerta de CX
+
+  // Coluna T (20): Classificação CX
+  sheet.getRange(startRow, 20, numRows, 1)
+    .setFontWeight("bold")
+    .setBackground("#EDE9FE"); // Roxo/Lilás suave
+
+  // Destaque adicional em negrito para métricas de apoio
+  sheet.getRange(startRow, 12, numRows, 1).setFontWeight("bold"); // Margem R$ (L)
+  sheet.getRange(startRow, 15, numRows, 1).setFontWeight("bold"); // Vendas Unidades (O)
+  sheet.getRange(startRow, 22, numRows, 1).setFontWeight("bold"); // Situação (V)
 
   // 5. Cores Semânticas de Fundo na Coluna V (Situação Operacional)
   const rangeSituacao = sheet.getRange(startRow, 22, numRows, 1);
@@ -872,20 +906,20 @@ function aplicarEstiloVisualMatriz(sheet, startRow, numRows) {
     const status = String(valoresSituacao[i][0] || '').toLowerCase();
 
     if (status.includes("validado") || status.includes("estável")) {
-      coresFundo.push(["#ECFDF5"]); // Verde suave
+      coresFundo.push(["#ECFDF5"]); // Verde
     } else if (status.includes("teste") || status.includes("otimiz")) {
-      coresFundo.push(["#FEF3C7"]); // Amarelo suave
+      coresFundo.push(["#FEF3C7"]); // Amarelo
     } else if (status.includes("exclu") || status.includes("descontinu")) {
-      coresFundo.push(["#FEE2E2"]); // Vermelho suave
+      coresFundo.push(["#FEE2E2"]); // Vermelho
     } else if (status.includes("esgotado") || status.includes("pausado")) {
-      coresFundo.push(["#E0E7FF"]); // Índigo/Azul suave
+      coresFundo.push(["#E0E7FF"]); // Azul
     } else {
-      coresFundo.push(["#F3F4F6"]); // Cinza neutro
+      coresFundo.push(["#F3F4F6"]); // Cinza
     }
   }
   rangeSituacao.setBackgrounds(coresFundo);
 
-  // 6. Bordas Sutis e Ajuste de Altura de Linha
+  // 6. Bordas Sutis e Altura Padrão de Linha
   rangeTotal.setBorder(true, true, true, true, true, true, "#E5E7EB", SpreadsheetApp.BorderStyle.SOLID);
   for (let r = 0; r < numRows; r++) {
     sheet.setRowHeight(startRow + r, 28);

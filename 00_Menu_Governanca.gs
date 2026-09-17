@@ -1,6 +1,6 @@
 /**
  * ARQUIVO: 00_Menu_Governanca.gs
- * RESPONSABILIDADE: Governança, Disparo em Lote de Testes A/B e Arquivamento Definitivo
+ * RESPONSABILIDADE: Menu de Governança, Disparo de Testes A/B com Prompt Dinâmico e Arquivamento
  */
 
 function onOpen() {
@@ -15,6 +15,9 @@ function onOpen() {
     .addToUi();
 }
 
+/**
+ * Fotografa anúncios em teste e pergunta a tipologia e a hipótese do lote via prompt
+ */
 function abrirTestesABEmLote() {
   const ss = SpreadsheetApp.getActiveSpreadsheet();
   const sheetMatriz = ss.getSheetByName('Matriz Operacional');
@@ -28,21 +31,50 @@ function abrirTestesABEmLote() {
 
   const lastRowMatriz = sheetMatriz.getLastRow();
   if (lastRowMatriz < 8) {
-    ui.alert("Aviso: Nenhum anúncio encontrado na Matriz Operacional para teste.");
+    ui.alert("Aviso: Nenhum dado encontrado na Matriz Operacional.");
     return;
   }
 
-  const dadosMatriz = sheetMatriz.getRange(8, 1, lastRowMatriz - 7, 22).getValues();
+  // 1. Identifica anúncios marcados na Coluna V como Teste A/B ou Em Otimização
+  const rangeMatriz = sheetMatriz.getRange(8, 1, lastRowMatriz - 7, 22).getValues();
+  const candidatos = [];
+
+  for (let i = 0; i < rangeMatriz.length; i++) {
+    const row = rangeMatriz[i];
+    const situacao = String(row[21] || '').trim().toLowerCase();
+    const idAnuncio = String(row[1] || '').trim();
+
+    if ((situacao.includes("teste") || situacao.includes("otimiz")) && idAnuncio) {
+      candidatos.push({
+        linhaOriginal: 8 + i,
+        canal: row[0],
+        idAnuncio: idAnuncio,
+        sku: row[2],
+        titulo: row[3],
+        cvrBase: Number(row[15]) || 0
+      });
+    }
+  }
+
+  if (candidatos.length === 0) {
+    ui.alert(
+      "Nenhum anúncio elegível encontrado!\n\n" +
+      "Para abrir um lote de testes, marque a Coluna V ('Situação') dos anúncios na Matriz como '🧪 Teste A/B Ativo' ou '🟡 Em Otimização' e tente novamente."
+    );
+    return;
+  }
+
+  // 2. Coleta o maior ID de experimento existente no Log
   const lastRowLog = sheetLog.getLastRow();
-  const idsEmTesteAberto = new Set();
   let proximoNumeroExp = 1;
+  const idsEmTesteAberto = new Set();
 
   if (lastRowLog >= 4) {
     const dadosLog = sheetLog.getRange(4, 1, lastRowLog - 3, 17).getValues();
-    dadosLog.forEach(row => {
-      const expId = String(row[0] || '').trim();
-      const idAnuncio = String(row[1] || '').trim();
-      const veredito = String(row[16] || '').toLowerCase();
+    dadosLog.forEach(r => {
+      const expId = String(r[0] || '').trim();
+      const idAnuncio = String(r[1] || '').trim();
+      const veredito = String(r[16] || '').toLowerCase();
 
       const match = expId.match(/EXP-(\d+)/i);
       if (match) {
@@ -56,80 +88,105 @@ function abrirTestesABEmLote() {
     });
   }
 
-  const loteParaCadastrar = [];
-  const hojeFormatado = Utilities.formatDate(new Date(), "America/Sao_Paulo", "yyyy-MM-dd");
+  // Filtra itens que já não estejam em teste aberto
+  const loteFinal = candidatos.filter(item => !idsEmTesteAberto.has(item.idAnuncio));
 
-  for (let i = 0; i < dadosMatriz.length; i++) {
-    const row = dadosMatriz[i];
-    const canal = row[0];
-    const idAnuncio = String(row[1] || '').trim();
-    const sku = row[2];
-    const titulo = row[3];
-    const cvrBase = Number(row[15]) || 0;
-    const situacao = String(row[21] || '').toLowerCase(); // Coluna V: Situação
-
-    if ((situacao.includes("teste") || situacao.includes("otimiza")) && idAnuncio) {
-      if (idsEmTesteAberto.has(idAnuncio)) continue;
-
-      const expFormatado = "EXP-" + String(proximoNumeroExp).padStart(3, '0');
-      proximoNumeroExp++;
-
-      const linhaLogDestino = lastRowLog < 4 ? 4 + loteParaCadastrar.length : lastRowLog + 1 + loteParaCadastrar.length;
-
-      const formulaDelta = `=SE(E(L${linhaLogDestino}<>"";M${linhaLogDestino}<>""); M${linhaLogDestino}-L${linhaLogDestino}; "")`;
-      const formulaLift = `=SE(E(L${linhaLogDestino}>0;M${linhaLogDestino}<>""); (M${linhaLogDestino}-L${linhaLogDestino})/L${linhaLogDestino}; "")`;
-
-      loteParaCadastrar.push([
-        expFormatado,
-        idAnuncio,
-        sku,
-        titulo,
-        canal,
-        "Foto Hero",
-        "Otimização visual de foto para estancar Vazamento de Funil",
-        "",
-        "",
-        hojeFormatado,
-        "",
-        cvrBase,
-        "",
-        formulaDelta,
-        formulaLift,
-        "",
-        "🟡 Em Andamento",
-        "Aguardando janela de maturação decendial"
-      ]);
-    }
-  }
-
-  if (loteParaCadastrar.length === 0) {
-    ui.alert(
-      "Nenhum anúncio elegível encontrado!\n\n" +
-      "Para abrir testes em lote, marque a Coluna V ('Situação') dos anúncios na Matriz como '🧪 Teste A/B Ativo' ou '🟡 Em Otimização'."
-    );
+  if (loteFinal.length === 0) {
+    ui.alert("Aviso: Todos os anúncios marcados já possuem testes ativos em andamento na aba 'Log de Testes A/B'.");
     return;
   }
 
-  const resposta = ui.alert(
-    "Snapshot de Testes A/B",
-    `Foram identificados ${loteParaCadastrar.length} anúncios elegíveis.\n\n` +
-    `Deseja registrar o snapshot inicial desses anúncios no 'Log de Testes A/B'?`,
-    ui.ButtonSet.YES_NO
+  // 3. PROMPT 1: Tipologia da Intervenção
+  const promptTipo = ui.prompt(
+    "1/2 - Tipologia do Teste em Lote",
+    `Foram identificados ${loteFinal.length} anúncio(s) selecionados.\n\n` +
+    "Selecione a Tipologia digitando o número correspondente:\n" +
+    "1 - Foto Hero (Foto Principal)\n" +
+    "2 - Carrossel / Tabela de Medidas\n" +
+    "3 - Título / SEO & Indexação\n" +
+    "4 - Preço / Condição de Oferta\n" +
+    "5 - Logística (Full / DBA)\n\n" +
+    "Digite o número de 1 a 5:",
+    ui.ButtonSet.OK_CANCEL
   );
 
-  if (resposta !== ui.Button.YES) return;
+  if (promptTipo.getSelectedButton() !== ui.Button.OK) return;
 
-  const linhaInicialGravacao = Math.max(sheetLog.getLastRow() + 1, 4);
-  sheetLog.getRange(linhaInicialGravacao, 1, loteParaCadastrar.length, 18).setValues(loteParaCadastrar);
+  const escolhaTipo = promptTipo.getResponseText().trim();
+  let tipologiaTexto = "Foto Hero";
+  if (escolhaTipo === "2") tipologiaTexto = "Carrossel / Tabela de Medidas";
+  else if (escolhaTipo === "3") tipologiaTexto = "Título / SEO & Indexação";
+  else if (escolhaTipo === "4") tipologiaTexto = "Preço / Oferta";
+  else if (escolhaTipo === "5") tipologiaTexto = "Logística / Full";
 
-  sheetLog.getRange(linhaInicialGravacao, 12, loteParaCadastrar.length, 2).setNumberFormat("0.00%");
-  sheetLog.getRange(linhaInicialGravacao, 14, loteParaCadastrar.length, 1).setNumberFormat("+0.00%;-0.00%");
-  sheetLog.getRange(linhaInicialGravacao, 15, loteParaCadastrar.length, 1).setNumberFormat("+0.0%;-0.0%");
-  sheetLog.getRange(linhaInicialGravacao, 16, loteParaCadastrar.length, 1).setNumberFormat("R$ #,##0.00");
+  // 4. PROMPT 2: Digitação da Hipótese / Mudança
+  const promptHipotese = ui.prompt(
+    "2/2 - Hipótese & Mudança Realizada",
+    `Tipologia definida: [ ${tipologiaTexto} ]\n\n` +
+    "Descreva o ajuste realizado que será aplicado a esse lote de anúncios:\n" +
+    "(Exemplo: Troca de imagem com fundo branco por modelo segurando o produto no corpo)",
+    ui.ButtonSet.OK_CANCEL
+  );
 
-  ui.alert(`Sucesso! ${loteParaCadastrar.length} testes cadastrados no Log com métricas de CVR congeladas.`);
+  if (promptHipotese.getSelectedButton() !== ui.Button.OK) return;
+
+  const hipoteseTexto = promptHipotese.getResponseText().trim() || "Otimização de anúncio em lote para estancar Vazamento de Funil";
+
+  // 5. Montagem das linhas para o Log
+  const hojeFormatado = Utilities.formatDate(new Date(), "America/Sao_Paulo", "yyyy-MM-dd");
+  const linhasParaGravar = [];
+  const startRowLog = Math.max(lastRowLog + 1, 4);
+
+  for (let k = 0; k < loteFinal.length; k++) {
+    const item = loteFinal[k];
+    const expFormatado = "EXP-" + String(proximoNumeroExp).padStart(3, '0');
+    proximoNumeroExp++;
+
+    const numLinhaDestino = startRowLog + k;
+    const formulaDelta = `=SE(E(L${numLinhaDestino}<>"";M${numLinhaDestino}<>""); M${numLinhaDestino}-L${numLinhaDestino}; "")`;
+    const formulaLift = `=SE(E(L${numLinhaDestino}>0;M${numLinhaDestino}<>""); (M${numLinhaDestino}-L${numLinhaDestino})/L${numLinhaDestino}; "")`;
+
+    linhasParaGravar.push([
+      expFormatado,
+      item.idAnuncio,
+      item.sku,
+      item.titulo,
+      item.canal,
+      tipologiaTexto,
+      hipoteseTexto,
+      "",
+      "",
+      hojeFormatado,
+      "",
+      item.cvrBase,
+      "",
+      formulaDelta,
+      formulaLift,
+      "",
+      "🟡 Em Andamento",
+      "Aguardando maturação decendial"
+    ]);
+  }
+
+  // 6. Gravação e Formatação no Log de Testes A/B
+  sheetLog.getRange(startRowLog, 1, linhasParaGravar.length, 18).setValues(linhasParaGravar);
+  sheetLog.getRange(startRowLog, 12, linhasParaGravar.length, 2).setNumberFormat("0.00%");
+  sheetLog.getRange(startRowLog, 14, linhasParaGravar.length, 1).setNumberFormat("+0.00%;-0.00%");
+  sheetLog.getRange(startRowLog, 15, linhasParaGravar.length, 1).setNumberFormat("+0.0%;-0.0%");
+  sheetLog.getRange(startRowLog, 16, linhasParaGravar.length, 1).setNumberFormat("R$ #,##0.00");
+
+  ui.alert(
+    "Snapshot Concluído com Sucesso!",
+    `${linhasParaGravar.length} teste(s) cadastrado(s) no 'Log de Testes A/B'.\n\n` +
+    `Tipologia: ${tipologiaTexto}\n` +
+    `Hipótese: ${hipoteseTexto}`,
+    ui.ButtonSet.OK
+  );
 }
 
+/**
+ * Processa o arquivamento definitivo, solicita o motivo em lote e remove da vitrine
+ */
 function processarArquivamentoExcluidos() {
   const ss = SpreadsheetApp.getActiveSpreadsheet();
   const sheetMatriz = ss.getSheetByName('Matriz Operacional');
@@ -145,71 +202,92 @@ function processarArquivamentoExcluidos() {
       "Preço de Venda (R$)", "CVR Final (%)", "Vendas Totais", "Classificação CX Final",
       "Motivo da Exclusão / Aprendizado"
     ];
-    sheetExcluidos.getRange(1, 1, 1, headers.length).setValues([headers]).setFontWeight("bold").setBackground("#fee2e2");
+    sheetExcluidos.getRange(1, 1, 1, headers.length)
+      .setValues([headers])
+      .setFontWeight("bold")
+      .setBackground("#fee2e2")
+      .setFontColor("#991b1b")
+      .setHorizontalAlignment("center");
     sheetExcluidos.setFrozenRows(1);
   }
 
   const lastRow = sheetMatriz.getLastRow();
   if (lastRow < 8) {
-    ui.alert("Aviso: Nenhum dado encontrado na Matriz Operacional para processar.");
+    ui.alert("Aviso: Nenhum dado encontrado na Matriz Operacional.");
     return;
   }
 
   const rangeDados = sheetMatriz.getRange(8, 1, lastRow - 7, 22).getValues();
-  const linhasParaArquivar = [];
-  const indicesParaExcluir = [];
+  const candidatosParaExcluir = [];
+  const indicesLinhasMatriz = [];
 
   for (let i = 0; i < rangeDados.length; i++) {
     const situacao = String(rangeDados[i][21] || '').trim().toLowerCase();
 
     if (situacao.includes("exclu") || situacao.includes("descontinu")) {
-      const dataHoje = Utilities.formatDate(new Date(), "America/Sao_Paulo", "dd/MM/yyyy HH:mm");
-      const canal = rangeDados[i][0];
-      const idAnuncio = rangeDados[i][1];
-      const sku = rangeDados[i][2];
-      const titulo = rangeDados[i][3];
-      const preco = rangeDados[i][7];
-      const cvr = rangeDados[i][15];
-      const vendas = rangeDados[i][14];
-      const cx = rangeDados[i][19];
-
-      linhasParaArquivar.push([
-        dataHoje, idAnuncio, sku, canal, titulo,
-        preco, cvr, vendas, cx,
-        "Descontinuado via Matriz Operacional (Análise de Desempenho)"
-      ]);
-
-      indicesParaExcluir.push(8 + i);
+      candidatosParaExcluir.push({
+        canal: rangeDados[i][0],
+        idAnuncio: rangeDados[i][1],
+        sku: rangeDados[i][2],
+        titulo: rangeDados[i][3],
+        preco: rangeDados[i][7],
+        cvr: rangeDados[i][15],
+        vendas: rangeDados[i][14],
+        cx: rangeDados[i][19]
+      });
+      indicesLinhasMatriz.push(8 + i);
     }
   }
 
-  if (linhasParaArquivar.length === 0) {
-    ui.alert("Nenhum anúncio com situação 'Excluir / Descontinuar' foi encontrado na Coluna V.");
+  if (candidatosParaExcluir.length === 0) {
+    ui.alert("Nenhum anúncio com situação '🔴 Excluir / Descontinuar' foi encontrado na Coluna V.");
     return;
   }
 
-  const resposta = ui.alert(
-    "Confirmação de Arquivamento",
-    `Foram identificados ${linhasParaArquivar.length} anúncio(s) para arquivamento definitivo.\n\n` +
-    `Eles serão transferidos para 'Apoio_Anuncios_Excluidos' e removidos da Matriz Operacional.\n` +
-    `Deseja prosseguir?`,
-    ui.ButtonSet.YES_NO
+  // Solicita o motivo da exclusão em lote
+  const promptMotivo = ui.prompt(
+    "Arquivamento de Anúncios",
+    `Foram identificados ${candidatosParaExcluir.length} anúncio(s) marcados para descontinuação.\n\n` +
+    "Digite o motivo do descarte / prática ruim aprendida para registrar no histórico:\n" +
+    "(Exemplo: Inviabilidade financeira com taxas atuais / Produto com alto índice de defeito de fábrica)",
+    ui.ButtonSet.OK_CANCEL
   );
 
-  if (resposta !== ui.Button.YES) return;
+  if (promptMotivo.getSelectedButton() !== ui.Button.OK) return;
 
-  const proxLinha = sheetExcluidos.getLastRow() + 1;
+  const motivoTexto = promptMotivo.getResponseText().trim() || "Descontinuado por baixa performance / margem inviável";
+  const dataHoje = Utilities.formatDate(new Date(), "America/Sao_Paulo", "dd/MM/yyyy HH:mm");
+  const linhasParaArquivar = [];
+
+  for (let j = 0; j < candidatosParaExcluir.length; j++) {
+    const item = candidatosParaExcluir[j];
+    linhasParaArquivar.push([
+      dataHoje,
+      item.idAnuncio,
+      item.sku,
+      item.canal,
+      item.titulo,
+      item.preco,
+      item.cvr,
+      item.vendas,
+      item.cx,
+      motivoTexto
+    ]);
+  }
+
+  // 1. Grava no Apoio_Anuncios_Excluidos
+  const proxLinha = Math.max(sheetExcluidos.getLastRow() + 1, 2);
   sheetExcluidos.getRange(proxLinha, 1, linhasParaArquivar.length, 10).setValues(linhasParaArquivar);
   sheetExcluidos.getRange(proxLinha, 6, linhasParaArquivar.length, 1).setNumberFormat("R$ #,##0.00");
   sheetExcluidos.getRange(proxLinha, 7, linhasParaArquivar.length, 1).setNumberFormat("0.00%");
   sheetExcluidos.getRange(proxLinha, 8, linhasParaArquivar.length, 1).setNumberFormat("#,##0");
 
-  // Remove linhas de baixo para cima para preservar os índices da planilha
-  for (let k = indicesParaExcluir.length - 1; k >= 0; k--) {
-    sheetMatriz.deleteRow(indicesParaExcluir[k]);
+  // 2. Remove da Matriz Operacional (de baixo para cima para não alterar os índices de linha)
+  for (let k = indicesLinhasMatriz.length - 1; k >= 0; k--) {
+    sheetMatriz.deleteRow(indicesLinhasMatriz[k]);
   }
 
-  ui.alert(`Sucesso! ${linhasParaArquivar.length} anúncio(s) transferido(s) para o log de arquivamento.`);
+  ui.alert(`Sucesso! ${linhasParaArquivar.length} anúncio(s) arquivado(s) e expurgado(s) da Matriz Operacional.`);
 }
 
 function solicitarResetProcessamento() {
