@@ -702,3 +702,5 @@ function formatarDataBR(dataChave) {
   const [y, m, d] = dataChave.split('-');
   return `${d}/${m}/${y}`;
 }
+
+// teste sincronização
