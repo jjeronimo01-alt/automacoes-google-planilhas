@@ -1,25 +1,26 @@
 /**
  * SISTEMA INTEGRADO DE ANÁLISE DE OFERTA E PRODUTO (MATRIZ OPERACIONAL)
- * Versão: 2.2 (Correção de cruzamento numérico ML, leitor em memória e limpeza de temporários)
+ * Versão: 3.0 (Vitrine Estática Upsert, Ordenação Composta, Blindagem de Status Coluna V e Formatação Executiva)
  */
 
 const CONFIG = {
   FOLDERS: {
-    SITUACAO_ML: '1YSOD4evEYU8G_t_cUokDYSPA-cmdWExY',      // Preço nominal de Cadastro ML
-    SITUACAO_AMZ: '1TDYMrXkzK4I6PY212fa7qpF8Hdo5p72X',     // Preço nominal de Cadastro AMZ
+    SITUACAO_ML: '1YSOD4evEYU8G_t_cUokDYSPA-cmdWExY',      // Cadastro ML nominal
+    SITUACAO_AMZ: '1TDYMrXkzK4I6PY212fa7qpF8Hdo5p72X',     // Cadastro AMZ nominal
     DESEMPENHO_ML: '1qXpf8uTi9BbWqyywxhXfznVxA-hgDwjt',    // Tráfego e Vendas ML
     DESEMPENHO_AMZ: '1Cydd10tGl9sPmgFc8mwPQl59lUp6oCal',   // Tráfego e Vendas AMZ
     KITS: '11Gde5yzkxJRz1msKjVn8tBy5p_fPYnf5',             // Composição de Kits
-    ESTOQUE_CMV: '1ReghJfwz3oS4fEtC6vUCl1sWQpAqIgtw'       // Visão de Estoque / Custo Unitário
+    ESTOQUE_CMV: '1ReghJfwz3oS4fEtC6vUCl1sWQpAqIgtw'       // Estoque / Custo Unitário
   },
   SHEETS: {
     MATRIZ: 'Matriz Operacional',
-    DEVOLUCOES_ML: 'Apoio_Devolucoes_ML'
+    DEVOLUCOES_ML: 'Apoio_Devolucoes_ML',
+    EXCLUIDOS: 'Apoio_Anuncios_Excluidos',
+    TESTES: 'Log de Testes A/B'
   },
   START_ROW: 8
 };
 
-// Gerenciador de arquivos temporários criados em tempo de execução
 const ARQUIVOS_TEMPORARIOS = [];
 
 function atualizarMatrizOperacional() {
@@ -56,48 +57,36 @@ function atualizarMatrizOperacional() {
       return;
     }
 
-    Logger.log(`4/4 - Gravando ${dadosConsolidados.length} anúncios na Matriz Operacional...`);
+    Logger.log(`4/4 - Gravando ${dadosConsolidados.length} anúncios na Matriz Operacional (Upsert)...`);
     gravarDadosNaMatriz(sheetMatriz, dadosConsolidados);
 
     try {
-      SpreadsheetApp.getUi().alert(`Sucesso! ${dadosConsolidados.length} anúncios atualizados na Matriz Operacional.`);
+      SpreadsheetApp.getUi().alert(`Sucesso! Anúncios consolidados e atualizados na Matriz Operacional.`);
     } catch (e) {
-      ss.toast(`Sucesso! ${dadosConsolidados.length} anúncios atualizados.`, "Matriz Operacional", 5);
-      Logger.log(`Sucesso! ${dadosConsolidados.length} anúncios atualizados na Matriz Operacional.`);
+      ss.toast(`Sucesso! Anúncios atualizados na Matriz.`, "Matriz Operacional", 5);
+      Logger.log(`Sucesso! Anúncios atualizados na Matriz Operacional.`);
     }
   } finally {
-    // Garante a exclusão de arquivos temporários ao final, com ou sem erros
     limparArquivosTemporarios();
   }
 }
 
-/**
- * Normaliza e valida rigorosamente o ID do anúncio (8 a 13 dígitos numéricos)
- */
 function normalizarIdML(id) {
   if (id === null || id === undefined) return '';
   let str = String(id).trim();
-  str = str.replace(/\.0+$/, '');              // Remove sufixo .0 de números float
-  str = str.replace(/^#?\s*mlb\s*-?/i, '');     // Remove prefixos '#', 'MLB', 'mlb-'
-  const digitos = str.replace(/\D/g, '');       // Extrai apenas dígitos
+  str = str.replace(/\.0+$/, '');
+  str = str.replace(/^#?\s*mlb\s*-?/i, '');
+  const digitos = str.replace(/\D/g, '');
   if (digitos.length >= 8 && digitos.length <= 13) {
     return digitos;
   }
   return '';
 }
 
-/**
- * ----------------------------------------------------
- * LEITURA DA ABA AUXILIAR: Apoio_Devolucoes_ML
- * ----------------------------------------------------
- */
 function carregarApoioDevolucoesML(ss) {
   const mapa = {};
   const sheet = ss.getSheetByName(CONFIG.SHEETS.DEVOLUCOES_ML);
-  if (!sheet) {
-    Logger.log(`Aba ${CONFIG.SHEETS.DEVOLUCOES_ML} não encontrada.`);
-    return mapa;
-  }
+  if (!sheet) return mapa;
 
   const dados = sheet.getDataRange().getValues();
   if (dados.length <= 1) return mapa;
@@ -107,10 +96,7 @@ function carregarApoioDevolucoesML(ss) {
   const colQtd = headers.findIndex(h => /quantidade devolvida/i.test(String(h)));
   const colMotivo = headers.findIndex(h => /motivo/i.test(String(h)));
 
-  if (colId === -1 || colQtd === -1) {
-    Logger.log("Colunas obrigatórias não encontradas na aba Apoio_Devolucoes_ML.");
-    return mapa;
-  }
+  if (colId === -1 || colQtd === -1) return mapa;
 
   for (let i = 1; i < dados.length; i++) {
     const idLimpo = normalizarIdML(dados[i][colId]);
@@ -131,18 +117,10 @@ function carregarApoioDevolucoesML(ss) {
   return mapa;
 }
 
-/**
- * ----------------------------------------------------
- * LEITURA DE PREÇOS REAIS: SITUAÇÃO DO CADASTRO (ML)
- * ----------------------------------------------------
- */
 function carregarPrecosCadastroML() {
   const mapa = {};
   const arquivo = obterArquivoMaisRecente(CONFIG.FOLDERS.SITUACAO_ML);
-  if (!arquivo) {
-    Logger.log("Aviso: Arquivo de Situação do Cadastro ML não localizado.");
-    return mapa;
-  }
+  if (!arquivo) return mapa;
 
   const wb = abrirArquivoComoPlanilha(arquivo);
   const sheets = wb.getSheets();
@@ -192,9 +170,9 @@ function carregarPrecosCadastroML() {
     }
   }
 
-  if (colStatus === -1 && totalColunas > 4) colStatus = 4; // Coluna E padrão
-  if (colTipo === -1 && totalColunas > 26) colTipo = 26;   // Coluna AA padrão
-  if (colFull === -1 && totalColunas > 8) colFull = 8;     // Coluna I padrão
+  if (colStatus === -1 && totalColunas > 4) colStatus = 4;
+  if (colTipo === -1 && totalColunas > 26) colTipo = 26;
+  if (colFull === -1 && totalColunas > 8) colFull = 8;
 
   for (let r = 0; r < dados.length; r++) {
     const row = dados[r];
@@ -208,7 +186,6 @@ function carregarPrecosCadastroML() {
     }
     if (!idLimpo) continue;
 
-    // Status do anúncio (Ativo vs Pausado/Inativo)
     let status = 'ativo';
     if (colStatus !== -1 && colStatus < row.length) {
       const valStatus = String(row[colStatus] || '').trim().toLowerCase();
@@ -285,7 +262,7 @@ function carregarPrecosCadastroAMZ() {
 
     if (preco > 0) {
       if (sku) mapa[sku] = preco;
-      if (asin) mapa[asin] = preco; // Permite o match direto com o ASIN (child) do relatório
+      if (asin) mapa[asin] = preco;
     }
   }
 
@@ -293,11 +270,6 @@ function carregarPrecosCadastroAMZ() {
   return mapa;
 }
 
-/**
- * ----------------------------------------------------
- * PROCESSAMENTO DE DESEMPENHO DOS CANAIS
- * ----------------------------------------------------
- */
 function processarMercadoLivre(tabelaCMV, tabelaKits, precosCadastro, mapaDevolucoes) {
   const arquivo = obterArquivoMaisRecente(CONFIG.FOLDERS.DESEMPENHO_ML);
   if (!arquivo) return [];
@@ -337,10 +309,9 @@ function processarMercadoLivre(tabelaCMV, tabelaKits, precosCadastro, mapaDevolu
     const visitas = Number(row[colVisitas]) || 0;
     const vendas = Number(row[colVendas]) || 0;
 
-    // Consulta única de cadastro (evita duplicidade de declaração de variáveis)
     const infoCadastro = precosCadastro[idLimpo] || precosCadastro[idAnuncioFormatado] || {};
     
-    // Regra de Governança: Desconsidera anúncios inativos na planilha de cadastro
+    // Filtro de ativos: ignora se cadastrado como inativo/pausado
     if (infoCadastro.status && !infoCadastro.status.includes('ativ')) {
       continue;
     }
@@ -453,37 +424,30 @@ function processarAmazon(tabelaCMV, tabelaKits, precosCadastro) {
   return lista;
 }
 
-/**
- * ----------------------------------------------------
- * LEITURA DE ARQUIVOS ROBUSTA E EM MEMÓRIA (SEM TEMPORÁRIOS DESNECESSÁRIOS)
- * ----------------------------------------------------
- */
 function abrirArquivoComoPlanilha(file) {
   const mime = file.getMimeType();
   const nome = file.getName().toLowerCase();
 
-  // 1. Planilha nativa do Google
   if (mime === MimeType.GOOGLE_SHEETS) {
     return SpreadsheetApp.open(file);
   }
 
-  // 2. CSV ou Texto: processa em memória sem criar arquivo no Drive
   if (mime === 'text/csv' || mime === 'text/plain' || nome.endsWith('.csv') || nome.endsWith('.txt')) {
     const conteudo = file.getBlob().getDataAsString('UTF-8');
     const delimitador = detectarDelimitadorCSV(conteudo);
     const matrizValores = Utilities.parseCsv(conteudo, delimitador);
 
-    // Retorna objeto mock estruturado compatível com a API de Planilhas
     return {
       getSheets: () => [{
         getDataRange: () => ({
           getValues: () => matrizValores
-        })
+        }),
+        getLastRow: () => matrizValores.length,
+        getName: () => "Dados"
       }]
     };
   }
 
-  // 3. Arquivo Excel (.xlsx/.xls): Converte com registro para exclusão no final
   try {
     const blob = file.getBlob();
     const url = "https://www.googleapis.com/upload/drive/v2/files?uploadType=media&convert=true";
@@ -501,7 +465,7 @@ function abrirArquivoComoPlanilha(file) {
       return SpreadsheetApp.openById(json.id);
     }
   } catch (e) {
-    Logger.log("Conversão via Drive REST falhou, tentando leitura direta: " + e.message);
+    Logger.log("Conversão via Drive REST falhou: " + e.message);
   }
 
   return SpreadsheetApp.open(file);
@@ -518,13 +482,7 @@ function detectarDelimitadorCSV(conteudo) {
   return ',';
 }
 
-/**
- * ----------------------------------------------------
- * ROTINA DE EXCLUSÃO DE ARQUIVOS TEMPORÁRIOS
- * ----------------------------------------------------
- */
 function limparArquivosTemporarios() {
-  // 1. Exclui os arquivos temporários gerados na execução atual
   while (ARQUIVOS_TEMPORARIOS.length > 0) {
     const id = ARQUIVOS_TEMPORARIOS.pop();
     try {
@@ -535,7 +493,6 @@ function limparArquivosTemporarios() {
     }
   }
 
-  // 2. Faxina preventiva restrita exclusivamente a arquivos de sua propriedade
   try {
     const query = "title starts with 'temp_' and trashed = false and 'me' in owners";
     const arquivosOrfaos = DriveApp.searchFiles(query);
@@ -545,25 +502,18 @@ function limparArquivosTemporarios() {
       try {
         arq.setTrashed(true);
         removidos++;
-      } catch (err) {
-        // Ignora caso algum arquivo específico esteja bloqueado
-      }
+      } catch (err) {}
     }
-    if (removidos > 0) {
-      Logger.log(`Faxina preventiva: ${removidos} arquivos temporários antigos excluídos.`);
-    }
+    if (removidos > 0) Logger.log(`Faxina preventiva: ${removidos} arquivos temporários antigos excluídos.`);
   } catch (e) {
     Logger.log("Aviso na faxina preventiva: " + e.message);
   }
 }
 
-/**
- * ----------------------------------------------------
- * GRAVAÇÃO NA MATRIZ COM FÓRMULAS PRESERVADAS
- * ----------------------------------------------------
- */
 function gravarDadosNaMatriz(sheet, novosDados) {
-  // 1. Identifica a linha de cabeçalho dinamicamente
+  const ss = sheet.getParent();
+  const idsExcluidos = carregarIdsExcluidos(ss);
+
   let headerRow = -1;
   const maxScan = Math.min(sheet.getLastRow() || 20, 20);
   if (maxScan > 0) {
@@ -579,7 +529,13 @@ function gravarDadosNaMatriz(sheet, novosDados) {
   if (headerRow === -1) headerRow = 7;
   const linhaInicio = headerRow + 1;
 
-  // 2. Leitura da Vitrine Estática Atual (Base já existente na planilha)
+  // Garante o cabeçalho 'Situação' na Coluna V (Coluna 22)
+  const celulaCabecalhoV = sheet.getRange(headerRow, 22);
+  if (!celulaCabecalhoV.getValue()) {
+    celulaCabecalhoV.setValue("Situação").setFontWeight("bold").setBackground("#f3f3f3").setHorizontalAlignment("center");
+  }
+
+  // 1. Leitura da Vitrine Atual (Upsert com proteção da Coluna V)
   const catalogoMestre = new Map();
   const lastRow = sheet.getLastRow();
 
@@ -587,10 +543,14 @@ function gravarDadosNaMatriz(sheet, novosDados) {
     const totalLinhasAtuais = lastRow - linhaInicio + 1;
     const dadosAtuaisA_K = sheet.getRange(linhaInicio, 1, totalLinhasAtuais, 11).getValues();
     const dadosAtuaisN_R = sheet.getRange(linhaInicio, 14, totalLinhasAtuais, 5).getValues();
+    const dadosAtuaisV = sheet.getRange(linhaInicio, 22, totalLinhasAtuais, 1).getValues();
 
     for (let i = 0; i < totalLinhasAtuais; i++) {
       const idRaw = String(dadosAtuaisA_K[i][1] || '').trim();
-      if (!idRaw) continue;
+      const idLimpo = normalizarIdML(idRaw);
+      
+      // Se estiver na lista negra de excluídos, descarta permanentemente da Matriz
+      if (!idRaw || idsExcluidos.has(idLimpo) || idsExcluidos.has(idRaw)) continue;
 
       catalogoMestre.set(idRaw, {
         canal: dadosAtuaisA_K[i][0],
@@ -608,25 +568,35 @@ function gravarDadosNaMatriz(sheet, novosDados) {
         vendas: Number(dadosAtuaisN_R[i][1]) || 0,
         cvr: Number(dadosAtuaisN_R[i][2]) || 0,
         buyBox: Number(dadosAtuaisN_R[i][3]) || 0,
-        devolucoes: Number(dadosAtuaisN_R[i][4]) || 0
+        devolucoes: Number(dadosAtuaisN_R[i][4]) || 0,
+        situacao: String(dadosAtuaisV[i][0] || '🟡 Novo / Em Análise').trim()
       });
     }
   }
 
-  // 3. Upsert: Atualiza existentes e insere anúncios novos
+  // 2. Consolidação de novos dados (preservando o status da Coluna V)
   novosDados.forEach(item => {
-    catalogoMestre.set(item.idAnuncio, item);
+    const idLimpo = normalizarIdML(item.idAnuncio);
+    if (idsExcluidos.has(idLimpo) || idsExcluidos.has(item.idAnuncio)) return;
+
+    if (catalogoMestre.has(item.idAnuncio)) {
+      const anterior = catalogoMestre.get(item.idAnuncio);
+      item.situacao = anterior.situacao; // Preserva '🧪 Teste A/B Ativo', '🟢 Validado', etc.
+      catalogoMestre.set(item.idAnuncio, item);
+    } else {
+      item.situacao = '🟡 Novo / Em Análise';
+      catalogoMestre.set(item.idAnuncio, item);
+    }
   });
 
   const listaConsolidada = Array.from(catalogoMestre.values());
   if (listaConsolidada.length === 0) return;
 
-  // 4. Algoritmo de Ordenação Composta (Maior CVR + Margem R$ + Vendas no topo)
+  // 3. Algoritmo de Ordenação Composta: CVR + Margem R$ + Vendas
   listaConsolidada.sort((a, b) => {
     const margemA = Math.max(0, a.precoVenda - a.cmv - a.comissao - a.freteTaxaFixa);
     const margemB = Math.max(0, b.precoVenda - b.cmv - b.comissao - b.freteTaxaFixa);
 
-    // Score ponderado de tração e rentabilidade
     const scoreA = (a.cvr * 100 * 0.40) + (margemA * 0.35) + (a.vendas * 0.25);
     const scoreB = (b.cvr * 100 * 0.40) + (margemB * 0.35) + (b.vendas * 0.25);
 
@@ -635,10 +605,11 @@ function gravarDadosNaMatriz(sheet, novosDados) {
     return margemB - margemA;
   });
 
-  // 5. Preparação dos Blocos (Respeitando ArrayFormulas em L, M, S, T, U)
+  // 4. Montagem dos Blocos (Respeita ARRAYFORMULA em L, M, S, T, U)
   const totalFinal = listaConsolidada.length;
   const bloco1_A_ate_K = [];
   const bloco2_N_ate_R = [];
+  const bloco3_V = [];
 
   listaConsolidada.forEach(r => {
     bloco1_A_ate_K.push([
@@ -649,28 +620,44 @@ function gravarDadosNaMatriz(sheet, novosDados) {
     bloco2_N_ate_R.push([
       r.visitas, r.vendas, r.cvr, r.buyBox, r.devolucoes
     ]);
+    bloco3_V.push([r.situacao]);
   });
 
-  // Limpeza das linhas antigas apenas nos blocos de dados
+  // 5. Limpeza cirúrgica da base antiga
   if (lastRow >= linhaInicio) {
     const linhasLimpar = lastRow - linhaInicio + 1;
     sheet.getRange(linhaInicio, 1, linhasLimpar, 11).clearContent();
     sheet.getRange(linhaInicio, 14, linhasLimpar, 5).clearContent();
+    sheet.getRange(linhaInicio, 22, linhasLimpar, 1).clearContent();
   }
 
-  // 6. Gravação na planilha
+  // 6. Gravação limpa nos blocos
   sheet.getRange(linhaInicio, 1, totalFinal, 11).setValues(bloco1_A_ate_K);
   sheet.getRange(linhaInicio, 14, totalFinal, 5).setValues(bloco2_N_ate_R);
+  sheet.getRange(linhaInicio, 22, totalFinal, 1).setValues(bloco3_V);
 
-  // 7. Formatação Visual Executiva e Destaque de Negrito
+  // 7. Formatação Visual Executiva
   aplicarEstiloVisualMatriz(sheet, linhaInicio, totalFinal);
 }
 
-/**
- * Formatação e Tipografia Profissional da Matriz Operacional
- */
+function carregarIdsExcluidos(ss) {
+  const ids = new Set();
+  const abaExcluidos = ss.getSheetByName(CONFIG.SHEETS.EXCLUIDOS);
+  if (!abaExcluidos) return ids;
+
+  const dados = abaExcluidos.getDataRange().getValues();
+  for (let i = 1; i < dados.length; i++) {
+    const idRaw = String(dados[i][1] || '').trim(); // Coluna B: ID do Anúncio
+    if (idRaw) {
+      ids.add(idRaw);
+      const idLimpo = normalizarIdML(idRaw);
+      if (idLimpo) ids.add(idLimpo);
+    }
+  }
+  return ids;
+}
+
 function aplicarEstiloVisualMatriz(sheet, startRow, numRows) {
-  // Alinhamentos Horizontais
   sheet.getRange(startRow, 1, numRows, 3).setHorizontalAlignment("center");  // Canal, ID, SKU
   sheet.getRange(startRow, 4, numRows, 1).setHorizontalAlignment("left");    // Título
   sheet.getRange(startRow, 5, numRows, 3).setHorizontalAlignment("center");  // Tipo Oferta, Tipo Anúncio, Logística
@@ -679,11 +666,10 @@ function aplicarEstiloVisualMatriz(sheet, startRow, numRows) {
   sheet.getRange(startRow, 14, numRows, 6).setHorizontalAlignment("right");  // Visitas, Vendas, CVR, BuyBox, Devs, Taxa Dev
   sheet.getRange(startRow, 20, numRows, 1).setHorizontalAlignment("center"); // Classificação CX
   sheet.getRange(startRow, 21, numRows, 1).setHorizontalAlignment("left");   // Plano de Ação
+  sheet.getRange(startRow, 22, numRows, 1).setHorizontalAlignment("center"); // Coluna V: Situação
 
-  // Alinhamento Vertical
-  sheet.getRange(startRow, 1, numRows, 21).setVerticalAlignment("middle");
+  sheet.getRange(startRow, 1, numRows, 22).setVerticalAlignment("middle");
 
-  // Formatos Numéricos Oficiais
   sheet.getRange(startRow, 8, numRows, 4).setNumberFormat("R$ #,##0.00");
   sheet.getRange(startRow, 12, numRows, 1).setNumberFormat("R$ #,##0.00");
   sheet.getRange(startRow, 13, numRows, 1).setNumberFormat("0.00%");
@@ -692,18 +678,14 @@ function aplicarEstiloVisualMatriz(sheet, startRow, numRows) {
   sheet.getRange(startRow, 18, numRows, 1).setNumberFormat("#,##0");
   sheet.getRange(startRow, 19, numRows, 1).setNumberFormat("0.00%");
 
-  // Destaques em Negrito (Colunas Estratégicas de Decisão)
-  sheet.getRange(startRow, 3, numRows, 1).setFontWeight("bold");  // Coluna C: SKU Principal
-  sheet.getRange(startRow, 12, numRows, 2).setFontWeight("bold"); // Colunas L e M: Margem R$ e Margem %
-  sheet.getRange(startRow, 15, numRows, 2).setFontWeight("bold"); // Colunas O e P: Vendas e CVR %
-  sheet.getRange(startRow, 20, numRows, 1).setFontWeight("bold"); // Coluna T: Classificação CX
+  // Destaques em Negrito para Colunas-Chave de Decisão
+  sheet.getRange(startRow, 3, numRows, 1).setFontWeight("bold");  // SKU Principal
+  sheet.getRange(startRow, 12, numRows, 2).setFontWeight("bold"); // Margem R$ e Margem %
+  sheet.getRange(startRow, 15, numRows, 2).setFontWeight("bold"); // Vendas e CVR %
+  sheet.getRange(startRow, 20, numRows, 1).setFontWeight("bold"); // Classificação CX
+  sheet.getRange(startRow, 22, numRows, 1).setFontWeight("bold"); // Situação Operacional
 }
 
-/**
- * ----------------------------------------------------
- * LÓGICA DE FRETE / TAXAS (OFICIAL ML E AMZ)
- * ----------------------------------------------------
- */
 function calcularFretePorPesoRealML(preco, pesoKg) {
   const p = Number(preco) || 0;
   const w = Number(pesoKg) || 0.4;
@@ -772,11 +754,6 @@ function calcularFreteTaxaAMZ(preco, isKit) {
   }
 }
 
-/**
- * ----------------------------------------------------
- * AUXILIARES DE ESTOQUE, CMV E ARQUIVOS
- * ----------------------------------------------------
- */
 function carregarTabelaEstoqueCMV() {
   const mapa = {};
   const arquivo = obterArquivoMaisRecente(CONFIG.FOLDERS.ESTOQUE_CMV);
@@ -883,10 +860,10 @@ function configurarCabecalhos(sheet) {
     "Tipo de Anúncio", "Logística Atual", "Preço de Venda (R$)", "CMV Composto (R$)",
     "Comissão Plataforma (R$)", "Frete / Taxas Fixas (R$)", "Margem Contribuição (R$)",
     "Margem Contribuição (%)", "Sessões / Visitas", "Vendas (Unidades)", "Taxa Conversão (CVR %)",
-    "Buy Box %", "Unidades Devolvidas", "Taxa Devolução (%)", "Classificação CX", "Plano de Ação (5W2H)"
+    "Buy Box %", "Unidades Devolvidas", "Taxa Devolução (%)", "Classificação CX", "Plano de Ação (5W2H)", "Situação"
   ];
-  sheet.getRange(1, 1, 1, cabecalhos.length).setValues([cabecalhos]).setFontWeight("bold").setBackground("#f3f3f3");
-  sheet.setFrozenRows(1);
+  sheet.getRange(7, 1, 1, cabecalhos.length).setValues([cabecalhos]).setFontWeight("bold").setBackground("#f3f3f3");
+  sheet.setFrozenRows(7);
 }
 
 function executarAtualizacaoSegura() {
