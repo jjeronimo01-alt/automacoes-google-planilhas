@@ -1,6 +1,6 @@
 /**
  * SISTEMA INTEGRADO DE ANÁLISE DE OFERTA E PRODUTO (MATRIZ OPERACIONAL)
- * Versão: 2.1 (Consolidada com leitura de preços nominais e Apoio_Devolucoes_ML com Motivos)
+ * Versão: 2.2 (Correção de cruzamento numérico ML, leitor em memória e limpeza de temporários)
  */
 
 const CONFIG = {
@@ -10,7 +10,7 @@ const CONFIG = {
     DESEMPENHO_ML: '1qXpf8uTi9BbWqyywxhXfznVxA-hgDwjt',    // Tráfego e Vendas ML
     DESEMPENHO_AMZ: '1Cydd10tGl9sPmgFc8mwPQl59lUp6oCal',   // Tráfego e Vendas AMZ
     KITS: '11Gde5yzkxJRz1msKjVn8tBy5p_fPYnf5',             // Composição de Kits
-    ESTOQUE_CMV: '1ReghJfwz3oS4fEtC6vUCl1sWQpAqIgtw'      // Visão de Estoque / Custo Unitário
+    ESTOQUE_CMV: '1ReghJfwz3oS4fEtC6vUCl1sWQpAqIgtw'       // Visão de Estoque / Custo Unitário
   },
   SHEETS: {
     MATRIZ: 'Matriz Operacional',
@@ -18,6 +18,9 @@ const CONFIG = {
   },
   START_ROW: 8
 };
+
+// Gerenciador de arquivos temporários criados em tempo de execução
+const ARQUIVOS_TEMPORARIOS = [];
 
 function atualizarMatrizOperacional() {
   const ss = SpreadsheetApp.getActiveSpreadsheet();
@@ -28,39 +31,59 @@ function atualizarMatrizOperacional() {
     configurarCabecalhos(sheetMatriz);
   }
 
-  Logger.log("1/4 - Carregando Estoque, CMV, Kits e Devoluções ML...");
-  const tabelaCMV = carregarTabelaEstoqueCMV();
-  const tabelaKits = carregarTabelaKits(tabelaCMV);
-  const mapaDevolucoesML = carregarApoioDevolucoesML(ss);
-
-  Logger.log("2/4 - Carregando preços nominais de Situação do Cadastro...");
-  const precosCadastroML = carregarPrecosCadastroML();
-  const precosCadastroAMZ = carregarPrecosCadastroAMZ();
-
-  Logger.log("3/4 - Processando dados de desempenho (ML e Amazon)...");
-  const dadosML = processarMercadoLivre(tabelaCMV, tabelaKits, precosCadastroML, mapaDevolucoesML);
-  const dadosAMZ = processarAmazon(tabelaCMV, tabelaKits, precosCadastroAMZ);
-
-  const dadosConsolidados = [...dadosML, ...dadosAMZ];
-
-  if (dadosConsolidados.length === 0) {
-    try {
-      SpreadsheetApp.getUi().alert("Aviso: Nenhum dado foi encontrado nas pastas informadas.");
-    } catch (e) {
-      Logger.log("Aviso: Nenhum dado foi encontrado nas pastas informadas.");
-    }
-    return;
-  }
-
-  Logger.log(`4/4 - Gravando ${dadosConsolidados.length} anúncios na Matriz Operacional...`);
-  gravarDadosNaMatriz(sheetMatriz, dadosConsolidados);
-
   try {
-    SpreadsheetApp.getUi().alert(`Sucesso! ${dadosConsolidados.length} anúncios atualizados na Matriz Operacional.`);
-  } catch (e) {
-    ss.toast(`Sucesso! ${dadosConsolidados.length} anúncios atualizados.`, "Matriz Operacional", 5);
-    Logger.log(`Sucesso! ${dadosConsolidados.length} anúncios atualizados na Matriz Operacional.`);
+    Logger.log("1/4 - Carregando Estoque, CMV, Kits e Devoluções ML...");
+    const tabelaCMV = carregarTabelaEstoqueCMV();
+    const tabelaKits = carregarTabelaKits(tabelaCMV);
+    const mapaDevolucoesML = carregarApoioDevolucoesML(ss);
+
+    Logger.log("2/4 - Carregando preços nominais de Situação do Cadastro...");
+    const precosCadastroML = carregarPrecosCadastroML();
+    const precosCadastroAMZ = carregarPrecosCadastroAMZ();
+
+    Logger.log("3/4 - Processando dados de desempenho (ML e Amazon)...");
+    const dadosML = processarMercadoLivre(tabelaCMV, tabelaKits, precosCadastroML, mapaDevolucoesML);
+    const dadosAMZ = processarAmazon(tabelaCMV, tabelaKits, precosCadastroAMZ);
+
+    const dadosConsolidados = [...dadosML, ...dadosAMZ];
+
+    if (dadosConsolidados.length === 0) {
+      try {
+        SpreadsheetApp.getUi().alert("Aviso: Nenhum dado foi encontrado nas pastas informadas.");
+      } catch (e) {
+        Logger.log("Aviso: Nenhum dado foi encontrado nas pastas informadas.");
+      }
+      return;
+    }
+
+    Logger.log(`4/4 - Gravando ${dadosConsolidados.length} anúncios na Matriz Operacional...`);
+    gravarDadosNaMatriz(sheetMatriz, dadosConsolidados);
+
+    try {
+      SpreadsheetApp.getUi().alert(`Sucesso! ${dadosConsolidados.length} anúncios atualizados na Matriz Operacional.`);
+    } catch (e) {
+      ss.toast(`Sucesso! ${dadosConsolidados.length} anúncios atualizados.`, "Matriz Operacional", 5);
+      Logger.log(`Sucesso! ${dadosConsolidados.length} anúncios atualizados na Matriz Operacional.`);
+    }
+  } finally {
+    // Garante a exclusão de arquivos temporários ao final, com ou sem erros
+    limparArquivosTemporarios();
   }
+}
+
+/**
+ * Normaliza e valida rigorosamente o ID do anúncio (8 a 13 dígitos numéricos)
+ */
+function normalizarIdML(id) {
+  if (id === null || id === undefined) return '';
+  let str = String(id).trim();
+  str = str.replace(/\.0+$/, '');              // Remove sufixo .0 de números float
+  str = str.replace(/^#?\s*mlb\s*-?/i, '');     // Remove prefixos '#', 'MLB', 'mlb-'
+  const digitos = str.replace(/\D/g, '');       // Extrai apenas dígitos
+  if (digitos.length >= 8 && digitos.length <= 13) {
+    return digitos;
+  }
+  return '';
 }
 
 /**
@@ -80,7 +103,7 @@ function carregarApoioDevolucoesML(ss) {
   if (dados.length <= 1) return mapa;
 
   const headers = dados[0];
-  const colId = headers.findIndex(h => /ID do An[uú]ncio/i.test(String(h)));
+  const colId = headers.findIndex(h => /ID do An[uú]ncio|An[uú]ncio/i.test(String(h)));
   const colQtd = headers.findIndex(h => /quantidade devolvida/i.test(String(h)));
   const colMotivo = headers.findIndex(h => /motivo/i.test(String(h)));
 
@@ -90,12 +113,11 @@ function carregarApoioDevolucoesML(ss) {
   }
 
   for (let i = 1; i < dados.length; i++) {
-    const rawId = String(dados[i][colId] || '').trim();
+    const idLimpo = normalizarIdML(dados[i][colId]);
     const qtd = Number(dados[i][colQtd]) || 0;
     const motivo = colMotivo !== -1 ? String(dados[i][colMotivo] || '').trim() : '';
 
-    if (rawId) {
-      const idLimpo = rawId.replace(/^MLB/i, '');
+    if (idLimpo) {
       if (!mapa[idLimpo]) {
         mapa[idLimpo] = { qtd: 0, motivos: [] };
         mapa[`MLB${idLimpo}`] = mapa[idLimpo];
@@ -111,10 +133,9 @@ function carregarApoioDevolucoesML(ss) {
 
 /**
  * ----------------------------------------------------
- * LEITURA DE PREÇOS REAIS: SITUAÇÃO DO CADASTRO
+ * LEITURA DE PREÇOS REAIS: SITUAÇÃO DO CADASTRO (ML)
  * ----------------------------------------------------
  */
-
 function carregarPrecosCadastroML() {
   const mapa = {};
   const arquivo = obterArquivoMaisRecente(CONFIG.FOLDERS.SITUACAO_ML);
@@ -124,97 +145,134 @@ function carregarPrecosCadastroML() {
   }
 
   const wb = abrirArquivoComoPlanilha(arquivo);
-  const sheet = wb.getSheets()[0];
-  const dados = sheet.getDataRange().getValues();
-
-  // 1. Varre até a linha 10 para identificar onde começam os cabeçalhos
-  let headerIndex = -1;
-  for (let i = 0; i < Math.min(dados.length, 10); i++) {
-    const linhaTexto = dados[i].join(" ").toLowerCase();
-    if (linhaTexto.includes('anúncio') || linhaTexto.includes('anuncio') || linhaTexto.includes('preço') || linhaTexto.includes('preco') || linhaTexto.includes('sku')) {
-      headerIndex = i;
+  
+  // 1. Seleciona a aba que contém os dados reais (evita abas de instruções com poucas linhas)
+  const sheets = wb.getSheets();
+  let sheet = sheets[0];
+  for (let i = 0; i < sheets.length; i++) {
+    const s = sheets[i];
+    const nomeAba = s.getName().toLowerCase();
+    if (nomeAba.includes("anúncio") || nomeAba.includes("anuncio") || nomeAba.includes("produto") || nomeAba.includes("modificar")) {
+      sheet = s;
       break;
     }
+    if (s.getLastRow() > sheet.getLastRow()) {
+      sheet = s;
+    }
   }
 
-  // Se não encontrar por palavra-chave, assume a linha 5 ou 6 padrão do ML
-  if (headerIndex === -1) headerIndex = 4;
+  const dados = sheet.getDataRange().getValues();
+  if (!dados || dados.length === 0) return mapa;
 
-  // Unifica a linha encontrada com as linhas vizinhas para capturar subcabeçalhos divididos
-  const linhaA = dados[headerIndex] || [];
-  const linhaB = dados[headerIndex + 1] || [];
-  const totalCols = Math.max(linhaA.length, linhaB.length);
-  const headersUnificados = [];
+  const totalColunas = Math.max(...dados.slice(0, 15).map(r => r.length));
 
-  for (let c = 0; c < totalCols; c++) {
-    const txtA = String(linhaA[c] || '').trim();
-    const txtB = String(linhaB[c] || '').trim();
-    headersUnificados.push(`${txtA} ${txtB}`.toLowerCase());
+  // 2. Mapeamento das colunas nos cabeçalhos iniciais
+  let colId = 0;
+  let colPrecoPromo = -1;
+  let colPrecoNormal = -1;
+  let colTipo = -1;
+  let colFull = -1;
+  let colTarifa = -1;
+  let colPeso = -1;
+
+  for (let r = 0; r < Math.min(dados.length, 12); r++) {
+    const linhaTexto = dados[r].map(c => String(c).toLowerCase()).join(" ");
+    if (/pre[çc]o|an[uú]ncio|c[oó]digo|#|estoque|sku/.test(linhaTexto)) {
+      for (let c = 0; c < dados[r].length; c++) {
+        const val = String(dados[r][c] || '').trim().toLowerCase();
+        if (!val) continue;
+
+        // ID do anúncio
+        if (/^(#\s*do\s*an[uú]ncio|id\s*do\s*an[uú]ncio|c[oó]digo\s*do\s*an[uú]ncio|#)$/i.test(val)) {
+          colId = c;
+        }
+        // Preço em promoção
+        if (val.includes("promo") && (val.includes("pre") || val.includes("valor"))) {
+          colPrecoPromo = c;
+        }
+        // Preço normal
+        else if ((val.includes("preço") || val.includes("preco")) && !val.includes("promo") && !val.includes("custo")) {
+          if (colPrecoNormal === -1) colPrecoNormal = c;
+        }
+        // Tipo de anúncio (Coluna AA)
+        if (val.includes("tipo") && (val.includes("an") || val.includes("pub"))) {
+          colTipo = c;
+        }
+        // Full (Coluna I)
+        if (val.includes("no full") || (val.includes("full") && (val.includes("estoque") || val.includes("centro")))) {
+          colFull = c;
+        }
+        // Tarifa de venda / Comissão
+        if (val.includes("tarifa") || val.includes("comiss")) {
+          colTarifa = c;
+        }
+        // Peso físico da embalagem
+        if (val.includes("peso") && (val.includes("f") || val.includes("kg") || val.includes("emb"))) {
+          colPeso = c;
+        }
+      }
+    }
   }
 
-  // 2. Mapeamento flexível das colunas (Nome técnico ou Índice alfabético exato)
-  // Coluna ID do anúncio: busca por id, código ou assume coluna A (índice 0)
-  let colId = headersUnificados.findIndex(h => /id do an[uú]ncio|c[oó]digo|#|an[uú]ncio/i.test(h));
-  if (colId === -1) colId = 0;
+  // Posições fixas caso os cabeçalhos sejam mesclados
+  if (colTipo === -1 && totalColunas > 26) colTipo = 26; // Coluna AA
+  if (colFull === -1 && totalColunas > 8) colFull = 8;   // Coluna I
 
-  // Preço e Preço promocional
-  let colPrecoPromo = headersUnificados.findIndex(h => /promo[çc][ãa]o/i.test(h));
-  let colPrecoNormal = headersUnificados.findIndex(h => /pre[çc]o/i.test(h) && !/promo[çc][ãa]o|custo/i.test(h));
+  // 3. Extração linha a linha dos anúncios
+  for (let r = 0; r < dados.length; r++) {
+    const row = dados[r];
+    
+    // Tenta obter ID pela coluna mapeada
+    let idLimpo = colId < row.length ? normalizarIdML(row[colId]) : '';
+    
+    // Se não encontrou, varre as 4 primeiras colunas da linha
+    if (!idLimpo) {
+      for (let c = 0; c < Math.min(row.length, 4); c++) {
+        const candidate = normalizarIdML(row[c]);
+        if (candidate) {
+          idLimpo = candidate;
+          break;
+        }
+      }
+    }
 
-  // Coluna AA (Tipo de Anúncio): Índice 26 (A=0, ..., Z=25, AA=26)
-  let colTipo = headersUnificados.findIndex(h => /tipo de an[uú]ncio/i.test(h));
-  if (colTipo === -1 && totalCols > 26) colTipo = 26;
+    if (!idLimpo) continue; // Pula linhas de instruções ou cabeçalhos
 
-  // Coluna I (No Full): Índice 8 (A=0, B=1, ..., I=8)
-  let colFull = headersUnificados.findIndex(h => /no full/i.test(h));
-  if (colFull === -1 && totalCols > 8) colFull = 8;
+    // Preço de venda (promoção tem precedência)
+    const pPromo = colPrecoPromo !== -1 && colPrecoPromo < row.length ? parseNumeroMoeda(row[colPrecoPromo]) : 0;
+    const pNorm = colPrecoNormal !== -1 && colPrecoNormal < row.length ? parseNumeroMoeda(row[colPrecoNormal]) : 0;
+    const precoFinal = pPromo > 0 ? pPromo : pNorm;
 
-  // Tarifa de venda / Comissão
-  let colTarifa = headersUnificados.findIndex(h => /tarifa de venda/i.test(h));
-
-  // Peso físico da embalagem
-  let colPeso = headersUnificados.findIndex(h => /peso f[íi]sico/i.test(h));
-
-  // Determina a linha real onde iniciam os dados (pula subcabeçalho se houver)
-  const linhaInicio = headerIndex + 2;
-
-  for (let i = linhaInicio; i < dados.length; i++) {
-    let rawId = String(dados[i][colId] || '').trim();
-    if (!rawId) continue;
-
-    // Normalização rigorosa do ID (remove .0 de números float e prefixos)
-    rawId = rawId.replace(/\.0$/, '').replace(/^MLB/i, '').trim();
-
-    // Leitura dos Preços
-    const precoPromo = colPrecoPromo !== -1 ? parseNumeroMoeda(dados[i][colPrecoPromo]) : 0;
-    const precoNormal = colPrecoNormal !== -1 ? parseNumeroMoeda(dados[i][colPrecoNormal]) : 0;
-    const precoFinal = precoPromo > 0 ? precoPromo : precoNormal;
-
-    // Leitura do Tipo de Anúncio (Coluna AA)
+    // Tipo de anúncio (Clássico ou Premium)
     let tipoAnuncio = 'Clássico';
-    if (colTipo !== -1) {
-      const valTipo = String(dados[i][colTipo] || '').toLowerCase();
-      if (valTipo.includes('premium')) tipoAnuncio = 'Premium';
+    if (colTipo !== -1 && colTipo < row.length) {
+      const valTipo = String(row[colTipo] || '').toLowerCase();
+      if (valTipo.includes('premium') || valTipo.includes('pro')) {
+        tipoAnuncio = 'Premium';
+      }
     }
 
-    // Leitura do Full (Coluna I)
+    // Logística (Coluna I: No Full > 0 impera FBML)
     let logistica = 'Mercado Envios';
-    if (colFull !== -1) {
-      const valFull = Number(dados[i][colFull]) || 0;
-      if (valFull > 0) logistica = 'FBML';
+    if (colFull !== -1 && colFull < row.length) {
+      const valFullStr = String(row[colFull] || '').trim().toLowerCase();
+      const valFullNum = Number(valFullStr) || 0;
+      if (valFullNum > 0 || valFullStr.includes('full') || valFullStr.includes('sim')) {
+        logistica = 'FBML';
+      }
     }
 
-    // Tarifa de venda / Comissão
+    // Tarifa percentual
     let pctTarifa = tipoAnuncio === 'Premium' ? 0.19 : 0.14;
-    if (colTarifa !== -1 && dados[i][colTarifa]) {
-      const t = parseNumeroPercentual(dados[i][colTarifa]);
+    if (colTarifa !== -1 && colTarifa < row.length && row[colTarifa]) {
+      const t = parseNumeroPercentual(row[colTarifa]);
       if (t > 0) pctTarifa = t;
     }
 
     // Peso físico (kg)
     let pesoKg = 0.4;
-    if (colPeso !== -1 && dados[i][colPeso]) {
-      const p = parseNumeroMoeda(dados[i][colPeso]);
+    if (colPeso !== -1 && colPeso < row.length && row[colPeso]) {
+      const p = parseNumeroMoeda(row[colPeso]);
       if (p > 0) pesoKg = p;
     }
 
@@ -226,9 +284,8 @@ function carregarPrecosCadastroML() {
       pesoKg: pesoKg
     };
 
-    // Armazena com e sem o prefixo MLB para garantir match perfeito
-    mapa[rawId] = itemInfo;
-    mapa[`MLB${rawId}`] = itemInfo;
+    mapa[idLimpo] = itemInfo;
+    mapa[`MLB${idLimpo}`] = itemInfo;
   }
 
   Logger.log(`Situação ML carregada com sucesso: ${Object.keys(mapa).length / 2} anúncios mapeados.`);
@@ -243,20 +300,27 @@ function carregarPrecosCadastroAMZ() {
   const wb = abrirArquivoComoPlanilha(arquivo);
   const sheet = wb.getSheets()[0];
   const dados = sheet.getDataRange().getValues();
+  if (dados.length <= 1) return mapa;
 
   const headers = dados[0];
-  const colSku = headers.findIndex(h => /seller-sku|sku|asin/i.test(String(h)));
+  const colSku = headers.findIndex(h => /seller-sku|^sku$/i.test(String(h)));
+  const colAsin = headers.findIndex(h => /asin1|^asin$|product-id/i.test(String(h)));
   const colPrice = headers.findIndex(h => /price|pre[çc]o/i.test(String(h)));
 
-  if (colSku === -1 || colPrice === -1) return mapa;
+  if (colPrice === -1) return mapa;
 
   for (let i = 1; i < dados.length; i++) {
-    const sku = String(dados[i][colSku] || '').trim();
+    const sku = colSku !== -1 ? String(dados[i][colSku] || '').trim() : '';
+    const asin = colAsin !== -1 ? String(dados[i][colAsin] || '').trim() : '';
     const preco = parseNumeroMoeda(dados[i][colPrice]);
-    if (sku && preco > 0) {
-      mapa[sku] = preco;
+
+    if (preco > 0) {
+      if (sku) mapa[sku] = preco;
+      if (asin) mapa[asin] = preco; // Permite o match direto com o ASIN (child) do relatório
     }
   }
+
+  Logger.log(`Situação Amazon carregada: ${Object.keys(mapa).length} chaves indexadas.`);
   return mapa;
 }
 
@@ -283,7 +347,7 @@ function processarMercadoLivre(tabelaCMV, tabelaKits, precosCadastro, mapaDevolu
   if (headerIndex === -1) return [];
 
   const headers = dadosBrutos[headerIndex];
-  const colId = headers.indexOf('ID do anúncio');
+  const colId = headers.indexOf('ID do anúncio') !== -1 ? headers.indexOf('ID do anúncio') : headers.indexOf('ID do anuncio');
   const colTitulo = headers.indexOf('Anúncio');
   const colSku = headers.indexOf('SKU');
   const colVisitas = headers.indexOf('Visitas únicas');
@@ -294,18 +358,19 @@ function processarMercadoLivre(tabelaCMV, tabelaKits, precosCadastro, mapaDevolu
 
   for (let i = headerIndex + 1; i < dadosBrutos.length; i++) {
     const row = dadosBrutos[i];
-    const rawId = String(row[colId] || '').trim();
-    if (!rawId) continue;
+    const rawId = row[colId];
+    const idLimpo = normalizarIdML(rawId);
+    if (!idLimpo) continue;
 
-    const idAnuncio = rawId.startsWith('MLB') ? rawId : `MLB${rawId}`;
-    const idPuro = rawId.replace(/^MLB/i, '');
+    // ID padronizado com MLB para exibição na Matriz Operacional
+    const idAnuncioFormatado = `MLB${idLimpo}`;
     const sku = String(row[colSku] || '').trim();
     const titulo = String(row[colTitulo] || '').trim();
     const visitas = Number(row[colVisitas]) || 0;
     const vendas = Number(row[colVendas]) || 0;
 
-    // Consulta aos dados enriquecidos da planilha de Cadastro
-    const infoCadastro = precosCadastro[idPuro] || precosCadastro[idAnuncio] || {};
+    // Busca infocadastro diretamente pelo ID numérico
+    const infoCadastro = precosCadastro[idLimpo] || precosCadastro[idAnuncioFormatado] || {};
     const preco = Number(infoCadastro.preco) || 0;
     const tipoAnuncio = infoCadastro.tipoAnuncio || 'Clássico';
     const logistica = infoCadastro.logistica || 'Mercado Envios';
@@ -324,17 +389,14 @@ function processarMercadoLivre(tabelaCMV, tabelaKits, precosCadastro, mapaDevolu
 
     const cmv = obterCMVProduto(sku, isKit, tabelaCMV, tabelaKits);
     const comissao = preco * pctTarifa;
-    
-    // Frete calculado pelo peso real da embalagem em kg
     const frete = calcularFretePorPesoRealML(preco, pesoKg);
 
-    // Consulta de devoluções
-    const devData = mapaDevolucoes[idPuro] || mapaDevolucoes[idAnuncio] || { qtd: 0 };
+    const devData = mapaDevolucoes[idLimpo] || mapaDevolucoes[idAnuncioFormatado] || { qtd: 0 };
     const devolucoes = devData.qtd || 0;
 
     lista.push({
       canal: 'Mercado Livre',
-      idAnuncio: idAnuncio,
+      idAnuncio: idAnuncioFormatado,
       sku: sku,
       titulo: titulo,
       tipoOferta: tipoOferta,
@@ -383,7 +445,6 @@ function processarAmazon(tabelaCMV, tabelaKits, precosCadastro) {
     const reembolsos = Number(row[colReembolsos]) || 0;
     const buyBox = parseNumeroPercentual(row[colBuyBox]);
 
-    // Busca obrigatória na planilha de Situação do Cadastro
     const preco = precosCadastro[asinChild] || 0;
     const cvr = sessoes > 0 ? unidades / sessoes : 0;
 
@@ -420,6 +481,110 @@ function processarAmazon(tabelaCMV, tabelaKits, precosCadastro) {
 
 /**
  * ----------------------------------------------------
+ * LEITURA DE ARQUIVOS ROBUSTA E EM MEMÓRIA (SEM TEMPORÁRIOS DESNECESSÁRIOS)
+ * ----------------------------------------------------
+ */
+function abrirArquivoComoPlanilha(file) {
+  const mime = file.getMimeType();
+  const nome = file.getName().toLowerCase();
+
+  // 1. Planilha nativa do Google
+  if (mime === MimeType.GOOGLE_SHEETS) {
+    return SpreadsheetApp.open(file);
+  }
+
+  // 2. CSV ou Texto: processa em memória sem criar arquivo no Drive
+  if (mime === 'text/csv' || mime === 'text/plain' || nome.endsWith('.csv') || nome.endsWith('.txt')) {
+    const conteudo = file.getBlob().getDataAsString('UTF-8');
+    const delimitador = detectarDelimitadorCSV(conteudo);
+    const matrizValores = Utilities.parseCsv(conteudo, delimitador);
+
+    // Retorna objeto mock estruturado compatível com a API de Planilhas
+    return {
+      getSheets: () => [{
+        getDataRange: () => ({
+          getValues: () => matrizValores
+        })
+      }]
+    };
+  }
+
+  // 3. Arquivo Excel (.xlsx/.xls): Converte com registro para exclusão no final
+  try {
+    const blob = file.getBlob();
+    const url = "https://www.googleapis.com/upload/drive/v2/files?uploadType=media&convert=true";
+    const res = UrlFetchApp.fetch(url, {
+      method: "POST",
+      headers: { Authorization: "Bearer " + ScriptApp.getOAuthToken() },
+      contentType: blob.getContentType(),
+      payload: blob.getBytes(),
+      muteHttpExceptions: true
+    });
+    
+    const json = JSON.parse(res.getContentText());
+    if (json.id) {
+      ARQUIVOS_TEMPORARIOS.push(json.id);
+      return SpreadsheetApp.openById(json.id);
+    }
+  } catch (e) {
+    Logger.log("Conversão via Drive REST falhou, tentando leitura direta: " + e.message);
+  }
+
+  return SpreadsheetApp.open(file);
+}
+
+function detectarDelimitadorCSV(conteudo) {
+  const primeiraLinha = conteudo.split(/\r?\n/)[0] || '';
+  const qtdTab = (primeiraLinha.match(/\t/g) || []).length;
+  const qtdPontoVirgula = (primeiraLinha.match(/;/g) || []).length;
+  const qtdVirgula = (primeiraLinha.match(/,/g) || []).length;
+
+  if (qtdTab > qtdPontoVirgula && qtdTab > qtdVirgula) return '\t';
+  if (qtdPontoVirgula >= qtdVirgula) return ';';
+  return ',';
+}
+
+/**
+ * ----------------------------------------------------
+ * ROTINA DE EXCLUSÃO DE ARQUIVOS TEMPORÁRIOS
+ * ----------------------------------------------------
+ */
+function limparArquivosTemporarios() {
+  // 1. Exclui os arquivos temporários gerados na execução atual
+  while (ARQUIVOS_TEMPORARIOS.length > 0) {
+    const id = ARQUIVOS_TEMPORARIOS.pop();
+    try {
+      DriveApp.getFileById(id).setTrashed(true);
+      Logger.log(`Arquivo temporário excluído: ${id}`);
+    } catch (e) {
+      Logger.log(`Aviso ao excluir temporário ${id}: ${e.message}`);
+    }
+  }
+
+  // 2. Faxina preventiva restrita exclusivamente a arquivos de sua propriedade
+  try {
+    const query = "title starts with 'temp_' and trashed = false and 'me' in owners";
+    const arquivosOrfaos = DriveApp.searchFiles(query);
+    let removidos = 0;
+    while (arquivosOrfaos.hasNext() && removidos < 10) {
+      const arq = arquivosOrfaos.next();
+      try {
+        arq.setTrashed(true);
+        removidos++;
+      } catch (err) {
+        // Ignora caso algum arquivo específico esteja bloqueado
+      }
+    }
+    if (removidos > 0) {
+      Logger.log(`Faxina preventiva: ${removidos} arquivos temporários antigos excluídos.`);
+    }
+  } catch (e) {
+    Logger.log("Aviso na faxina preventiva: " + e.message);
+  }
+}
+
+/**
+ * ----------------------------------------------------
  * GRAVAÇÃO NA MATRIZ COM FÓRMULAS PRESERVADAS
  * ----------------------------------------------------
  */
@@ -427,7 +592,6 @@ function gravarDadosNaMatriz(sheet, dados) {
   const numLinhas = dados.length;
   if (numLinhas === 0) return;
 
-  // 1. Identifica dinamicamente a linha onde está o cabeçalho
   let headerRow = -1;
   const maxScanRows = Math.min(sheet.getLastRow() || 20, 20);
   if (maxScanRows > 0) {
@@ -444,57 +608,48 @@ function gravarDadosNaMatriz(sheet, dados) {
   if (headerRow === -1) headerRow = 7;
   const linhaInicioDados = headerRow + 1;
 
-  // 2. Limpa APENAS as colunas que recebem dados brutos, preservando os ARRAYFORMULA
   const lastRow = sheet.getLastRow();
   if (lastRow >= linhaInicioDados) {
     const linhasParaLimpar = lastRow - linhaInicioDados + 1;
-    // Limpa Bloco 1 (Colunas A a K: 11 colunas)
     sheet.getRange(linhaInicioDados, 1, linhasParaLimpar, 11).clearContent();
-    // Limpa Bloco 2 (Colunas N a R: 5 colunas)
     sheet.getRange(linhaInicioDados, 14, linhasParaLimpar, 5).clearContent();
   }
 
-  // 3. Monta as matrizes separadas
-  const bloco1_A_ate_K = []; // Colunas A a K (1 a 11)
-  const bloco2_N_ate_R = []; // Colunas N a R (14 a 18)
+  const bloco1_A_ate_K = [];
+  const bloco2_N_ate_R = [];
 
   for (let i = 0; i < numLinhas; i++) {
     const r = dados[i];
-
-    // Bloco 1: Canal até Frete/Taxas Fixas
     bloco1_A_ate_K.push([
-      r.canal,          // Coluna A
-      r.idAnuncio,      // Coluna B
-      r.sku,            // Coluna C
-      r.titulo,         // Coluna D
-      r.tipoOferta,     // Coluna E
-      r.tipoAnuncio,    // Coluna F
-      r.logistica,      // Coluna G
-      r.precoVenda,     // Coluna H
-      r.cmv,            // Coluna I
-      r.comissao,       // Coluna J
-      r.freteTaxaFixa   // Coluna K
+      r.canal,
+      r.idAnuncio,
+      r.sku,
+      r.titulo,
+      r.tipoOferta,
+      r.tipoAnuncio,
+      r.logistica,
+      r.precoVenda,
+      r.cmv,
+      r.comissao,
+      r.freteTaxaFixa
     ]);
 
-    // Bloco 2: Sessões até Unidades Devolvidas
     bloco2_N_ate_R.push([
-      r.visitas,        // Coluna N
-      r.vendas,         // Coluna O
-      r.cvr,            // Coluna P
-      r.buyBox,         // Coluna Q
-      r.devolucoes      // Coluna R
+      r.visitas,
+      r.vendas,
+      r.cvr,
+      r.buyBox,
+      r.devolucoes
     ]);
   }
 
-  // 4. Grava os blocos sem tocar nas colunas L, M, S, T, U
   sheet.getRange(linhaInicioDados, 1, numLinhas, 11).setValues(bloco1_A_ate_K);
   sheet.getRange(linhaInicioDados, 14, numLinhas, 5).setValues(bloco2_N_ate_R);
 
-  // 5. Aplica formatação numérica estrita nos blocos gravados
-  sheet.getRange(linhaInicioDados, 8, numLinhas, 4).setNumberFormat("R$ #,##0.00"); // H a K
-  sheet.getRange(linhaInicioDados, 14, numLinhas, 2).setNumberFormat("#,##0");        // N e O
-  sheet.getRange(linhaInicioDados, 16, numLinhas, 2).setNumberFormat("0.00%");        // P e Q
-  sheet.getRange(linhaInicioDados, 18, numLinhas, 1).setNumberFormat("#,##0");        // R
+  sheet.getRange(linhaInicioDados, 8, numLinhas, 4).setNumberFormat("R$ #,##0.00");
+  sheet.getRange(linhaInicioDados, 14, numLinhas, 2).setNumberFormat("#,##0");
+  sheet.getRange(linhaInicioDados, 16, numLinhas, 2).setNumberFormat("0.00%");
+  sheet.getRange(linhaInicioDados, 18, numLinhas, 1).setNumberFormat("#,##0");
 }
 
 /**
@@ -506,7 +661,6 @@ function calcularFretePorPesoRealML(preco, pesoKg) {
   const p = Number(preco) || 0;
   const w = Number(pesoKg) || 0.4;
 
-  // Faixa 1: Até 0,3 kg
   if (w <= 0.3) {
     if (p < 19.00) return 5.65;
     if (p <= 48.99) return 6.85;
@@ -518,7 +672,6 @@ function calcularFretePorPesoRealML(preco, pesoKg) {
     return 21.65;
   }
 
-  // Faixa 2: De 0,3 a 0,5 kg (padrão cinto unitário)
   if (w <= 0.5) {
     if (p < 19.00) return 5.95;
     if (p <= 48.99) return 6.95;
@@ -530,7 +683,6 @@ function calcularFretePorPesoRealML(preco, pesoKg) {
     return 23.25;
   }
 
-  // Faixa 3: De 0,5 a 1 kg (padrão kits 2 e 3 peças)
   if (w <= 1.0) {
     if (p < 19.00) return 6.05;
     if (p <= 48.99) return 7.15;
@@ -542,7 +694,6 @@ function calcularFretePorPesoRealML(preco, pesoKg) {
     return 24.45;
   }
 
-  // Faixa 4: Acima de 1 kg (até 1,5 kg)
   if (p < 19.00) return 6.15;
   if (p <= 48.99) return 7.35;
   if (p <= 78.99) return 8.65;
@@ -664,64 +815,6 @@ function obterArquivoMaisRecente(folderId) {
   }
 }
 
-// ============================================================================
-// AJUSTE PONTUAL: abrirArquivoComoPlanilha COM SUPORTE ROBUSTO A CSV/TXT/XLSX
-// Substituir a função existente a partir da linha ~495 por esta:
-// ============================================================================
-
-function abrirArquivoComoPlanilha(file) {
-  const mime = file.getMimeType();
-  const nome = file.getName().toLowerCase();
-
-  // 1. Caso seja Google Planilha nativa
-  if (mime === MimeType.GOOGLE_SHEETS) {
-    return SpreadsheetApp.open(file);
-  }
-
-  // 2. Caso seja CSV, TXT ou relatório de texto delimitado por vírgula/tabulação (muito comum na Amazon)
-  if (mime === 'text/csv' || mime === 'text/plain' || nome.endsWith('.csv') || nome.endsWith('.txt')) {
-    const conteudo = file.getBlob().getDataAsString('UTF-8');
-    // Detecta se o separador é ponto-e-vírgula, tabulação (\t) ou vírgula
-    let delimitador = ',';
-    if (conteudo.indexOf('\t') !== -1 && (conteudo.indexOf('\t') < conteudo.indexOf(',') || conteudo.indexOf(',') === -1)) {
-      delimitador = '\t';
-    } else if (conteudo.indexOf(';') !== -1 && (conteudo.indexOf(';') < conteudo.indexOf(',') || conteudo.indexOf(',') === -1)) {
-      delimitador = ';';
-    }
-
-    const linhas = Utilities.parseCsv(conteudo, delimitador);
-    const tempSs = SpreadsheetApp.create(`temp_${new Date().getTime()}`);
-    const tempSheet = tempSs.getSheets()[0];
-    if (linhas.length > 0 && linhas[0].length > 0) {
-      tempSheet.getRange(1, 1, linhas.length, linhas[0].length).setValues(linhas);
-    }
-    return tempSs;
-  }
-
-  // 3. Caso seja arquivo Excel binário (.xlsx ou .xls)
-  // Converte temporariamente para Google Sheets via Drive API para permitir leitura
-  try {
-    const blob = file.getBlob();
-    const configConversao = {
-      title: `temp_convert_${file.getName()}`,
-      mimeType: MimeType.GOOGLE_SHEETS,
-      parents: []
-    };
-    
-    // Tenta abrir direto ou converte
-    return SpreadsheetApp.open(file);
-  } catch (e) {
-    // Se o SpreadsheetApp falhar ao ler o binário, extrai via string limpa se for texto disfarçado
-    const textoFallback = file.getBlob().getDataAsString('ISO-8859-1');
-    const linhasFallback = Utilities.parseCsv(textoFallback, '\t');
-    const tempSs = SpreadsheetApp.create(`temp_fallback_${new Date().getTime()}`);
-    if (linhasFallback.length > 0 && linhasFallback[0].length > 0) {
-      tempSs.getSheets()[0].getRange(1, 1, linhasFallback.length, linhasFallback[0].length).setValues(linhasFallback);
-    }
-    return tempSs;
-  }
-}
-
 function parseNumeroMoeda(val) {
   if (typeof val === 'number') return val;
   if (!val) return 0;
@@ -749,15 +842,10 @@ function configurarCabecalhos(sheet) {
   sheet.setFrozenRows(1);
 }
 
-// ============================================================================
-// BLOCO DE GOVERNANÇA: TRAVA ANTI-DUPLICIDADE DE ARQUIVOS
-// ============================================================================
-
 function executarAtualizacaoSegura() {
   const ui = SpreadsheetApp.getUi();
   const props = PropertiesService.getScriptProperties();
   
-  // 1. Captura os arquivos mais recentes de cada pasta configurada
   const arquivosAtuais = [
     obterArquivoMaisRecente(CONFIG.FOLDERS.DESEMPENHO_ML),
     obterArquivoMaisRecente(CONFIG.FOLDERS.DESEMPENHO_AMZ),
@@ -770,11 +858,9 @@ function executarAtualizacaoSegura() {
     return;
   }
 
-  // 2. Gera assinatura única (ID do Arquivo + Data da Última Modificação)
   const assinaturaAtual = arquivosAtuais.map(a => `${a.getId()}_${a.getLastUpdated().getTime()}`).join('|');
   const assinaturaSalva = props.getProperty('PROCESSADOS_HASH');
 
-  // 3. Trava de governança: bloqueia se a assinatura for idêntica à anterior
   if (assinaturaSalva && assinaturaSalva === assinaturaAtual) {
     ui.alert(
       'Aviso de Governança (Arquivos já processados)',
@@ -786,13 +872,9 @@ function executarAtualizacaoSegura() {
     return;
   }
 
-  // 4. Executa a rotina principal
   atualizarMatrizOperacional();
 
-  // 5. Salva a nova assinatura no banco de propriedades interno
   props.setProperty('PROCESSADOS_HASH', assinaturaAtual);
   props.setProperty('ULTIMA_EXECUCAO', new Date().toISOString());
   Logger.log('Governança: Assinatura de arquivos atualizada com sucesso.');
 }
-
-//teste de sincronização
