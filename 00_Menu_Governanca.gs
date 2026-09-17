@@ -36,12 +36,12 @@ function abrirTestesABEmLote() {
   }
 
   // 1. Identifica anúncios marcados na Coluna V como Teste A/B ou Em Otimização
-  const rangeMatriz = sheetMatriz.getRange(8, 1, lastRowMatriz - 7, 22).getValues();
+  const rangeMatriz = sheetMatriz.getRange(8, 1, lastRowMatriz - 7, 25).getValues();
   const candidatos = [];
 
   for (let i = 0; i < rangeMatriz.length; i++) {
     const row = rangeMatriz[i];
-    const situacao = String(row[21] || '').trim().toLowerCase();
+    const situacao = String(row[24] || '').trim().toLowerCase();
     const idAnuncio = String(row[1] || '').trim();
 
     if ((situacao.includes("teste") || situacao.includes("otimiz")) && idAnuncio) {
@@ -217,12 +217,12 @@ function processarArquivamentoExcluidos() {
     return;
   }
 
-  const rangeDados = sheetMatriz.getRange(8, 1, lastRow - 7, 22).getValues();
+  const rangeDados = sheetMatriz.getRange(8, 1, lastRow - 7, 25).getValues();
   const candidatosParaExcluir = [];
   const indicesLinhasMatriz = [];
 
   for (let i = 0; i < rangeDados.length; i++) {
-    const situacao = String(rangeDados[i][21] || '').trim().toLowerCase();
+    const situacao = String(rangeDados[i][24] || '').trim().toLowerCase();
 
     if (situacao.includes("exclu") || situacao.includes("descontinu")) {
       candidatosParaExcluir.push({

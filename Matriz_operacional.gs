@@ -1,6 +1,6 @@
 /**
- * SISTEMA INTEGRADO DE ANÁLISE DE OFERTA E PRODUTO (MATRIZ OPERACIONAL)
- * Versão: 3.0 (Vitrine Estática Upsert, Ordenação Composta, Blindagem de Status Coluna V e Formatação Executiva)
+ * SISTEMA INTEGRADO DE ANÁLISE DE OFERTA, PRODUTO E DEMANDA (MATRIZ OPERACIONAL)
+ * Versão: 4.0 (3 Novas Colunas S/T/U, Leitura Multi-Estoque Drive e Blindagem de Status)
  */
 
 const CONFIG = {
@@ -10,7 +10,9 @@ const CONFIG = {
     DESEMPENHO_ML: '1qXpf8uTi9BbWqyywxhXfznVxA-hgDwjt',    // Tráfego e Vendas ML
     DESEMPENHO_AMZ: '1Cydd10tGl9sPmgFc8mwPQl59lUp6oCal',   // Tráfego e Vendas AMZ
     KITS: '11Gde5yzkxJRz1msKjVn8tBy5p_fPYnf5',             // Composição de Kits
-    ESTOQUE_CMV: '1ReghJfwz3oS4fEtC6vUCl1sWQpAqIgtw'       // Estoque / Custo Unitário
+    ESTOQUE_CMV: '1ReghJfwz3oS4fEtC6vUCl1sWQpAqIgtw',      // Visão Estoque Principal (Envios / DBA)
+    ESTOQUE_FULL_ML: '1PQbqgL-ZxoSdtUam0m4O8y86qKFhscLy',  // Visão Estoque Full Mercado Livre
+    ESTOQUE_FULL_AMZ: '1Br1znG56j1eeOWoQ16rAv_F3kNsF6MXc'  // Visão Estoque FBA Amazon
   },
   SHEETS: {
     MATRIZ: 'Matriz Operacional',
@@ -33,18 +35,21 @@ function atualizarMatrizOperacional() {
   }
 
   try {
-    Logger.log("1/4 - Carregando Estoque, CMV, Kits e Devoluções ML...");
+    Logger.log("1/4 - Carregando Estoques Consolidados, CMV, Kits e Devoluções ML...");
     const tabelaCMV = carregarTabelaEstoqueCMV();
     const tabelaKits = carregarTabelaKits(tabelaCMV);
     const mapaDevolucoesML = carregarApoioDevolucoesML(ss);
+    
+    // Consolidação dos 3 relatórios de estoque físico/plataformas para cálculo de necessidade
+    const mapaEstoqueGeral = carregarMapaEstoqueConsolidado();
 
-    Logger.log("2/4 - Carregando preços nominais de Situação do Cadastro...");
+    Logger.log("2/4 - Carregando preços e estoques instantâneos de Cadastro...");
     const precosCadastroML = carregarPrecosCadastroML();
     const precosCadastroAMZ = carregarPrecosCadastroAMZ();
 
     Logger.log("3/4 - Processando dados de desempenho (ML e Amazon)...");
-    const dadosML = processarMercadoLivre(tabelaCMV, tabelaKits, precosCadastroML, mapaDevolucoesML);
-    const dadosAMZ = processarAmazon(tabelaCMV, tabelaKits, precosCadastroAMZ);
+    const dadosML = processarMercadoLivre(tabelaCMV, tabelaKits, precosCadastroML, mapaDevolucoesML, mapaEstoqueGeral);
+    const dadosAMZ = processarAmazon(tabelaCMV, tabelaKits, precosCadastroAMZ, mapaEstoqueGeral);
 
     const dadosConsolidados = [...dadosML, ...dadosAMZ];
 
@@ -57,14 +62,14 @@ function atualizarMatrizOperacional() {
       return;
     }
 
-    Logger.log(`4/4 - Gravando ${dadosConsolidados.length} anúncios na Matriz Operacional (Upsert)...`);
+    Logger.log(`4/4 - Gravando ${dadosConsolidados.length} anúncios na Matriz Operacional...`);
     gravarDadosNaMatriz(sheetMatriz, dadosConsolidados);
 
     try {
-      SpreadsheetApp.getUi().alert(`Sucesso! Anúncios consolidados e atualizados na Matriz Operacional.`);
+      SpreadsheetApp.getUi().alert(`Sucesso! ${dadosConsolidados.length} anúncios atualizados na Matriz Operacional.`);
     } catch (e) {
-      ss.toast(`Sucesso! Anúncios atualizados na Matriz.`, "Matriz Operacional", 5);
-      Logger.log(`Sucesso! Anúncios atualizados na Matriz Operacional.`);
+      ss.toast(`Sucesso! ${dadosConsolidados.length} anúncios atualizados.`, "Matriz Operacional", 5);
+      Logger.log(`Sucesso! ${dadosConsolidados.length} anúncios atualizados na Matriz Operacional.`);
     }
   } finally {
     limparArquivosTemporarios();
@@ -81,6 +86,44 @@ function normalizarIdML(id) {
     return digitos;
   }
   return '';
+}
+
+/**
+ * Consolidação dos 3 relatórios de estoque em subpastas de mês
+ */
+function carregarMapaEstoqueConsolidado() {
+  const mapa = {}; // SKU -> saldo total somado
+  
+  function somarSaldoPasta(folderId) {
+    const arq = obterArquivoMaisRecente(folderId);
+    if (!arq) return;
+    const wb = abrirArquivoComoPlanilha(arq);
+    const sheet = wb.getSheets()[0];
+    const dados = sheet.getDataRange().getValues();
+    if (dados.length <= 1) return;
+
+    const headers = dados[0];
+    const colSku = headers.findIndex(h => /sku|c[oó]digo/i.test(String(h)));
+    const colQtd = headers.findIndex(h => /quantidade|saldo|estoque|dispon[íi]vel/i.test(String(h)));
+
+    if (colSku === -1 || colQtd === -1) return;
+
+    for (let i = 1; i < dados.length; i++) {
+      const sku = String(dados[i][colSku] || '').trim();
+      const qtd = Number(dados[i][colQtd]) || 0;
+      if (sku) {
+        mapa[sku] = (mapa[sku] || 0) + qtd;
+        mapa[sku.toUpperCase()] = (mapa[sku.toUpperCase()] || 0) + qtd;
+      }
+    }
+  }
+
+  somarSaldoPasta(CONFIG.FOLDERS.ESTOQUE_CMV);
+  somarSaldoPasta(CONFIG.FOLDERS.ESTOQUE_FULL_ML);
+  somarSaldoPasta(CONFIG.FOLDERS.ESTOQUE_FULL_AMZ);
+
+  Logger.log(`Estoque unificado carregado: ${Object.keys(mapa).length / 2} SKUs mapeados.`);
+  return mapa;
 }
 
 function carregarApoioDevolucoesML(ss) {
@@ -117,18 +160,10 @@ function carregarApoioDevolucoesML(ss) {
   return mapa;
 }
 
-/**
- * ----------------------------------------------------
- * LEITURA DE PREÇOS REAIS: SITUAÇÃO DO CADASTRO (ML)
- * ----------------------------------------------------
- */
 function carregarPrecosCadastroML() {
   const mapa = {};
   const arquivo = obterArquivoMaisRecente(CONFIG.FOLDERS.SITUACAO_ML);
-  if (!arquivo) {
-    Logger.log("Aviso: Arquivo de Situação do Cadastro ML não localizado.");
-    return mapa;
-  }
+  if (!arquivo) return mapa;
 
   const wb = abrirArquivoComoPlanilha(arquivo);
   const sheets = wb.getSheets();
@@ -148,14 +183,8 @@ function carregarPrecosCadastroML() {
 
   const totalColunas = Math.max(...dados.slice(0, 15).map(r => r.length));
 
-  let colId = 0;
-  let colStatus = -1;
-  let colPrecoPromo = -1;
-  let colPrecoNormal = -1;
-  let colTipo = -1;
-  let colFull = -1;
-  let colTarifa = -1;
-  let colPeso = -1;
+  let colId = 0, colStatus = -1, colPrecoPromo = -1, colPrecoNormal = -1;
+  let colTipo = -1, colFull = -1, colTarifa = -1, colPeso = -1, colEstoque = -1;
 
   for (let r = 0; r < Math.min(dados.length, 12); r++) {
     const linhaTexto = dados[r].map(c => String(c).toLowerCase()).join(" ");
@@ -166,6 +195,7 @@ function carregarPrecosCadastroML() {
 
         if (/^(#\s*do\s*an[uú]ncio|id\s*do\s*an[uú]ncio|c[oó]digo\s*do\s*an[uú]ncio|#)$/i.test(val)) colId = c;
         if (val === 'status' || val.includes('status do an')) colStatus = c;
+        if (val.includes("estoque") && !val.includes("full") && !val.includes("centro")) colEstoque = c;
         if (val.includes("promo") && (val.includes("pre") || val.includes("valor"))) colPrecoPromo = c;
         else if ((val.includes("preço") || val.includes("preco")) && !val.includes("promo") && !val.includes("custo")) {
           if (colPrecoNormal === -1) colPrecoNormal = c;
@@ -178,14 +208,13 @@ function carregarPrecosCadastroML() {
     }
   }
 
-  if (colStatus === -1 && totalColunas > 4) colStatus = 4; // Coluna E padrão
-  if (colTipo === -1 && totalColunas > 26) colTipo = 26;   // Coluna AA padrão
-  if (colFull === -1 && totalColunas > 8) colFull = 8;     // Coluna I padrão
+  if (colStatus === -1 && totalColunas > 4) colStatus = 4;
+  if (colTipo === -1 && totalColunas > 26) colTipo = 26;
+  if (colFull === -1 && totalColunas > 8) colFull = 8;
 
   for (let r = 0; r < dados.length; r++) {
     const row = dados[r];
     let idLimpo = colId < row.length ? normalizarIdML(row[colId]) : '';
-    
     if (!idLimpo) {
       for (let c = 0; c < Math.min(row.length, 4); c++) {
         const candidate = normalizarIdML(row[c]);
@@ -194,13 +223,13 @@ function carregarPrecosCadastroML() {
     }
     if (!idLimpo) continue;
 
-    // Status do anúncio (Ativo vs Pausado/Inativo)
     let status = 'ativo';
     if (colStatus !== -1 && colStatus < row.length) {
       const valStatus = String(row[colStatus] || '').trim().toLowerCase();
       if (valStatus) status = valStatus;
     }
 
+    const estoqueCanal = colEstoque !== -1 && colEstoque < row.length ? Number(row[colEstoque]) || 0 : 0;
     const pPromo = colPrecoPromo !== -1 && colPrecoPromo < row.length ? parseNumeroMoeda(row[colPrecoPromo]) : 0;
     const pNorm = colPrecoNormal !== -1 && colPrecoNormal < row.length ? parseNumeroMoeda(row[colPrecoNormal]) : 0;
     const precoFinal = pPromo > 0 ? pPromo : pNorm;
@@ -236,7 +265,8 @@ function carregarPrecosCadastroML() {
       logistica: logistica,
       pctTarifa: pctTarifa,
       pesoKg: pesoKg,
-      status: status
+      status: status,
+      estoqueCanal: estoqueCanal
     };
 
     mapa[idLimpo] = itemInfo;
@@ -269,7 +299,8 @@ function carregarPrecosCadastroAMZ() {
   const headers = dados[headerIndex];
   let colSku = headers.findIndex(h => /seller-sku|sku/i.test(String(h)));
   let colStatus = headers.findIndex(h => /^status$/i.test(String(h).trim()));
-  let colPrice = headers.findIndex(h => /(^price$\vert{}^pre[çc]o$|your-price|item-price|listing-price)/i.test(String(h).trim()));
+  let colQtd = headers.findIndex(h => /quantity|quantidade/i.test(String(h)));
+  let colPrice = headers.findIndex(h => /(^price$|^pre[çc]o$|your-price|item-price|listing-price)/i.test(String(h).trim()));
   
   if (colPrice === -1) {
     colPrice = headers.findIndex(h => /price|pre[çc]o/i.test(String(h)) && !/min|max|business/i.test(String(h)));
@@ -279,6 +310,7 @@ function carregarPrecosCadastroAMZ() {
     const row = dados[i];
     let sku = colSku !== -1 ? String(row[colSku] || '').trim() : '';
     let status = colStatus !== -1 ? String(row[colStatus] || '').trim().toLowerCase() : 'active';
+    let estoqueCanal = colQtd !== -1 ? Number(row[colQtd]) || 0 : 0;
     let preco = colPrice !== -1 ? parseNumeroMoeda(row[colPrice]) : 0;
 
     if (preco <= 0) {
@@ -290,9 +322,8 @@ function carregarPrecosCadastroAMZ() {
       }
     }
 
-    // Grava SEMPRE o SKU e os ASINs, mesmo que o preço nominal atual esteja zerado
     if (sku || row.some(cell => /^B0[A-Z0-9]{8}$/i.test(String(cell).trim()))) {
-      const objInfo = { preco: preco, sku: sku, status: status };
+      const objInfo = { preco: preco, sku: sku, status: status, estoqueCanal: estoqueCanal };
 
       if (sku) {
         mapa[sku] = objInfo;
@@ -308,79 +339,11 @@ function carregarPrecosCadastroAMZ() {
     }
   }
 
-  Logger.log(`Situação Amazon carregada com sucesso: ${Object.keys(mapa).length} referências indexadas.`);
+  Logger.log(`Situação Amazon carregada com sucesso: ${Object.keys(mapa).length} chaves indexadas.`);
   return mapa;
 }
 
-function carregarPrecosCadastroAMZ() {
-  const mapa = {};
-  const arquivo = obterArquivoMaisRecente(CONFIG.FOLDERS.SITUACAO_AMZ);
-  if (!arquivo) return mapa;
-
-  const wb = abrirArquivoComoPlanilha(arquivo);
-  const sheet = wb.getSheets()[0];
-  const dados = sheet.getDataRange().getValues();
-  if (dados.length <= 1) return mapa;
-
-  // Localiza linha de cabeçalho dinamicamente
-  let headerIndex = 0;
-  for (let r = 0; r < Math.min(dados.length, 5); r++) {
-    const rowStr = dados[r].map(c => String(c).toLowerCase()).join(" ");
-    if (rowStr.includes("sku") || rowStr.includes("asin") || rowStr.includes("price") || rowStr.includes("preço")) {
-      headerIndex = r;
-      break;
-    }
-  }
-
-  const headers = dados[headerIndex];
-  let colSku = headers.findIndex(h => /seller-sku|sku/i.test(String(h)));
-  let colPrice = headers.findIndex(h => /(^price$\vert{}^pre[çc]o$|your-price|item-price|listing-price)/i.test(String(h).trim()));
-  
-  if (colPrice === -1) {
-    colPrice = headers.findIndex(h => /price|pre[çc]o/i.test(String(h)) && !/min|max|business/i.test(String(h)));
-  }
-
-  for (let i = headerIndex + 1; i < dados.length; i++) {
-    const row = dados[i];
-    let sku = colSku !== -1 ? String(row[colSku] || '').trim() : '';
-
-    // Lê o preço nominal utilizando o conversor flexível
-    let preco = colPrice !== -1 ? parseNumeroMoeda(row[colPrice]) : 0;
-
-    // Se a coluna mapeada de preço vier zerada, varre outras colunas candidatas na mesma linha
-    if (preco <= 0) {
-      for (let c = 0; c < row.length; c++) {
-        if (/price|pre[çc]o/i.test(String(headers[c])) && !/min|max/i.test(String(headers[c]))) {
-          const pTest = parseNumeroMoeda(row[c]);
-          if (pTest > 0) { preco = pTest; break; }
-        }
-      }
-    }
-
-    if (preco > 0) {
-      const objInfo = { preco: preco, sku: sku };
-
-      // Se o SKU for válido, indexa por ele
-      if (sku) {
-        mapa[sku] = objInfo;
-        mapa[sku.toUpperCase()] = objInfo;
-      }
-
-      // Varrer a linha inteira e indexa TODOS os ASINs encontrados (Pai, Filho 1, Filho 2, etc.)
-      for (let c = 0; c < row.length; c++) {
-        const valStr = String(row[c] || '').trim().toUpperCase();
-        if (/^B0[A-Z0-9]{8}$/.test(valStr)) {
-          mapa[valStr] = objInfo; // Garante o match mesmo em famílias de variação
-        }
-      }
-    }
-  }
-
-  Logger.log(`Situação Amazon carregada com sucesso: ${Object.keys(mapa).length} chaves cruzadas (SKUs e ASINs).`);
-  return mapa;
-}
-
-function processarMercadoLivre(tabelaCMV, tabelaKits, precosCadastro, mapaDevolucoes) {
+function processarMercadoLivre(tabelaCMV, tabelaKits, precosCadastro, mapaDevolucoes, mapaEstoqueGeral) {
   const arquivo = obterArquivoMaisRecente(CONFIG.FOLDERS.DESEMPENHO_ML);
   if (!arquivo) return [];
 
@@ -420,10 +383,13 @@ function processarMercadoLivre(tabelaCMV, tabelaKits, precosCadastro, mapaDevolu
     const vendas = Number(row[colVendas]) || 0;
 
     const infoCadastro = precosCadastro[idLimpo] || precosCadastro[idAnuncioFormatado] || {};
-    const isAtivo = !infoCadastro.status || infoCadastro.status.includes('ativ');
+    const statusCanal = (infoCadastro.status || 'ativo').toLowerCase();
+    const estoqueCanal = Number(infoCadastro.estoqueCanal) || 0;
+    
+    // Status do anúncio no marketplace
+    const isEsgotadoNoMarketplace = estoqueCanal === 0 || statusCanal.includes('paus') || statusCanal.includes('inativ');
 
-    // REGRA DE PORTA: Inativo com zero vendas é descartado da Matriz
-    if (!isAtivo && vendas === 0) {
+    if (isEsgotadoNoMarketplace && vendas === 0) {
       continue;
     }
 
@@ -450,8 +416,13 @@ function processarMercadoLivre(tabelaCMV, tabelaKits, precosCadastro, mapaDevolu
     const devData = mapaDevolucoes[idLimpo] || mapaDevolucoes[idAnuncioFormatado] || { qtd: 0 };
     const devolucoes = devData.qtd || 0;
 
-    // Se estava inativo mas vendeu, rotula automaticamente como Esgotado/Pausado
-    const situacaoInicial = isAtivo ? '🟢 Validado / Estável' : '📦 Esgotado / Pausado';
+    // Cálculo das Novas Colunas (S, T, U)
+    const estoqueFisicoTotal = mapaEstoqueGeral[sku] || mapaEstoqueGeral[sku.toUpperCase()] || 0;
+    const projecaoVendas40d = Math.round((vendas / 60) * 40); // Proporcional de 60d para 40d
+    const necessidadeEstoque = estoqueFisicoTotal - projecaoVendas40d;
+
+    // Status Inicial Operacional
+    const situacaoInicial = isEsgotadoNoMarketplace ? '📦 Esgotado / Pausado' : '🟢 Validado / Estável';
 
     lista.push({
       canal: 'Mercado Livre',
@@ -470,13 +441,17 @@ function processarMercadoLivre(tabelaCMV, tabelaKits, precosCadastro, mapaDevolu
       cvr: cvr,
       buyBox: 0,
       devolucoes: devolucoes,
-      situacao: situacaoInicial
+      estoqueAtual: estoqueFisicoTotal,
+      projecao40d: projecaoVendas40d,
+      necessidadeEstoque: necessidadeEstoque,
+      situacao: situacaoInicial,
+      isEsgotadoNoMarketplace: isEsgotadoNoMarketplace
     });
   }
   return lista;
 }
 
-function processarAmazon(tabelaCMV, tabelaKits, precosCadastro) {
+function processarAmazon(tabelaCMV, tabelaKits, precosCadastro, mapaEstoqueGeral) {
   const arquivo = obterArquivoMaisRecente(CONFIG.FOLDERS.DESEMPENHO_AMZ);
   if (!arquivo) return [];
 
@@ -513,29 +488,24 @@ function processarAmazon(tabelaCMV, tabelaKits, precosCadastro) {
 
     const infoCad = precosCadastro[asinChild] || precosCadastro[skuRelatorio] || precosCadastro[skuRelatorio.toUpperCase()] || {};
     const statusAmazon = (infoCad.status || 'active').toLowerCase();
-    const isAtivo = statusAmazon.includes('activ') || statusAmazon.includes('ativ');
+    const estoqueCanal = Number(infoCad.estoqueCanal) || 0;
 
-    // REGRA DE PORTA: Inativo com zero vendas é descartado do cockpit
-    if (!isAtivo && unidades === 0) {
+    const isEsgotadoNoMarketplace = estoqueCanal === 0 || !statusAmazon.includes('activ');
+
+    if (isEsgotadoNoMarketplace && unidades === 0) {
       continue;
     }
 
     let preco = Number(infoCad.preco) || 0;
-
-    // 1. Preço Real por Faturamento para anúncios com vendas
     if (preco <= 0 && colValorVendas !== -1 && unidades > 0) {
       const faturamento = parseNumeroMoeda(row[colValorVendas]);
-      if (faturamento > 0) {
-        preco = faturamento / unidades;
-      }
+      if (faturamento > 0) preco = faturamento / unidades;
     }
 
-    // SKU Principal consolidado
     const skuFinal = infoCad.sku || skuRelatorio || asinChild;
     const isKit = titulo.toUpperCase().includes('KIT') || skuFinal.toUpperCase().includes('KIT');
     const cmv = obterCMVProduto(skuFinal, isKit, tabelaCMV, tabelaKits);
 
-    // 2. Fallback de Preço: se não há preço nominal nem vendas, estima por markup sobre o CMV
     if (preco <= 0) {
       preco = isKit ? 149.90 : 69.90;
     }
@@ -547,7 +517,12 @@ function processarAmazon(tabelaCMV, tabelaKits, precosCadastro) {
     const comissao = preco * 0.14;
     const frete = calcularFreteTaxaAMZ(preco, isKit);
 
-    const situacaoInicial = isAtivo ? '🟢 Validado / Estável' : '📦 Esgotado / Pausado';
+    // Cálculo das Novas Colunas (S, T, U)
+    const estoqueFisicoTotal = mapaEstoqueGeral[skuFinal] || mapaEstoqueGeral[skuFinal.toUpperCase()] || 0;
+    const projecaoVendas40d = Math.round((unidades / 60) * 40);
+    const necessidadeEstoque = estoqueFisicoTotal - projecaoVendas40d;
+
+    const situacaoInicial = isEsgotadoNoMarketplace ? '📦 Esgotado / Pausado' : '🟢 Validado / Estável';
 
     lista.push({
       canal: 'Amazon',
@@ -566,27 +541,24 @@ function processarAmazon(tabelaCMV, tabelaKits, precosCadastro) {
       cvr: cvr,
       buyBox: buyBox,
       devolucoes: reembolsos,
-      situacao: situacaoInicial
+      estoqueAtual: estoqueFisicoTotal,
+      projecao40d: projecaoVendas40d,
+      necessidadeEstoque: necessidadeEstoque,
+      situacao: situacaoInicial,
+      isEsgotadoNoMarketplace: isEsgotadoNoMarketplace
     });
   }
   return lista;
 }
 
-/**
- * ----------------------------------------------------
- * LEITURA DE ARQUIVOS ROBUSTA E EM MEMÓRIA (SEM TEMPORÁRIOS DESNECESSÁRIOS)
- * ----------------------------------------------------
- */
 function abrirArquivoComoPlanilha(file) {
   const mime = file.getMimeType();
   const nome = file.getName().toLowerCase();
 
-  // 1. Planilha nativa do Google
   if (mime === MimeType.GOOGLE_SHEETS) {
     return SpreadsheetApp.open(file);
   }
 
-  // 2. CSV ou Texto: processa em memória sem poluir o Drive
   if (mime === 'text/csv' || mime === 'text/plain' || nome.endsWith('.csv') || nome.endsWith('.txt')) {
     const conteudo = file.getBlob().getDataAsString('UTF-8');
     const delimitador = detectarDelimitadorCSV(conteudo);
@@ -603,7 +575,6 @@ function abrirArquivoComoPlanilha(file) {
     };
   }
 
-  // 3. Arquivo Excel (.xlsx / .xls): Converte com ID registrado para exclusão no final
   try {
     const blob = file.getBlob();
     const url = "https://www.googleapis.com/upload/drive/v2/files?uploadType=media&convert=true";
@@ -625,17 +596,6 @@ function abrirArquivoComoPlanilha(file) {
   }
 
   return SpreadsheetApp.open(file);
-}
-
-function detectarDelimitadorCSV(conteudo) {
-  const primeiraLinha = conteudo.split(/\r?\n/)[0] || '';
-  const qtdTab = (primeiraLinha.match(/\t/g) || []).length;
-  const qtdPontoVirgula = (primeiraLinha.match(/;/g) || []).length;
-  const qtdVirgula = (primeiraLinha.match(/,/g) || []).length;
-
-  if (qtdTab > qtdPontoVirgula && qtdTab > qtdVirgula) return '\t';
-  if (qtdPontoVirgula >= qtdVirgula) return ';';
-  return ',';
 }
 
 function detectarDelimitadorCSV(conteudo) {
@@ -677,9 +637,15 @@ function limparArquivosTemporarios() {
   }
 }
 
+/**
+ * Gravação na Matriz Operacional com 25 Colunas e Blindagem de Status
+ */
 function gravarDadosNaMatriz(sheet, novosDados) {
   const ss = sheet.getParent();
   const idsExcluidos = carregarIdsExcluidos(ss);
+
+  // Consulta testes realmente abertos no Log de Testes A/B para validação cruzada
+  const idsEmTesteAberto = carregarIdsEmTesteAberto(ss);
 
   let headerRow = -1;
   const maxScan = Math.min(sheet.getLastRow() || 20, 20);
@@ -696,19 +662,14 @@ function gravarDadosNaMatriz(sheet, novosDados) {
   if (headerRow === -1) headerRow = 7;
   const linhaInicio = headerRow + 1;
 
-  const celulaCabecalhoV = sheet.getRange(headerRow, 22);
-  if (!celulaCabecalhoV.getValue()) {
-    celulaCabecalhoV.setValue("Situação").setFontWeight("bold").setBackground("#f3f3f3").setHorizontalAlignment("center");
-  }
-
-  // 1. Mapeia a base já existente apenas para preservar a Coluna V dos anúncios válidos
+  // 1. Mapeia a base já existente para preservar ajustes manuais válidos
   const statusAnteriores = new Map();
   const lastRow = sheet.getLastRow();
 
   if (lastRow >= linhaInicio) {
     const totalLinhasAtuais = lastRow - linhaInicio + 1;
     const idsAtuais = sheet.getRange(linhaInicio, 2, totalLinhasAtuais, 1).getValues();
-    const situacoesAtuais = sheet.getRange(linhaInicio, 22, totalLinhasAtuais, 1).getValues();
+    const situacoesAtuais = sheet.getRange(linhaInicio, 25, totalLinhasAtuais, 1).getValues(); // Coluna Y: Situação
 
     for (let i = 0; i < totalLinhasAtuais; i++) {
       const idRaw = String(idsAtuais[i][0] || '').trim();
@@ -718,21 +679,43 @@ function gravarDadosNaMatriz(sheet, novosDados) {
     }
   }
 
-  // 2. Filtro Rigoroso: Apenas dados processados válidos (elimina fantasmas com preço R$ 0,00 e sem vendas)
+  // 2. Filtro Rigoroso e Aplicação da Verdade de Status
   const catalogoMestre = new Map();
 
   novosDados.forEach(item => {
     const idLimpo = normalizarIdML(item.idAnuncio);
     if (idsExcluidos.has(idLimpo) || idsExcluidos.has(item.idAnuncio)) return;
 
-    // Descarta qualquer registro inconsistente que tenha ficado com preço 0 e sem vendas
     if (item.precoVenda <= 0 && item.vendas === 0) return;
 
-    // Preserva status manual prévio se existir
+    let situacaoFinal = item.situacao;
+
+    // Se houver histórico anterior na planilha:
     if (statusAnteriores.has(item.idAnuncio)) {
-      item.situacao = statusAnteriores.get(item.idAnuncio);
+      const statusSalvo = statusAnteriores.get(item.idAnuncio);
+
+      // Blindagem: só aceita 'Teste A/B Ativo' se o teste realmente existir aberto no Log
+      if (statusSalvo.includes("Teste") || statusSalvo.includes("Otimiz")) {
+        if (idsEmTesteAberto.has(item.idAnuncio)) {
+          situacaoFinal = statusSalvo;
+        } else {
+          situacaoFinal = item.isEsgotadoNoMarketplace ? '📦 Esgotado / Pausado' : '🟢 Validado / Estável';
+        }
+      } else {
+        // Se no marketplace estiver zerado/pausado, o status de esgotado prevalece
+        if (item.isEsgotadoNoMarketplace) {
+          situacaoFinal = '📦 Esgotado / Pausado';
+        } else {
+          situacaoFinal = statusSalvo;
+        }
+      }
+    } else {
+      if (item.isEsgotadoNoMarketplace) {
+        situacaoFinal = '📦 Esgotado / Pausado';
+      }
     }
 
+    item.situacao = situacaoFinal;
     catalogoMestre.set(item.idAnuncio, item);
   });
 
@@ -754,11 +737,11 @@ function gravarDadosNaMatriz(sheet, novosDados) {
     return margemB - margemA;
   });
 
-  // 4. Montagem dos Blocos (Respeita ARRAYFORMULA em L, M, S, T, U)
+  // 4. Montagem dos Blocos (Respeita ARRAYFORMULA em L, M, V, W, X)
   const totalFinal = listaConsolidada.length;
-  const bloco1_A_ate_K = [];
-  const bloco2_N_ate_R = [];
-  const bloco3_V = [];
+  const bloco1_A_ate_K = []; // Colunas 1 a 11
+  const bloco2_N_ate_U = []; // Colunas 14 a 21 (inclui S, T, U)
+  const bloco3_Y = [];       // Coluna 25 (Situação)
 
   listaConsolidada.forEach(r => {
     bloco1_A_ate_K.push([
@@ -766,26 +749,48 @@ function gravarDadosNaMatriz(sheet, novosDados) {
       r.tipoAnuncio, r.logistica, r.precoVenda, r.cmv,
       r.comissao, r.freteTaxaFixa
     ]);
-    bloco2_N_ate_R.push([
-      r.visitas, r.vendas, r.cvr, r.buyBox, r.devolucoes
+    bloco2_N_ate_U.push([
+      r.visitas, r.vendas, r.cvr, r.buyBox, r.devolucoes,
+      r.estoqueAtual, r.projecao40d, r.necessidadeEstoque
     ]);
-    bloco3_V.push([r.situacao]);
+    bloco3_Y.push([r.situacao]);
   });
 
-  // 5. Limpeza de linhas excedentes da execução anterior
+  // 5. Limpeza de linhas antigas
   if (lastRow >= linhaInicio) {
     const linhasLimpar = lastRow - linhaInicio + 1;
     sheet.getRange(linhaInicio, 1, linhasLimpar, 11).clearContent();
-    sheet.getRange(linhaInicio, 14, linhasLimpar, 5).clearContent();
-    sheet.getRange(linhaInicio, 22, linhasLimpar, 1).clearContent();
+    sheet.getRange(linhaInicio, 14, linhasLimpar, 8).clearContent();
+    sheet.getRange(linhaInicio, 25, linhasLimpar, 1).clearContent();
   }
 
-  // 6. Gravação limpa
+  // 6. Gravação limpa nos blocos
   sheet.getRange(linhaInicio, 1, totalFinal, 11).setValues(bloco1_A_ate_K);
-  sheet.getRange(linhaInicio, 14, totalFinal, 5).setValues(bloco2_N_ate_R);
-  sheet.getRange(linhaInicio, 22, totalFinal, 1).setValues(bloco3_V);
+  sheet.getRange(linhaInicio, 14, totalFinal, 8).setValues(bloco2_N_ate_U);
+  sheet.getRange(linhaInicio, 25, totalFinal, 1).setValues(bloco3_Y);
 
   aplicarEstiloVisualMatriz(sheet, linhaInicio, totalFinal);
+}
+
+function carregarIdsEmTesteAberto(ss) {
+  const ids = new Set();
+  const sheetLog = ss.getSheetByName(CONFIG.SHEETS.TESTES);
+  if (!sheetLog) return ids;
+
+  const lastRow = sheetLog.getLastRow();
+  if (lastRow < 4) return ids;
+
+  const dadosLog = sheetLog.getRange(4, 1, lastRow - 3, 17).getValues();
+  dadosLog.forEach(row => {
+    const idAnuncio = String(row[1] || '').trim();
+    const veredito = String(row[16] || '').toLowerCase();
+    if (veredito.includes("andamento") && idAnuncio) {
+      ids.add(idAnuncio);
+      const idLimpo = normalizarIdML(idAnuncio);
+      if (idLimpo) ids.add(idLimpo);
+    }
+  });
+  return ids;
 }
 
 function carregarIdsExcluidos(ss) {
@@ -795,7 +800,7 @@ function carregarIdsExcluidos(ss) {
 
   const dados = abaExcluidos.getDataRange().getValues();
   for (let i = 1; i < dados.length; i++) {
-    const idRaw = String(dados[i][1] || '').trim(); // Coluna B: ID do Anúncio
+    const idRaw = String(dados[i][1] || '').trim();
     if (idRaw) {
       ids.add(idRaw);
       const idLimpo = normalizarIdML(idRaw);
@@ -806,16 +811,14 @@ function carregarIdsExcluidos(ss) {
 }
 
 /**
- * FORMATAÇÃO VISUAL EXECUTIVA DA MATRIZ OPERACIONAL
- * Aplica negrito e cores de fundo destacadas nas colunas-chave: A, C, H, M, P, S, T.
+ * Formatação Executiva Adaptada para 25 Colunas
  */
 function aplicarEstiloVisualMatriz(sheet, startRow, numRows) {
   if (numRows <= 0) return;
 
-  const totalColunas = 22;
+  const totalColunas = 25;
   const rangeTotal = sheet.getRange(startRow, 1, numRows, totalColunas);
 
-  // 1. Higienização Base: limpa resquícios e define o padrão das colunas comuns
   rangeTotal
     .setFontFamily("Segoe UI")
     .setFontSize(10)
@@ -825,80 +828,46 @@ function aplicarEstiloVisualMatriz(sheet, startRow, numRows) {
     .setVerticalAlignment("middle")
     .setWrapStrategy(SpreadsheetApp.WrapStrategy.CLIP);
 
-  // 2. Alinhamentos Horizontais por Tipo de Dado
-  // Identificadores e Categorias: Centro
-  sheet.getRange(startRow, 1, numRows, 3).setHorizontalAlignment("center"); // Canal (A), ID (B), SKU (C)
-  sheet.getRange(startRow, 5, numRows, 3).setHorizontalAlignment("center"); // Tipo Oferta (E), Tipo Anúncio (F), Logística (G)
-  
-  // Textos Descritivos: Esquerda
-  sheet.getRange(startRow, 4, numRows, 1).setHorizontalAlignment("left");   // Título do Anúncio (D)
-  sheet.getRange(startRow, 21, numRows, 1).setHorizontalAlignment("left");  // Plano de Ação 5W2H (U)
-
-  // Métricas Financeiras e Volumes: Direita
-  sheet.getRange(startRow, 8, numRows, 4).setHorizontalAlignment("right");  // Preço (H), CMV (I), Comissão (J), Frete (K)
-  sheet.getRange(startRow, 12, numRows, 1).setHorizontalAlignment("right"); // Margem R$ (L)
-  sheet.getRange(startRow, 14, numRows, 2).setHorizontalAlignment("right"); // Visitas (N), Vendas (O)
-  sheet.getRange(startRow, 18, numRows, 1).setHorizontalAlignment("right"); // Unidades Devolvidas (R)
-
-  // PERCENTUAIS: Rigorosamente Centralizados
+  // Alinhamentos Horizontais
+  sheet.getRange(startRow, 1, numRows, 3).setHorizontalAlignment("center");  // Canal (A), ID (B), SKU (C)
+  sheet.getRange(startRow, 4, numRows, 1).setHorizontalAlignment("left");    // Título (D)
+  sheet.getRange(startRow, 5, numRows, 3).setHorizontalAlignment("center");  // Oferta (E), Anúncio (F), Logística (G)
+  sheet.getRange(startRow, 8, numRows, 4).setHorizontalAlignment("right");   // Preço (H), CMV (I), Comis (J), Frete (K)
+  sheet.getRange(startRow, 12, numRows, 1).setHorizontalAlignment("right");  // Margem R$ (L)
   sheet.getRange(startRow, 13, numRows, 1).setHorizontalAlignment("center"); // Margem % (M)
-  sheet.getRange(startRow, 16, numRows, 2).setHorizontalAlignment("center"); // CVR % (P) e Buy Box % (Q)
-  sheet.getRange(startRow, 19, numRows, 1).setHorizontalAlignment("center"); // Taxa Devolução % (S)
-  sheet.getRange(startRow, 20, numRows, 1).setHorizontalAlignment("center"); // Classificação CX (T)
-  sheet.getRange(startRow, 22, numRows, 1).setHorizontalAlignment("center"); // Situação Operacional (V)
+  sheet.getRange(startRow, 14, numRows, 2).setHorizontalAlignment("right");  // Visitas (N), Vendas (O)
+  sheet.getRange(startRow, 16, numRows, 2).setHorizontalAlignment("center"); // CVR % (P), Buy Box % (Q)
+  sheet.getRange(startRow, 18, numRows, 1).setHorizontalAlignment("right");  // Devoluções (R)
+  sheet.getRange(startRow, 19, numRows, 3).setHorizontalAlignment("right");  // Estoque (S), Projeção (T), Necessidade (U)
+  sheet.getRange(startRow, 22, numRows, 1).setHorizontalAlignment("center"); // Taxa Dev % (V)
+  sheet.getRange(startRow, 23, numRows, 1).setHorizontalAlignment("center"); // CX (W)
+  sheet.getRange(startRow, 24, numRows, 1).setHorizontalAlignment("left");   // 5W2H (X)
+  sheet.getRange(startRow, 25, numRows, 1).setHorizontalAlignment("center"); // Situação (Y)
 
-  // 3. Formatação Numérica Padrão BRL e Percentual
-  sheet.getRange(startRow, 8, numRows, 4).setNumberFormat("R$ #,##0.00");   // Colunas H, I, J, K
-  sheet.getRange(startRow, 12, numRows, 1).setNumberFormat("R$ #,##0.00");  // Coluna L
-  sheet.getRange(startRow, 13, numRows, 1).setNumberFormat("0.00%");        // Coluna M
-  sheet.getRange(startRow, 14, numRows, 2).setNumberFormat("#,##0");        // Colunas N, O
-  sheet.getRange(startRow, 16, numRows, 2).setNumberFormat("0.00%");        // Colunas P, Q
-  sheet.getRange(startRow, 18, numRows, 1).setNumberFormat("#,##0");        // Coluna R
-  sheet.getRange(startRow, 19, numRows, 1).setNumberFormat("0.00%");        // Coluna S
+  // Formatos Numéricos
+  sheet.getRange(startRow, 8, numRows, 4).setNumberFormat("R$ #,##0.00");
+  sheet.getRange(startRow, 12, numRows, 1).setNumberFormat("R$ #,##0.00");
+  sheet.getRange(startRow, 13, numRows, 1).setNumberFormat("0.00%");
+  sheet.getRange(startRow, 14, numRows, 2).setNumberFormat("#,##0");
+  sheet.getRange(startRow, 16, numRows, 2).setNumberFormat("0.00%");
+  sheet.getRange(startRow, 18, numRows, 4).setNumberFormat("#,##0");        // R, S, T, U
+  sheet.getRange(startRow, 22, numRows, 1).setNumberFormat("0.00%");
 
-  // 4. DESTAQUE VISUAL DAS COLUNAS-CHAVE (Negrito + Cor de Fundo Chamativa)
-  // Coluna A (1): Canal
-  sheet.getRange(startRow, 1, numRows, 1)
-    .setFontWeight("bold")
-    .setBackground("#F1F5F9"); // Cinza ardósia suave
+  // Destaques em Negrito e Cores Chamativas
+  sheet.getRange(startRow, 1, numRows, 1).setFontWeight("bold").setBackground("#F1F5F9"); // Canal (A)
+  sheet.getRange(startRow, 3, numRows, 1).setFontWeight("bold").setBackground("#E0E7FF"); // SKU (C)
+  sheet.getRange(startRow, 8, numRows, 1).setFontWeight("bold").setBackground("#DCFCE7"); // Preço (H)
+  sheet.getRange(startRow, 12, numRows, 1).setFontWeight("bold");                          // Margem R$ (L)
+  sheet.getRange(startRow, 13, numRows, 1).setFontWeight("bold").setBackground("#D1FAE5"); // Margem % (M)
+  sheet.getRange(startRow, 15, numRows, 1).setFontWeight("bold");                          // Vendas (O)
+  sheet.getRange(startRow, 16, numRows, 1).setFontWeight("bold").setBackground("#FEF3C7"); // CVR % (P)
+  sheet.getRange(startRow, 21, numRows, 1).setFontWeight("bold");                          // Necessidade Estoque (U)
+  sheet.getRange(startRow, 22, numRows, 1).setFontWeight("bold").setBackground("#FEE2E2"); // Taxa Dev % (V)
+  sheet.getRange(startRow, 23, numRows, 1).setFontWeight("bold").setBackground("#EDE9FE"); // CX (W)
+  sheet.getRange(startRow, 25, numRows, 1).setFontWeight("bold");                          // Situação (Y)
 
-  // Coluna C (3): SKU Principal
-  sheet.getRange(startRow, 3, numRows, 1)
-    .setFontWeight("bold")
-    .setBackground("#E0E7FF"); // Azul anil suave
-
-  // Coluna H (8): Preço de Venda (R$)
-  sheet.getRange(startRow, 8, numRows, 1)
-    .setFontWeight("bold")
-    .setBackground("#DCFCE7"); // Verde esmeralda suave
-
-  // Coluna M (13): Margem Contribuição (%)
-  sheet.getRange(startRow, 13, numRows, 1)
-    .setFontWeight("bold")
-    .setBackground("#D1FAE5"); // Verde menta vibrante
-
-  // Coluna P (16): Taxa Conversão (CVR %)
-  sheet.getRange(startRow, 16, numRows, 1)
-    .setFontWeight("bold")
-    .setBackground("#FEF3C7"); // Âmbar/Dourado suave
-
-  // Coluna S (19): Taxa Devolução (%)
-  sheet.getRange(startRow, 19, numRows, 1)
-    .setFontWeight("bold")
-    .setBackground("#FEE2E2"); // Coral/Vermelho suave para alerta de CX
-
-  // Coluna T (20): Classificação CX
-  sheet.getRange(startRow, 20, numRows, 1)
-    .setFontWeight("bold")
-    .setBackground("#EDE9FE"); // Roxo/Lilás suave
-
-  // Destaque adicional em negrito para métricas de apoio
-  sheet.getRange(startRow, 12, numRows, 1).setFontWeight("bold"); // Margem R$ (L)
-  sheet.getRange(startRow, 15, numRows, 1).setFontWeight("bold"); // Vendas Unidades (O)
-  sheet.getRange(startRow, 22, numRows, 1).setFontWeight("bold"); // Situação (V)
-
-  // 5. Cores Semânticas de Fundo na Coluna V (Situação Operacional)
-  const rangeSituacao = sheet.getRange(startRow, 22, numRows, 1);
+  // Cores Semânticas da Coluna Y (Situação)
+  const rangeSituacao = sheet.getRange(startRow, 25, numRows, 1);
   const valoresSituacao = rangeSituacao.getValues();
   const coresFundo = [];
 
@@ -906,20 +875,19 @@ function aplicarEstiloVisualMatriz(sheet, startRow, numRows) {
     const status = String(valoresSituacao[i][0] || '').toLowerCase();
 
     if (status.includes("validado") || status.includes("estável")) {
-      coresFundo.push(["#ECFDF5"]); // Verde
+      coresFundo.push(["#ECFDF5"]);
     } else if (status.includes("teste") || status.includes("otimiz")) {
-      coresFundo.push(["#FEF3C7"]); // Amarelo
+      coresFundo.push(["#FEF3C7"]);
     } else if (status.includes("exclu") || status.includes("descontinu")) {
-      coresFundo.push(["#FEE2E2"]); // Vermelho
+      coresFundo.push(["#FEE2E2"]);
     } else if (status.includes("esgotado") || status.includes("pausado")) {
-      coresFundo.push(["#E0E7FF"]); // Azul
+      coresFundo.push(["#E0E7FF"]);
     } else {
-      coresFundo.push(["#F3F4F6"]); // Cinza
+      coresFundo.push(["#F3F4F6"]);
     }
   }
   rangeSituacao.setBackgrounds(coresFundo);
 
-  // 6. Bordas Sutis e Altura Padrão de Linha
   rangeTotal.setBorder(true, true, true, true, true, true, "#E5E7EB", SpreadsheetApp.BorderStyle.SOLID);
   for (let r = 0; r < numRows; r++) {
     sheet.setRowHeight(startRow + r, 28);
@@ -1084,24 +1052,15 @@ function parseNumeroMoeda(val) {
   if (!val) return 0;
   
   let str = String(val).replace('R$', '').replace('$', '').trim();
-  
-  // Caso 1: Contém ponto e vírgula (ex: 1.250,50 ou 1,250.50)
   if (str.indexOf('.') !== -1 && str.indexOf(',') !== -1) {
     if (str.lastIndexOf(',') > str.lastIndexOf('.')) {
-      // Padrão Brasileiro: 1.250,50 -> 1250.50
       str = str.replace(/\./g, '').replace(',', '.');
     } else {
-      // Padrão Americano: 1,250.50 -> 1250.50
       str = str.replace(/,/g, '');
     }
-  } 
-  // Caso 2: Apenas vírgula presente (Padrão BR decimal: 67,90 -> 67.90)
-  else if (str.indexOf(',') !== -1) {
+  } else if (str.indexOf(',') !== -1) {
     str = str.replace(',', '.');
   }
-  // Caso 3: Apenas ponto presente (Padrão US da Amazon: 67.90 ou 67.9 -> preserva o ponto)
-  // Não remove o ponto decimal.
-
   return parseFloat(str) || 0;
 }
 
@@ -1119,7 +1078,8 @@ function configurarCabecalhos(sheet) {
     "Tipo de Anúncio", "Logística Atual", "Preço de Venda (R$)", "CMV Composto (R$)",
     "Comissão Plataforma (R$)", "Frete / Taxas Fixas (R$)", "Margem Contribuição (R$)",
     "Margem Contribuição (%)", "Sessões / Visitas", "Vendas (Unidades)", "Taxa Conversão (CVR %)",
-    "Buy Box %", "Unidades Devolvidas", "Taxa Devolução (%)", "Classificação CX", "Plano de Ação (5W2H)", "Situação"
+    "Buy Box %", "Unidades Devolvidas", "Estoque Atual", "Projeção Vendas (40d)", "Necessidade Estoque",
+    "Taxa Devolução (%)", "Classificação CX", "Plano de Ação (5W2H)", "Situação"
   ];
   sheet.getRange(7, 1, 1, cabecalhos.length).setValues([cabecalhos]).setFontWeight("bold").setBackground("#f3f3f3");
   sheet.setFrozenRows(7);
@@ -1133,7 +1093,10 @@ function executarAtualizacaoSegura() {
     obterArquivoMaisRecente(CONFIG.FOLDERS.DESEMPENHO_ML),
     obterArquivoMaisRecente(CONFIG.FOLDERS.DESEMPENHO_AMZ),
     obterArquivoMaisRecente(CONFIG.FOLDERS.SITUACAO_ML),
-    obterArquivoMaisRecente(CONFIG.FOLDERS.SITUACAO_AMZ)
+    obterArquivoMaisRecente(CONFIG.FOLDERS.SITUACAO_AMZ),
+    obterArquivoMaisRecente(CONFIG.FOLDERS.ESTOQUE_CMV),
+    obterArquivoMaisRecente(CONFIG.FOLDERS.ESTOQUE_FULL_ML),
+    obterArquivoMaisRecente(CONFIG.FOLDERS.ESTOQUE_FULL_AMZ)
   ].filter(a => a !== null);
 
   if (arquivosAtuais.length === 0) {
