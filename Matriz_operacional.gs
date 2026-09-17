@@ -44,13 +44,23 @@ function atualizarMatrizOperacional() {
   const dadosConsolidados = [...dadosML, ...dadosAMZ];
 
   if (dadosConsolidados.length === 0) {
-    SpreadsheetApp.getUi().alert("Aviso: Nenhum dado foi encontrado nas pastas informadas.");
+    try {
+      SpreadsheetApp.getUi().alert("Aviso: Nenhum dado foi encontrado nas pastas informadas.");
+    } catch (e) {
+      Logger.log("Aviso: Nenhum dado foi encontrado nas pastas informadas.");
+    }
     return;
   }
 
   Logger.log(`4/4 - Gravando ${dadosConsolidados.length} anúncios na Matriz Operacional...`);
   gravarDadosNaMatriz(sheetMatriz, dadosConsolidados);
-  SpreadsheetApp.getUi().alert(`Sucesso! ${dadosConsolidados.length} anúncios atualizados na Matriz Operacional.`);
+
+  try {
+    SpreadsheetApp.getUi().alert(`Sucesso! ${dadosConsolidados.length} anúncios atualizados na Matriz Operacional.`);
+  } catch (e) {
+    ss.toast(`Sucesso! ${dadosConsolidados.length} anúncios atualizados.`, "Matriz Operacional", 5);
+    Logger.log(`Sucesso! ${dadosConsolidados.length} anúncios atualizados na Matriz Operacional.`);
+  }
 }
 
 /**
@@ -104,58 +114,124 @@ function carregarApoioDevolucoesML(ss) {
  * LEITURA DE PREÇOS REAIS: SITUAÇÃO DO CADASTRO
  * ----------------------------------------------------
  */
+
 function carregarPrecosCadastroML() {
   const mapa = {};
   const arquivo = obterArquivoMaisRecente(CONFIG.FOLDERS.SITUACAO_ML);
-  if (!arquivo) return mapa;
+  if (!arquivo) {
+    Logger.log("Aviso: Arquivo de Situação do Cadastro ML não localizado.");
+    return mapa;
+  }
 
   const wb = abrirArquivoComoPlanilha(arquivo);
   const sheet = wb.getSheets()[0];
   const dados = sheet.getDataRange().getValues();
 
+  // 1. Varre até a linha 10 para identificar onde começam os cabeçalhos
   let headerIndex = -1;
   for (let i = 0; i < Math.min(dados.length, 10); i++) {
     const linhaTexto = dados[i].join(" ").toLowerCase();
-    if (linhaTexto.includes('id do an') || linhaTexto.includes('título') || linhaTexto.includes('preco')) {
+    if (linhaTexto.includes('anúncio') || linhaTexto.includes('anuncio') || linhaTexto.includes('preço') || linhaTexto.includes('preco') || linhaTexto.includes('sku')) {
       headerIndex = i;
       break;
     }
   }
-  if (headerIndex === -1) return mapa;
 
-  const headers = dados[headerIndex];
-  const colId = headers.findIndex(h => /ID do an[uú]ncio/i.test(String(h)));
-  const colPreco = headers.findIndex(h => /Pre[çc]o/i.test(String(h)));
-  const colTipo = headers.findIndex(h => /Tipo de an[uú]ncio|Exposi[çc][ãa]o/i.test(String(h)));
-  const colLogistica = headers.findIndex(h => /Forma de entrega|Log[ií]stica|Envio/i.test(String(h)));
+  // Se não encontrar por palavra-chave, assume a linha 5 ou 6 padrão do ML
+  if (headerIndex === -1) headerIndex = 4;
 
-  if (colId === -1) return mapa;
+  // Unifica a linha encontrada com as linhas vizinhas para capturar subcabeçalhos divididos
+  const linhaA = dados[headerIndex] || [];
+  const linhaB = dados[headerIndex + 1] || [];
+  const totalCols = Math.max(linhaA.length, linhaB.length);
+  const headersUnificados = [];
 
-  for (let i = headerIndex + 1; i < dados.length; i++) {
-    const rawId = String(dados[i][colId] || '').trim();
+  for (let c = 0; c < totalCols; c++) {
+    const txtA = String(linhaA[c] || '').trim();
+    const txtB = String(linhaB[c] || '').trim();
+    headersUnificados.push(`${txtA} ${txtB}`.toLowerCase());
+  }
+
+  // 2. Mapeamento flexível das colunas (Nome técnico ou Índice alfabético exato)
+  // Coluna ID do anúncio: busca por id, código ou assume coluna A (índice 0)
+  let colId = headersUnificados.findIndex(h => /id do an[uú]ncio|c[oó]digo|#|an[uú]ncio/i.test(h));
+  if (colId === -1) colId = 0;
+
+  // Preço e Preço promocional
+  let colPrecoPromo = headersUnificados.findIndex(h => /promo[çc][ãa]o/i.test(h));
+  let colPrecoNormal = headersUnificados.findIndex(h => /pre[çc]o/i.test(h) && !/promo[çc][ãa]o|custo/i.test(h));
+
+  // Coluna AA (Tipo de Anúncio): Índice 26 (A=0, ..., Z=25, AA=26)
+  let colTipo = headersUnificados.findIndex(h => /tipo de an[uú]ncio/i.test(h));
+  if (colTipo === -1 && totalCols > 26) colTipo = 26;
+
+  // Coluna I (No Full): Índice 8 (A=0, B=1, ..., I=8)
+  let colFull = headersUnificados.findIndex(h => /no full/i.test(h));
+  if (colFull === -1 && totalCols > 8) colFull = 8;
+
+  // Tarifa de venda / Comissão
+  let colTarifa = headersUnificados.findIndex(h => /tarifa de venda/i.test(h));
+
+  // Peso físico da embalagem
+  let colPeso = headersUnificados.findIndex(h => /peso f[íi]sico/i.test(h));
+
+  // Determina a linha real onde iniciam os dados (pula subcabeçalho se houver)
+  const linhaInicio = headerIndex + 2;
+
+  for (let i = linhaInicio; i < dados.length; i++) {
+    let rawId = String(dados[i][colId] || '').trim();
     if (!rawId) continue;
 
-    const preco = colPreco !== -1 ? parseNumeroMoeda(dados[i][colPreco]) : 0;
-    
-    // Tipo de anúncio (Clássico ou Premium)
-    let tipo = 'Clássico';
+    // Normalização rigorosa do ID (remove .0 de números float e prefixos)
+    rawId = rawId.replace(/\.0$/, '').replace(/^MLB/i, '').trim();
+
+    // Leitura dos Preços
+    const precoPromo = colPrecoPromo !== -1 ? parseNumeroMoeda(dados[i][colPrecoPromo]) : 0;
+    const precoNormal = colPrecoNormal !== -1 ? parseNumeroMoeda(dados[i][colPrecoNormal]) : 0;
+    const precoFinal = precoPromo > 0 ? precoPromo : precoNormal;
+
+    // Leitura do Tipo de Anúncio (Coluna AA)
+    let tipoAnuncio = 'Clássico';
     if (colTipo !== -1) {
-      const tipoStr = String(dados[i][colTipo] || '').toLowerCase();
-      if (tipoStr.includes('premium')) tipo = 'Premium';
+      const valTipo = String(dados[i][colTipo] || '').toLowerCase();
+      if (valTipo.includes('premium')) tipoAnuncio = 'Premium';
     }
 
-    // Logística: FBML ou Mercado Envios
+    // Leitura do Full (Coluna I)
     let logistica = 'Mercado Envios';
-    if (colLogistica !== -1) {
-      const logStr = String(dados[i][colLogistica] || '').toLowerCase();
-      if (logStr.includes('full')) logistica = 'FBML';
+    if (colFull !== -1) {
+      const valFull = Number(dados[i][colFull]) || 0;
+      if (valFull > 0) logistica = 'FBML';
     }
 
-    const info = { preco: preco, tipoAnuncio: tipo, logistica: logistica };
-    const idLimpo = rawId.replace(/^MLB/i, '');
-    mapa[idLimpo] = info;
-    mapa[`MLB${idLimpo}`] = info;
+    // Tarifa de venda / Comissão
+    let pctTarifa = tipoAnuncio === 'Premium' ? 0.19 : 0.14;
+    if (colTarifa !== -1 && dados[i][colTarifa]) {
+      const t = parseNumeroPercentual(dados[i][colTarifa]);
+      if (t > 0) pctTarifa = t;
+    }
+
+    // Peso físico (kg)
+    let pesoKg = 0.4;
+    if (colPeso !== -1 && dados[i][colPeso]) {
+      const p = parseNumeroMoeda(dados[i][colPeso]);
+      if (p > 0) pesoKg = p;
+    }
+
+    const itemInfo = {
+      preco: precoFinal,
+      tipoAnuncio: tipoAnuncio,
+      logistica: logistica,
+      pctTarifa: pctTarifa,
+      pesoKg: pesoKg
+    };
+
+    // Armazena com e sem o prefixo MLB para garantir match perfeito
+    mapa[rawId] = itemInfo;
+    mapa[`MLB${rawId}`] = itemInfo;
   }
+
+  Logger.log(`Situação ML carregada com sucesso: ${Object.keys(mapa).length / 2} anúncios mapeados.`);
   return mapa;
 }
 
@@ -228,8 +304,13 @@ function processarMercadoLivre(tabelaCMV, tabelaKits, precosCadastro, mapaDevolu
     const visitas = Number(row[colVisitas]) || 0;
     const vendas = Number(row[colVendas]) || 0;
 
-    // Busca obrigatória na planilha de Situação do Cadastro
-    const preco = precosCadastro[idPuro] || precosCadastro[idAnuncio] || 0;
+    // Consulta aos dados enriquecidos da planilha de Cadastro
+    const infoCadastro = precosCadastro[idPuro] || precosCadastro[idAnuncio] || {};
+    const preco = Number(infoCadastro.preco) || 0;
+    const tipoAnuncio = infoCadastro.tipoAnuncio || 'Clássico';
+    const logistica = infoCadastro.logistica || 'Mercado Envios';
+    const pctTarifa = infoCadastro.pctTarifa || (tipoAnuncio === 'Premium' ? 0.19 : 0.14);
+    const pesoKg = infoCadastro.pesoKg || (sku.toUpperCase().includes('KIT') ? 0.7 : 0.4);
 
     let cvr = 0;
     if (colCvr !== -1 && row[colCvr]) {
@@ -240,14 +321,14 @@ function processarMercadoLivre(tabelaCMV, tabelaKits, precosCadastro, mapaDevolu
 
     const isKit = sku.toUpperCase().includes('KIT') || titulo.toUpperCase().includes('KIT');
     const tipoOferta = isKit ? 'Kit (>= R$ 79)' : 'Unitário (< R$ 79)';
-    const tipoAnuncio = 'Clássico';
-    const logistica = 'Mercado Envios / Full';
 
     const cmv = obterCMVProduto(sku, isKit, tabelaCMV, tabelaKits);
-    const comissao = preco * (tipoAnuncio === 'Premium' ? 0.19 : 0.14);
-    const frete = calcularFreteTaxaML(preco, isKit);
+    const comissao = preco * pctTarifa;
+    
+    // Frete calculado pelo peso real da embalagem em kg
+    const frete = calcularFretePorPesoRealML(preco, pesoKg);
 
-    // Consulta à aba Apoio_Devolucoes_ML
+    // Consulta de devoluções
     const devData = mapaDevolucoes[idPuro] || mapaDevolucoes[idAnuncio] || { qtd: 0 };
     const devolucoes = devData.qtd || 0;
 
@@ -360,46 +441,60 @@ function gravarDadosNaMatriz(sheet, dados) {
     }
   }
 
-  // Se não encontrar cabeçalho, adota linha 7 como padrão de cabeçalho
   if (headerRow === -1) headerRow = 7;
   const linhaInicioDados = headerRow + 1;
 
-  // Limpa apenas a área de dados anterior (da linhaInicioDados para baixo)
+  // 2. Limpa APENAS as colunas que recebem dados brutos, preservando os ARRAYFORMULA
   const lastRow = sheet.getLastRow();
   if (lastRow >= linhaInicioDados) {
-    sheet.getRange(linhaInicioDados, 1, lastRow - linhaInicioDados + 1, 21).clearContent();
+    const linhasParaLimpar = lastRow - linhaInicioDados + 1;
+    // Limpa Bloco 1 (Colunas A a K: 11 colunas)
+    sheet.getRange(linhaInicioDados, 1, linhasParaLimpar, 11).clearContent();
+    // Limpa Bloco 2 (Colunas N a R: 5 colunas)
+    sheet.getRange(linhaInicioDados, 14, linhasParaLimpar, 5).clearContent();
   }
 
-  const matrizFinal = [];
+  // 3. Monta as matrizes separadas
+  const bloco1_A_ate_K = []; // Colunas A a K (1 a 11)
+  const bloco2_N_ate_R = []; // Colunas N a R (14 a 18)
 
   for (let i = 0; i < numLinhas; i++) {
     const r = dados[i];
-    const row = linhaInicioDados + i; // Linha real da planilha
 
-    const formulaMargemR$ = `=H${row}-I${row}-J${row}-K${row}`;
-    const formulaMargemPct = `=SE(H${row}>0; L${row}/H${row}; 0)`;
-    const formulaTaxaDev = `=SE(O${row}>0; R${row}/O${row}; 0)`;
-    const formulaCX = `=SE(E(N${row}>=MEDIANA(N$${linhaInicioDados}:N$${linhaInicioDados + numLinhas - 1}); P${row}>=0,02); "Estrela"; SE(E(N${row}>=MEDIANA(N$${linhaInicioDados}:N$${linhaInicioDados + numLinhas - 1}); P${row}<0,015); "Vazamento de Funil"; SE(E(N${row}<MEDIANA(N$${linhaInicioDados}:N$${linhaInicioDados + numLinhas - 1}); P${row}>=0,02); "Joia Escondida"; "Zumbi")))`;
-    const formulaPlano = `=SE(T${row}="Estrela"; "Proteger Estoque no Full/DBA + Criar Variações"; SE(T${row}="Vazamento de Funil"; "Auditar Foto Hero + Inserir Tabela Manequim x cm"; SE(T${row}="Joia Escondida"; "Revisar SEO Título + Ativar Ads Controlado"; "Avaliar Exclusão após 2 ciclos sem tração")))`;
+    // Bloco 1: Canal até Frete/Taxas Fixas
+    bloco1_A_ate_K.push([
+      r.canal,          // Coluna A
+      r.idAnuncio,      // Coluna B
+      r.sku,            // Coluna C
+      r.titulo,         // Coluna D
+      r.tipoOferta,     // Coluna E
+      r.tipoAnuncio,    // Coluna F
+      r.logistica,      // Coluna G
+      r.precoVenda,     // Coluna H
+      r.cmv,            // Coluna I
+      r.comissao,       // Coluna J
+      r.freteTaxaFixa   // Coluna K
+    ]);
 
-    matrizFinal.push([
-      r.canal, r.idAnuncio, r.sku, r.titulo, r.tipoOferta,
-      r.tipoAnuncio, r.logistica, r.precoVenda, r.cmv,
-      r.comissao, r.freteTaxaFixa, formulaMargemR$, formulaMargemPct,
-      r.visitas, r.vendas, r.cvr, r.buyBox, r.devolucoes,
-      formulaTaxaDev, formulaCX, formulaPlano
+    // Bloco 2: Sessões até Unidades Devolvidas
+    bloco2_N_ate_R.push([
+      r.visitas,        // Coluna N
+      r.vendas,         // Coluna O
+      r.cvr,            // Coluna P
+      r.buyBox,         // Coluna Q
+      r.devolucoes      // Coluna R
     ]);
   }
 
-  // Grava exatamente a partir da linhaInicioDados identificada
-  sheet.getRange(linhaInicioDados, 1, numLinhas, 21).setValues(matrizFinal);
+  // 4. Grava os blocos sem tocar nas colunas L, M, S, T, U
+  sheet.getRange(linhaInicioDados, 1, numLinhas, 11).setValues(bloco1_A_ate_K);
+  sheet.getRange(linhaInicioDados, 14, numLinhas, 5).setValues(bloco2_N_ate_R);
 
-  sheet.getRange(linhaInicioDados, 8, numLinhas, 5).setNumberFormat("R$ #,##0.00");
-  sheet.getRange(linhaInicioDados, 13, numLinhas, 1).setNumberFormat("0.00%");
-  sheet.getRange(linhaInicioDados, 14, numLinhas, 2).setNumberFormat("#,##0");
-  sheet.getRange(linhaInicioDados, 16, numLinhas, 2).setNumberFormat("0.00%");
-  sheet.getRange(linhaInicioDados, 18, numLinhas, 1).setNumberFormat("#,##0");
-  sheet.getRange(linhaInicioDados, 19, numLinhas, 1).setNumberFormat("0.00%");
+  // 5. Aplica formatação numérica estrita nos blocos gravados
+  sheet.getRange(linhaInicioDados, 8, numLinhas, 4).setNumberFormat("R$ #,##0.00"); // H a K
+  sheet.getRange(linhaInicioDados, 14, numLinhas, 2).setNumberFormat("#,##0");        // N e O
+  sheet.getRange(linhaInicioDados, 16, numLinhas, 2).setNumberFormat("0.00%");        // P e Q
+  sheet.getRange(linhaInicioDados, 18, numLinhas, 1).setNumberFormat("#,##0");        // R
 }
 
 /**
@@ -407,16 +502,55 @@ function gravarDadosNaMatriz(sheet, dados) {
  * LÓGICA DE FRETE / TAXAS (OFICIAL ML E AMZ)
  * ----------------------------------------------------
  */
-function calcularFreteTaxaML(preco, isKit) {
+function calcularFretePorPesoRealML(preco, pesoKg) {
   const p = Number(preco) || 0;
-  if (p < 19.00) return 5.95;
-  if (p <= 48.99) return isKit ? 7.15 : 6.95;
-  if (p <= 78.99) return isKit ? 8.45 : 8.25;
-  if (p <= 99.99) return isKit ? 14.45 : 13.85;
-  if (p <= 119.99) return isKit ? 16.85 : 16.15;
-  if (p <= 149.99) return isKit ? 19.05 : 18.15;
-  if (p <= 199.99) return isKit ? 21.35 : 20.45;
-  return isKit ? 24.45 : 23.25;
+  const w = Number(pesoKg) || 0.4;
+
+  // Faixa 1: Até 0,3 kg
+  if (w <= 0.3) {
+    if (p < 19.00) return 5.65;
+    if (p <= 48.99) return 6.85;
+    if (p <= 78.99) return 8.15;
+    if (p <= 99.99) return 12.95;
+    if (p <= 119.99) return 14.95;
+    if (p <= 149.99) return 16.95;
+    if (p <= 199.99) return 19.05;
+    return 21.65;
+  }
+
+  // Faixa 2: De 0,3 a 0,5 kg (padrão cinto unitário)
+  if (w <= 0.5) {
+    if (p < 19.00) return 5.95;
+    if (p <= 48.99) return 6.95;
+    if (p <= 78.99) return 8.25;
+    if (p <= 99.99) return 13.85;
+    if (p <= 119.99) return 16.15;
+    if (p <= 149.99) return 18.15;
+    if (p <= 199.99) return 20.45;
+    return 23.25;
+  }
+
+  // Faixa 3: De 0,5 a 1 kg (padrão kits 2 e 3 peças)
+  if (w <= 1.0) {
+    if (p < 19.00) return 6.05;
+    if (p <= 48.99) return 7.15;
+    if (p <= 78.99) return 8.45;
+    if (p <= 99.99) return 14.45;
+    if (p <= 119.99) return 16.85;
+    if (p <= 149.99) return 19.05;
+    if (p <= 199.99) return 21.35;
+    return 24.45;
+  }
+
+  // Faixa 4: Acima de 1 kg (até 1,5 kg)
+  if (p < 19.00) return 6.15;
+  if (p <= 48.99) return 7.35;
+  if (p <= 78.99) return 8.65;
+  if (p <= 99.99) return 14.75;
+  if (p <= 119.99) return 17.15;
+  if (p <= 149.99) return 19.45;
+  if (p <= 199.99) return 21.75;
+  return 25.45;
 }
 
 function calcularFreteTaxaAMZ(preco, isKit) {
