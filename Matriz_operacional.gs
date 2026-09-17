@@ -145,8 +145,6 @@ function carregarPrecosCadastroML() {
   }
 
   const wb = abrirArquivoComoPlanilha(arquivo);
-  
-  // 1. Seleciona a aba que contém os dados reais (evita abas de instruções com poucas linhas)
   const sheets = wb.getSheets();
   let sheet = sheets[0];
   for (let i = 0; i < sheets.length; i++) {
@@ -156,9 +154,7 @@ function carregarPrecosCadastroML() {
       sheet = s;
       break;
     }
-    if (s.getLastRow() > sheet.getLastRow()) {
-      sheet = s;
-    }
+    if (s.getLastRow() > sheet.getLastRow()) sheet = s;
   }
 
   const dados = sheet.getDataRange().getValues();
@@ -166,8 +162,8 @@ function carregarPrecosCadastroML() {
 
   const totalColunas = Math.max(...dados.slice(0, 15).map(r => r.length));
 
-  // 2. Mapeamento das colunas nos cabeçalhos iniciais
   let colId = 0;
+  let colStatus = -1;
   let colPrecoPromo = -1;
   let colPrecoNormal = -1;
   let colTipo = -1;
@@ -177,99 +173,71 @@ function carregarPrecosCadastroML() {
 
   for (let r = 0; r < Math.min(dados.length, 12); r++) {
     const linhaTexto = dados[r].map(c => String(c).toLowerCase()).join(" ");
-    if (/pre[çc]o|an[uú]ncio|c[oó]digo|#|estoque|sku/.test(linhaTexto)) {
+    if (/pre[çc]o|an[uú]ncio|c[oó]digo|#|estoque|sku|status/.test(linhaTexto)) {
       for (let c = 0; c < dados[r].length; c++) {
         const val = String(dados[r][c] || '').trim().toLowerCase();
         if (!val) continue;
 
-        // ID do anúncio
-        if (/^(#\s*do\s*an[uú]ncio|id\s*do\s*an[uú]ncio|c[oó]digo\s*do\s*an[uú]ncio|#)$/i.test(val)) {
-          colId = c;
-        }
-        // Preço em promoção
-        if (val.includes("promo") && (val.includes("pre") || val.includes("valor"))) {
-          colPrecoPromo = c;
-        }
-        // Preço normal
+        if (/^(#\s*do\s*an[uú]ncio|id\s*do\s*an[uú]ncio|c[oó]digo\s*do\s*an[uú]ncio|#)$/i.test(val)) colId = c;
+        if (val === 'status' || val.includes('status do an')) colStatus = c;
+        if (val.includes("promo") && (val.includes("pre") || val.includes("valor"))) colPrecoPromo = c;
         else if ((val.includes("preço") || val.includes("preco")) && !val.includes("promo") && !val.includes("custo")) {
           if (colPrecoNormal === -1) colPrecoNormal = c;
         }
-        // Tipo de anúncio (Coluna AA)
-        if (val.includes("tipo") && (val.includes("an") || val.includes("pub"))) {
-          colTipo = c;
-        }
-        // Full (Coluna I)
-        if (val.includes("no full") || (val.includes("full") && (val.includes("estoque") || val.includes("centro")))) {
-          colFull = c;
-        }
-        // Tarifa de venda / Comissão
-        if (val.includes("tarifa") || val.includes("comiss")) {
-          colTarifa = c;
-        }
-        // Peso físico da embalagem
-        if (val.includes("peso") && (val.includes("f") || val.includes("kg") || val.includes("emb"))) {
-          colPeso = c;
-        }
+        if (val.includes("tipo") && (val.includes("an") || val.includes("pub"))) colTipo = c;
+        if (val.includes("no full") || (val.includes("full") && (val.includes("estoque") || val.includes("centro")))) colFull = c;
+        if (val.includes("tarifa") || val.includes("comiss")) colTarifa = c;
+        if (val.includes("peso") && (val.includes("f") || val.includes("kg") || val.includes("emb"))) colPeso = c;
       }
     }
   }
 
-  // Posições fixas caso os cabeçalhos sejam mesclados
-  if (colTipo === -1 && totalColunas > 26) colTipo = 26; // Coluna AA
-  if (colFull === -1 && totalColunas > 8) colFull = 8;   // Coluna I
+  if (colStatus === -1 && totalColunas > 4) colStatus = 4; // Coluna E padrão
+  if (colTipo === -1 && totalColunas > 26) colTipo = 26;   // Coluna AA padrão
+  if (colFull === -1 && totalColunas > 8) colFull = 8;     // Coluna I padrão
 
-  // 3. Extração linha a linha dos anúncios
   for (let r = 0; r < dados.length; r++) {
     const row = dados[r];
-    
-    // Tenta obter ID pela coluna mapeada
     let idLimpo = colId < row.length ? normalizarIdML(row[colId]) : '';
     
-    // Se não encontrou, varre as 4 primeiras colunas da linha
     if (!idLimpo) {
       for (let c = 0; c < Math.min(row.length, 4); c++) {
         const candidate = normalizarIdML(row[c]);
-        if (candidate) {
-          idLimpo = candidate;
-          break;
-        }
+        if (candidate) { idLimpo = candidate; break; }
       }
     }
+    if (!idLimpo) continue;
 
-    if (!idLimpo) continue; // Pula linhas de instruções ou cabeçalhos
+    // Status do anúncio (Ativo vs Pausado/Inativo)
+    let status = 'ativo';
+    if (colStatus !== -1 && colStatus < row.length) {
+      const valStatus = String(row[colStatus] || '').trim().toLowerCase();
+      if (valStatus) status = valStatus;
+    }
 
-    // Preço de venda (promoção tem precedência)
     const pPromo = colPrecoPromo !== -1 && colPrecoPromo < row.length ? parseNumeroMoeda(row[colPrecoPromo]) : 0;
     const pNorm = colPrecoNormal !== -1 && colPrecoNormal < row.length ? parseNumeroMoeda(row[colPrecoNormal]) : 0;
     const precoFinal = pPromo > 0 ? pPromo : pNorm;
 
-    // Tipo de anúncio (Clássico ou Premium)
     let tipoAnuncio = 'Clássico';
     if (colTipo !== -1 && colTipo < row.length) {
       const valTipo = String(row[colTipo] || '').toLowerCase();
-      if (valTipo.includes('premium') || valTipo.includes('pro')) {
-        tipoAnuncio = 'Premium';
-      }
+      if (valTipo.includes('premium') || valTipo.includes('pro')) tipoAnuncio = 'Premium';
     }
 
-    // Logística (Coluna I: No Full > 0 impera FBML)
     let logistica = 'Mercado Envios';
     if (colFull !== -1 && colFull < row.length) {
       const valFullStr = String(row[colFull] || '').trim().toLowerCase();
       const valFullNum = Number(valFullStr) || 0;
-      if (valFullNum > 0 || valFullStr.includes('full') || valFullStr.includes('sim')) {
-        logistica = 'FBML';
-      }
+      if (valFullNum > 0 || valFullStr.includes('full') || valFullStr.includes('sim')) logistica = 'FBML';
     }
 
-    // Tarifa percentual
     let pctTarifa = tipoAnuncio === 'Premium' ? 0.19 : 0.14;
     if (colTarifa !== -1 && colTarifa < row.length && row[colTarifa]) {
       const t = parseNumeroPercentual(row[colTarifa]);
       if (t > 0) pctTarifa = t;
     }
 
-    // Peso físico (kg)
     let pesoKg = 0.4;
     if (colPeso !== -1 && colPeso < row.length && row[colPeso]) {
       const p = parseNumeroMoeda(row[colPeso]);
@@ -281,7 +249,8 @@ function carregarPrecosCadastroML() {
       tipoAnuncio: tipoAnuncio,
       logistica: logistica,
       pctTarifa: pctTarifa,
-      pesoKg: pesoKg
+      pesoKg: pesoKg,
+      status: status
     };
 
     mapa[idLimpo] = itemInfo;
@@ -362,15 +331,20 @@ function processarMercadoLivre(tabelaCMV, tabelaKits, precosCadastro, mapaDevolu
     const idLimpo = normalizarIdML(rawId);
     if (!idLimpo) continue;
 
-    // ID padronizado com MLB para exibição na Matriz Operacional
     const idAnuncioFormatado = `MLB${idLimpo}`;
     const sku = String(row[colSku] || '').trim();
     const titulo = String(row[colTitulo] || '').trim();
     const visitas = Number(row[colVisitas]) || 0;
     const vendas = Number(row[colVendas]) || 0;
 
-    // Busca infocadastro diretamente pelo ID numérico
+    // Consulta única de cadastro (evita duplicidade de declaração de variáveis)
     const infoCadastro = precosCadastro[idLimpo] || precosCadastro[idAnuncioFormatado] || {};
+    
+    // Regra de Governança: Desconsidera anúncios inativos na planilha de cadastro
+    if (infoCadastro.status && !infoCadastro.status.includes('ativ')) {
+      continue;
+    }
+
     const preco = Number(infoCadastro.preco) || 0;
     const tipoAnuncio = infoCadastro.tipoAnuncio || 'Clássico';
     const logistica = infoCadastro.logistica || 'Mercado Envios';
@@ -588,68 +562,141 @@ function limparArquivosTemporarios() {
  * GRAVAÇÃO NA MATRIZ COM FÓRMULAS PRESERVADAS
  * ----------------------------------------------------
  */
-function gravarDadosNaMatriz(sheet, dados) {
-  const numLinhas = dados.length;
-  if (numLinhas === 0) return;
-
+function gravarDadosNaMatriz(sheet, novosDados) {
+  // 1. Identifica a linha de cabeçalho dinamicamente
   let headerRow = -1;
-  const maxScanRows = Math.min(sheet.getLastRow() || 20, 20);
-  if (maxScanRows > 0) {
-    const scanRange = sheet.getRange(1, 1, maxScanRows, 5).getValues();
-    for (let r = 0; r < scanRange.length; r++) {
-      const linhaStr = scanRange[r].join(" ").toLowerCase();
-      if (linhaStr.includes("canal") || linhaStr.includes("id do an")) {
+  const maxScan = Math.min(sheet.getLastRow() || 20, 20);
+  if (maxScan > 0) {
+    const scan = sheet.getRange(1, 1, maxScan, 5).getValues();
+    for (let r = 0; r < scan.length; r++) {
+      const linha = scan[r].join(" ").toLowerCase();
+      if (linha.includes("canal") || linha.includes("id do an")) {
         headerRow = r + 1;
         break;
       }
     }
   }
-
   if (headerRow === -1) headerRow = 7;
-  const linhaInicioDados = headerRow + 1;
+  const linhaInicio = headerRow + 1;
 
+  // 2. Leitura da Vitrine Estática Atual (Base já existente na planilha)
+  const catalogoMestre = new Map();
   const lastRow = sheet.getLastRow();
-  if (lastRow >= linhaInicioDados) {
-    const linhasParaLimpar = lastRow - linhaInicioDados + 1;
-    sheet.getRange(linhaInicioDados, 1, linhasParaLimpar, 11).clearContent();
-    sheet.getRange(linhaInicioDados, 14, linhasParaLimpar, 5).clearContent();
+
+  if (lastRow >= linhaInicio) {
+    const totalLinhasAtuais = lastRow - linhaInicio + 1;
+    const dadosAtuaisA_K = sheet.getRange(linhaInicio, 1, totalLinhasAtuais, 11).getValues();
+    const dadosAtuaisN_R = sheet.getRange(linhaInicio, 14, totalLinhasAtuais, 5).getValues();
+
+    for (let i = 0; i < totalLinhasAtuais; i++) {
+      const idRaw = String(dadosAtuaisA_K[i][1] || '').trim();
+      if (!idRaw) continue;
+
+      catalogoMestre.set(idRaw, {
+        canal: dadosAtuaisA_K[i][0],
+        idAnuncio: idRaw,
+        sku: dadosAtuaisA_K[i][2],
+        titulo: dadosAtuaisA_K[i][3],
+        tipoOferta: dadosAtuaisA_K[i][4],
+        tipoAnuncio: dadosAtuaisA_K[i][5],
+        logistica: dadosAtuaisA_K[i][6],
+        precoVenda: Number(dadosAtuaisA_K[i][7]) || 0,
+        cmv: Number(dadosAtuaisA_K[i][8]) || 0,
+        comissao: Number(dadosAtuaisA_K[i][9]) || 0,
+        freteTaxaFixa: Number(dadosAtuaisA_K[i][10]) || 0,
+        visitas: Number(dadosAtuaisN_R[i][0]) || 0,
+        vendas: Number(dadosAtuaisN_R[i][1]) || 0,
+        cvr: Number(dadosAtuaisN_R[i][2]) || 0,
+        buyBox: Number(dadosAtuaisN_R[i][3]) || 0,
+        devolucoes: Number(dadosAtuaisN_R[i][4]) || 0
+      });
+    }
   }
 
+  // 3. Upsert: Atualiza existentes e insere anúncios novos
+  novosDados.forEach(item => {
+    catalogoMestre.set(item.idAnuncio, item);
+  });
+
+  const listaConsolidada = Array.from(catalogoMestre.values());
+  if (listaConsolidada.length === 0) return;
+
+  // 4. Algoritmo de Ordenação Composta (Maior CVR + Margem R$ + Vendas no topo)
+  listaConsolidada.sort((a, b) => {
+    const margemA = Math.max(0, a.precoVenda - a.cmv - a.comissao - a.freteTaxaFixa);
+    const margemB = Math.max(0, b.precoVenda - b.cmv - b.comissao - b.freteTaxaFixa);
+
+    // Score ponderado de tração e rentabilidade
+    const scoreA = (a.cvr * 100 * 0.40) + (margemA * 0.35) + (a.vendas * 0.25);
+    const scoreB = (b.cvr * 100 * 0.40) + (margemB * 0.35) + (b.vendas * 0.25);
+
+    if (scoreB !== scoreA) return scoreB - scoreA;
+    if (b.vendas !== a.vendas) return b.vendas - a.vendas;
+    return margemB - margemA;
+  });
+
+  // 5. Preparação dos Blocos (Respeitando ArrayFormulas em L, M, S, T, U)
+  const totalFinal = listaConsolidada.length;
   const bloco1_A_ate_K = [];
   const bloco2_N_ate_R = [];
 
-  for (let i = 0; i < numLinhas; i++) {
-    const r = dados[i];
+  listaConsolidada.forEach(r => {
     bloco1_A_ate_K.push([
-      r.canal,
-      r.idAnuncio,
-      r.sku,
-      r.titulo,
-      r.tipoOferta,
-      r.tipoAnuncio,
-      r.logistica,
-      r.precoVenda,
-      r.cmv,
-      r.comissao,
-      r.freteTaxaFixa
+      r.canal, r.idAnuncio, r.sku, r.titulo, r.tipoOferta,
+      r.tipoAnuncio, r.logistica, r.precoVenda, r.cmv,
+      r.comissao, r.freteTaxaFixa
     ]);
-
     bloco2_N_ate_R.push([
-      r.visitas,
-      r.vendas,
-      r.cvr,
-      r.buyBox,
-      r.devolucoes
+      r.visitas, r.vendas, r.cvr, r.buyBox, r.devolucoes
     ]);
+  });
+
+  // Limpeza das linhas antigas apenas nos blocos de dados
+  if (lastRow >= linhaInicio) {
+    const linhasLimpar = lastRow - linhaInicio + 1;
+    sheet.getRange(linhaInicio, 1, linhasLimpar, 11).clearContent();
+    sheet.getRange(linhaInicio, 14, linhasLimpar, 5).clearContent();
   }
 
-  sheet.getRange(linhaInicioDados, 1, numLinhas, 11).setValues(bloco1_A_ate_K);
-  sheet.getRange(linhaInicioDados, 14, numLinhas, 5).setValues(bloco2_N_ate_R);
+  // 6. Gravação na planilha
+  sheet.getRange(linhaInicio, 1, totalFinal, 11).setValues(bloco1_A_ate_K);
+  sheet.getRange(linhaInicio, 14, totalFinal, 5).setValues(bloco2_N_ate_R);
 
-  sheet.getRange(linhaInicioDados, 8, numLinhas, 4).setNumberFormat("R$ #,##0.00");
-  sheet.getRange(linhaInicioDados, 14, numLinhas, 2).setNumberFormat("#,##0");
-  sheet.getRange(linhaInicioDados, 16, numLinhas, 2).setNumberFormat("0.00%");
-  sheet.getRange(linhaInicioDados, 18, numLinhas, 1).setNumberFormat("#,##0");
+  // 7. Formatação Visual Executiva e Destaque de Negrito
+  aplicarEstiloVisualMatriz(sheet, linhaInicio, totalFinal);
+}
+
+/**
+ * Formatação e Tipografia Profissional da Matriz Operacional
+ */
+function aplicarEstiloVisualMatriz(sheet, startRow, numRows) {
+  // Alinhamentos Horizontais
+  sheet.getRange(startRow, 1, numRows, 3).setHorizontalAlignment("center");  // Canal, ID, SKU
+  sheet.getRange(startRow, 4, numRows, 1).setHorizontalAlignment("left");    // Título
+  sheet.getRange(startRow, 5, numRows, 3).setHorizontalAlignment("center");  // Tipo Oferta, Tipo Anúncio, Logística
+  sheet.getRange(startRow, 8, numRows, 4).setHorizontalAlignment("right");   // Preço, CMV, Comissão, Frete
+  sheet.getRange(startRow, 12, numRows, 2).setHorizontalAlignment("right");  // Margens (ArrayFormula)
+  sheet.getRange(startRow, 14, numRows, 6).setHorizontalAlignment("right");  // Visitas, Vendas, CVR, BuyBox, Devs, Taxa Dev
+  sheet.getRange(startRow, 20, numRows, 1).setHorizontalAlignment("center"); // Classificação CX
+  sheet.getRange(startRow, 21, numRows, 1).setHorizontalAlignment("left");   // Plano de Ação
+
+  // Alinhamento Vertical
+  sheet.getRange(startRow, 1, numRows, 21).setVerticalAlignment("middle");
+
+  // Formatos Numéricos Oficiais
+  sheet.getRange(startRow, 8, numRows, 4).setNumberFormat("R$ #,##0.00");
+  sheet.getRange(startRow, 12, numRows, 1).setNumberFormat("R$ #,##0.00");
+  sheet.getRange(startRow, 13, numRows, 1).setNumberFormat("0.00%");
+  sheet.getRange(startRow, 14, numRows, 2).setNumberFormat("#,##0");
+  sheet.getRange(startRow, 16, numRows, 2).setNumberFormat("0.00%");
+  sheet.getRange(startRow, 18, numRows, 1).setNumberFormat("#,##0");
+  sheet.getRange(startRow, 19, numRows, 1).setNumberFormat("0.00%");
+
+  // Destaques em Negrito (Colunas Estratégicas de Decisão)
+  sheet.getRange(startRow, 3, numRows, 1).setFontWeight("bold");  // Coluna C: SKU Principal
+  sheet.getRange(startRow, 12, numRows, 2).setFontWeight("bold"); // Colunas L e M: Margem R$ e Margem %
+  sheet.getRange(startRow, 15, numRows, 2).setFontWeight("bold"); // Colunas O e P: Vendas e CVR %
+  sheet.getRange(startRow, 20, numRows, 1).setFontWeight("bold"); // Coluna T: Classificação CX
 }
 
 /**
