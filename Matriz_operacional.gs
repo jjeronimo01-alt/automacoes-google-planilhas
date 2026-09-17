@@ -115,7 +115,8 @@ function carregarPrecosCadastroML() {
 
   let headerIndex = -1;
   for (let i = 0; i < Math.min(dados.length, 10); i++) {
-    if (dados[i].includes('ID do anúncio') || dados[i].includes('ID do anuncio') || dados[i].includes('ID')) {
+    const linhaTexto = dados[i].join(" ").toLowerCase();
+    if (linhaTexto.includes('id do an') || linhaTexto.includes('título') || linhaTexto.includes('preco')) {
       headerIndex = i;
       break;
     }
@@ -125,17 +126,35 @@ function carregarPrecosCadastroML() {
   const headers = dados[headerIndex];
   const colId = headers.findIndex(h => /ID do an[uú]ncio/i.test(String(h)));
   const colPreco = headers.findIndex(h => /Pre[çc]o/i.test(String(h)));
+  const colTipo = headers.findIndex(h => /Tipo de an[uú]ncio|Exposi[çc][ãa]o/i.test(String(h)));
+  const colLogistica = headers.findIndex(h => /Forma de entrega|Log[ií]stica|Envio/i.test(String(h)));
 
-  if (colId === -1 || colPreco === -1) return mapa;
+  if (colId === -1) return mapa;
 
   for (let i = headerIndex + 1; i < dados.length; i++) {
     const rawId = String(dados[i][colId] || '').trim();
-    const preco = parseNumeroMoeda(dados[i][colPreco]);
-    if (rawId) {
-      const idLimpo = rawId.replace(/^MLB/i, '');
-      mapa[idLimpo] = preco;
-      mapa[`MLB${idLimpo}`] = preco;
+    if (!rawId) continue;
+
+    const preco = colPreco !== -1 ? parseNumeroMoeda(dados[i][colPreco]) : 0;
+    
+    // Tipo de anúncio (Clássico ou Premium)
+    let tipo = 'Clássico';
+    if (colTipo !== -1) {
+      const tipoStr = String(dados[i][colTipo] || '').toLowerCase();
+      if (tipoStr.includes('premium')) tipo = 'Premium';
     }
+
+    // Logística: FBML ou Mercado Envios
+    let logistica = 'Mercado Envios';
+    if (colLogistica !== -1) {
+      const logStr = String(dados[i][colLogistica] || '').toLowerCase();
+      if (logStr.includes('full')) logistica = 'FBML';
+    }
+
+    const info = { preco: preco, tipoAnuncio: tipo, logistica: logistica };
+    const idLimpo = rawId.replace(/^MLB/i, '');
+    mapa[idLimpo] = info;
+    mapa[`MLB${idLimpo}`] = info;
   }
   return mapa;
 }
@@ -290,7 +309,7 @@ function processarAmazon(tabelaCMV, tabelaKits, precosCadastro) {
     const isKit = titulo.toUpperCase().includes('KIT') || asinChild.toUpperCase().includes('KIT');
     const tipoOferta = isKit ? 'Kit (>= R$ 79)' : 'Unitário (< R$ 79)';
     const tipoAnuncio = 'Clássico';
-    const logistica = 'Modelo padrão da Amazon (DBA)';
+    const logistica = 'DBA';
 
     const cmv = obterCMVProduto(asinChild, isKit, tabelaCMV, tabelaKits);
     const comissao = preco * 0.14;
@@ -355,12 +374,12 @@ function gravarDadosNaMatriz(sheet, dados) {
 
   for (let i = 0; i < numLinhas; i++) {
     const r = dados[i];
-    const row = CONFIG.START_ROW + i;
+    const row = linhaInicioDados + i; // Linha real da planilha
 
     const formulaMargemR$ = `=H${row}-I${row}-J${row}-K${row}`;
     const formulaMargemPct = `=SE(H${row}>0; L${row}/H${row}; 0)`;
     const formulaTaxaDev = `=SE(O${row}>0; R${row}/O${row}; 0)`;
-    const formulaCX = `=SE(E(N${row}>=MEDIANA(N$${CONFIG.START_ROW}:N$${CONFIG.START_ROW + numLinhas - 1}); P${row}>=0,02); "Estrela"; SE(E(N${row}>=MEDIANA(N$${CONFIG.START_ROW}:N$${CONFIG.START_ROW + numLinhas - 1}); P${row}<0,015); "Vazamento de Funil"; SE(E(N${row}<MEDIANA(N$${CONFIG.START_ROW}:N$${CONFIG.START_ROW + numLinhas - 1}); P${row}>=0,02); "Joia Escondida"; "Zumbi")))`;
+    const formulaCX = `=SE(E(N${row}>=MEDIANA(N$${linhaInicioDados}:N$${linhaInicioDados + numLinhas - 1}); P${row}>=0,02); "Estrela"; SE(E(N${row}>=MEDIANA(N$${linhaInicioDados}:N$${linhaInicioDados + numLinhas - 1}); P${row}<0,015); "Vazamento de Funil"; SE(E(N${row}<MEDIANA(N$${linhaInicioDados}:N$${linhaInicioDados + numLinhas - 1}); P${row}>=0,02); "Joia Escondida"; "Zumbi")))`;
     const formulaPlano = `=SE(T${row}="Estrela"; "Proteger Estoque no Full/DBA + Criar Variações"; SE(T${row}="Vazamento de Funil"; "Auditar Foto Hero + Inserir Tabela Manequim x cm"; SE(T${row}="Joia Escondida"; "Revisar SEO Título + Ativar Ads Controlado"; "Avaliar Exclusão após 2 ciclos sem tração")))`;
 
     matrizFinal.push([
@@ -372,14 +391,15 @@ function gravarDadosNaMatriz(sheet, dados) {
     ]);
   }
 
-  sheet.getRange(CONFIG.START_ROW, 1, numLinhas, 21).setValues(matrizFinal);
+  // Grava exatamente a partir da linhaInicioDados identificada
+  sheet.getRange(linhaInicioDados, 1, numLinhas, 21).setValues(matrizFinal);
 
-  sheet.getRange(CONFIG.START_ROW, 8, numLinhas, 5).setNumberFormat("R$ #,##0.00");
-  sheet.getRange(CONFIG.START_ROW, 13, numLinhas, 1).setNumberFormat("0.00%");
-  sheet.getRange(CONFIG.START_ROW, 14, numLinhas, 2).setNumberFormat("#,##0");
-  sheet.getRange(CONFIG.START_ROW, 16, numLinhas, 2).setNumberFormat("0.00%");
-  sheet.getRange(CONFIG.START_ROW, 18, numLinhas, 1).setNumberFormat("#,##0");
-  sheet.getRange(CONFIG.START_ROW, 19, numLinhas, 1).setNumberFormat("0.00%");
+  sheet.getRange(linhaInicioDados, 8, numLinhas, 5).setNumberFormat("R$ #,##0.00");
+  sheet.getRange(linhaInicioDados, 13, numLinhas, 1).setNumberFormat("0.00%");
+  sheet.getRange(linhaInicioDados, 14, numLinhas, 2).setNumberFormat("#,##0");
+  sheet.getRange(linhaInicioDados, 16, numLinhas, 2).setNumberFormat("0.00%");
+  sheet.getRange(linhaInicioDados, 18, numLinhas, 1).setNumberFormat("#,##0");
+  sheet.getRange(linhaInicioDados, 19, numLinhas, 1).setNumberFormat("0.00%");
 }
 
 /**
