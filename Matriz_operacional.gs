@@ -7,6 +7,7 @@ const CONFIG = {
   FOLDERS: {
     SITUACAO_ML: '1YSOD4evEYU8G_t_cUokDYSPA-cmdWExY',      // Cadastro ML nominal
     SITUACAO_AMZ: '1TDYMrXkzK4I6PY212fa7qpF8Hdo5p72X',     // Cadastro AMZ nominal
+    INVENTARIO_AMZ: '1cF6eWgfiOPBOJqqh8E_XE-Br390uKzj6',   // Novo Relatório de Inventário Real AMZ
     DESEMPENHO_ML: '1qXpf8uTi9BbWqyywxhXfznVxA-hgDwjt',    // Tráfego e Vendas ML
     DESEMPENHO_AMZ: '1Cydd10tGl9sPmgFc8mwPQl59lUp6oCal',   // Tráfego e Vendas AMZ
     KITS: '11Gde5yzkxJRz1msKjVn8tBy5p_fPYnf5',             // Composição de Kits
@@ -45,11 +46,12 @@ function atualizarMatrizOperacional() {
 
     Logger.log("2/4 - Carregando preços e estoques instantâneos de Cadastro...");
     const precosCadastroML = carregarPrecosCadastroML();
-    const precosCadastroAMZ = carregarPrecosCadastroAMZ();
+    const mapaInventarioAMZ = carregarInventarioRealAMZ();
+    const precosCadastroAMZ = carregarPrecosCadastroAMZ(mapaInventarioAMZ);
 
     Logger.log("3/4 - Processando dados de desempenho (ML e Amazon)...");
     const dadosML = processarMercadoLivre(tabelaCMV, tabelaKits, precosCadastroML, mapaDevolucoesML, mapaEstoqueGeral);
-    const dadosAMZ = processarAmazon(tabelaCMV, tabelaKits, precosCadastroAMZ, mapaEstoqueGeral);
+    const dadosAMZ = processarAmazon(tabelaCMV, tabelaKits, precosCadastroAMZ, mapaEstoqueGeral, mapaInventarioAMZ);
 
     const dadosConsolidados = [...dadosML, ...dadosAMZ];
 
@@ -89,40 +91,100 @@ function normalizarIdML(id) {
 }
 
 /**
- * Consolidação dos 3 relatórios de estoque em subpastas de mês
+ * Consolidação dos 3 relatórios de estoque (Geral, Full ML e FBA Amazon)
+ * Varre as primeiras linhas para achar o cabeçalho real do Tiny ERP.
+ * Prioriza 'Estoque Disponível'; se estiver zerado (bug ERP), usa 'Estoque Físico'.
  */
 function carregarMapaEstoqueConsolidado() {
-  const mapa = {}; // SKU -> saldo total somado
-  
-  function somarSaldoPasta(folderId) {
+  const mapa = {};
+
+  function somarSaldoPasta(folderId, nomeOrigem) {
     const arq = obterArquivoMaisRecente(folderId);
-    if (!arq) return;
+    if (!arq) {
+      Logger.log(`Aviso: Nenhum arquivo de estoque localizado para ${nomeOrigem}.`);
+      return;
+    }
+
     const wb = abrirArquivoComoPlanilha(arq);
     const sheet = wb.getSheets()[0];
     const dados = sheet.getDataRange().getValues();
     if (dados.length <= 1) return;
 
-    const headers = dados[0];
-    const colSku = headers.findIndex(h => /sku|c[oó]digo/i.test(String(h)));
-    const colQtd = headers.findIndex(h => /quantidade|saldo|estoque|dispon[íi]vel/i.test(String(h)));
-
-    if (colSku === -1 || colQtd === -1) return;
-
-    for (let i = 1; i < dados.length; i++) {
-      const sku = String(dados[i][colSku] || '').trim();
-      const qtd = Number(dados[i][colQtd]) || 0;
-      if (sku) {
-        mapa[sku] = (mapa[sku] || 0) + qtd;
-        mapa[sku.toUpperCase()] = (mapa[sku.toUpperCase()] || 0) + qtd;
+    // 1. Localização dinâmica da linha de cabeçalho (pula cabeçalhos administrativos do Tiny)
+    let headerIndex = -1;
+    for (let r = 0; r < Math.min(dados.length, 10); r++) {
+      const linhaStr = dados[r].map(c => String(c).toLowerCase()).join(" ");
+      if ((linhaStr.includes("sku") || linhaStr.includes("código") || linhaStr.includes("codigo") || linhaStr.includes("cód")) &&
+          (linhaStr.includes("estoque") || linhaStr.includes("dispon") || linhaStr.includes("físic") || linhaStr.includes("fisic") || linhaStr.includes("descri"))) {
+        headerIndex = r;
+        break;
       }
+    }
+
+    if (headerIndex === -1) {
+      // Fallback: procura qualquer linha que contenha 'código' ou 'sku'
+      for (let r = 0; r < Math.min(dados.length, 10); r++) {
+        if (dados[r].some(cell => /sku|c[oó]d/i.test(String(cell).trim()))) {
+          headerIndex = r;
+          break;
+        }
+      }
+    }
+
+    if (headerIndex === -1) {
+      Logger.log(`Cabeçalho não identificado no arquivo ${arq.getName()} (${nomeOrigem}).`);
+      return;
+    }
+
+    const headers = dados[headerIndex];
+    const colSku = headers.findIndex(h => /sku|c[oó]d/i.test(String(h).trim()));
+    const colDisponivel = headers.findIndex(h => /dispon[íi]vel|disponivel/i.test(String(h).trim()));
+    const colFisico = headers.findIndex(h => /f[íi]sico|fisico|saldo|quantidade/i.test(String(h).trim()));
+
+    if (colSku === -1) {
+      Logger.log(`Coluna de SKU não encontrada no arquivo ${arq.getName()} (${nomeOrigem}).`);
+      return;
+    }
+
+    // 2. Auditoria do bug do ERP: verifica se 'Disponível' possui valores > 0
+    let usarDisponivel = false;
+    if (colDisponivel !== -1) {
+      for (let r = headerIndex + 1; r < dados.length; r++) {
+        const val = Number(dados[r][colDisponivel]) || 0;
+        if (val > 0) {
+          usarDisponivel = true;
+          break;
+        }
+      }
+    }
+
+    let colAlvo = usarDisponivel ? colDisponivel : colFisico;
+    if (colAlvo === -1) colAlvo = colDisponivel !== -1 ? colDisponivel : colFisico;
+
+    if (colAlvo === -1) {
+      Logger.log(`Nenhuma coluna de saldo encontrada no arquivo ${arq.getName()} (${nomeOrigem}).`);
+      return;
+    }
+
+    Logger.log(`Processando ${nomeOrigem}: Arquivo '${arq.getName()}' na linha ${headerIndex + 1} usando coluna '${headers[colAlvo]}'.`);
+
+    // 3. Extração dos saldos sem duplicação de chave
+    for (let i = headerIndex + 1; i < dados.length; i++) {
+      const skuRaw = String(dados[i][colSku] || '').trim();
+      if (!skuRaw) continue;
+
+      const skuChave = skuRaw.toUpperCase();
+      const qtd = Number(dados[i][colAlvo]) || 0;
+
+      mapa[skuChave] = (mapa[skuChave] || 0) + qtd;
     }
   }
 
-  somarSaldoPasta(CONFIG.FOLDERS.ESTOQUE_CMV);
-  somarSaldoPasta(CONFIG.FOLDERS.ESTOQUE_FULL_ML);
-  somarSaldoPasta(CONFIG.FOLDERS.ESTOQUE_FULL_AMZ);
+  somarSaldoPasta(CONFIG.FOLDERS.ESTOQUE_CMV, "Estoque Geral (Envios/DBA)");
+  somarSaldoPasta(CONFIG.FOLDERS.ESTOQUE_FULL_ML, "Full Mercado Livre");
+  somarSaldoPasta(CONFIG.FOLDERS.ESTOQUE_FULL_AMZ, "FBA Amazon");
 
-  Logger.log(`Estoque unificado carregado: ${Object.keys(mapa).length / 2} SKUs mapeados.`);
+  Logger.log(`Estoque unificado carregado: ${Object.keys(mapa).length} SKUs únicos mapeados.`);
   return mapa;
 }
 
@@ -277,7 +339,64 @@ function carregarPrecosCadastroML() {
   return mapa;
 }
 
-function carregarPrecosCadastroAMZ() {
+/**
+ * Lê o relatório dedicado de inventário da Amazon e indexa o saldo real
+ * tanto pelo SKU quanto por qualquer ASIN presente na linha.
+ */
+function carregarInventarioRealAMZ() {
+  const mapaSaldo = {};
+  const arquivo = obterArquivoMaisRecente(CONFIG.FOLDERS.INVENTARIO_AMZ);
+  if (!arquivo) {
+    Logger.log("Aviso: Relatório de Inventário Real AMZ não localizado.");
+    return mapaSaldo;
+  }
+
+  const wb = abrirArquivoComoPlanilha(arquivo);
+  const sheet = wb.getSheets()[0];
+  const dados = sheet.getDataRange().getValues();
+  if (dados.length <= 1) return mapaSaldo;
+
+  // Localiza cabeçalho dinamicamente
+  let headerIndex = -1;
+  for (let r = 0; r < Math.min(dados.length, 10); r++) {
+    const rowStr = dados[r].map(c => String(c).toLowerCase()).join(" ");
+    if ((rowStr.includes("sku") || rowStr.includes("asin")) && 
+        (rowStr.includes("quant") || rowStr.includes("saldo") || rowStr.includes("estoque") || rowStr.includes("dispon") || rowStr.includes("físic"))) {
+      headerIndex = r;
+      break;
+    }
+  }
+  if (headerIndex === -1) headerIndex = 0;
+
+  const headers = dados[headerIndex];
+  const colSku = headers.findIndex(h => /sku|seller-sku|c[oó]digo/i.test(String(h).trim()));
+  const colQtd = headers.findIndex(h => /dispon[íi]vel|quantity|quantidade|saldo|estoque|afn-fulfillable-quantity/i.test(String(h).trim()));
+
+  for (let i = headerIndex + 1; i < dados.length; i++) {
+    const row = dados[i];
+    const sku = colSku !== -1 ? String(row[colSku] || '').trim() : '';
+    const qtd = colQtd !== -1 ? Number(row[colQtd]) || 0 : 0;
+
+    // Indexa por SKU
+    if (sku) {
+      mapaSaldo[sku] = qtd;
+      mapaSaldo[sku.toUpperCase()] = qtd;
+    }
+
+    // Indexa por todos os ASINs encontrados na linha (Pai ou Filho)
+    for (let c = 0; c < row.length; c++) {
+      const valStr = String(row[c] || '').trim().toUpperCase();
+      if (/^B0[A-Z0-9]{8}$/.test(valStr)) {
+        mapaSaldo[valStr] = qtd;
+      }
+    }
+  }
+
+  Logger.log(`Inventário Real Amazon carregado: ${Object.keys(mapaSaldo).length} referências indexadas.`);
+  return mapaSaldo;
+}
+
+function carregarPrecosCadastroAMZ(mapaInventario) {
   const mapa = {};
   const arquivo = obterArquivoMaisRecente(CONFIG.FOLDERS.SITUACAO_AMZ);
   if (!arquivo) return mapa;
@@ -299,8 +418,7 @@ function carregarPrecosCadastroAMZ() {
   const headers = dados[headerIndex];
   let colSku = headers.findIndex(h => /seller-sku|sku/i.test(String(h)));
   let colStatus = headers.findIndex(h => /^status$/i.test(String(h).trim()));
-  let colQtd = headers.findIndex(h => /quantity|quantidade/i.test(String(h)));
-  let colPrice = headers.findIndex(h => /(^price$|^pre[çc]o$|your-price|item-price|listing-price)/i.test(String(h).trim()));
+  let colPrice = headers.findIndex(h => /(^price$\vert{}^pre[çc]o$|your-price|item-price|listing-price)/i.test(String(h).trim()));
   
   if (colPrice === -1) {
     colPrice = headers.findIndex(h => /price|pre[çc]o/i.test(String(h)) && !/min|max|business/i.test(String(h)));
@@ -310,7 +428,6 @@ function carregarPrecosCadastroAMZ() {
     const row = dados[i];
     let sku = colSku !== -1 ? String(row[colSku] || '').trim() : '';
     let status = colStatus !== -1 ? String(row[colStatus] || '').trim().toLowerCase() : 'active';
-    let estoqueCanal = colQtd !== -1 ? Number(row[colQtd]) || 0 : 0;
     let preco = colPrice !== -1 ? parseNumeroMoeda(row[colPrice]) : 0;
 
     if (preco <= 0) {
@@ -322,8 +439,27 @@ function carregarPrecosCadastroAMZ() {
       }
     }
 
+    // Busca o saldo real do marketplace: 1º por SKU, 2º por qualquer ASIN da linha
+    let estoqueRealAMZ = 0;
+    if (sku && mapaInventario[sku.toUpperCase()] !== undefined) {
+      estoqueRealAMZ = mapaInventario[sku.toUpperCase()];
+    } else {
+      for (let c = 0; c < row.length; c++) {
+        const valStr = String(row[c] || '').trim().toUpperCase();
+        if (/^B0[A-Z0-9]{8}$/.test(valStr) && mapaInventario[valStr] !== undefined) {
+          estoqueRealAMZ = mapaInventario[valStr];
+          break;
+        }
+      }
+    }
+
     if (sku || row.some(cell => /^B0[A-Z0-9]{8}$/i.test(String(cell).trim()))) {
-      const objInfo = { preco: preco, sku: sku, status: status, estoqueCanal: estoqueCanal };
+      const objInfo = { 
+        preco: preco, 
+        sku: sku, 
+        status: status, 
+        estoqueCanal: estoqueRealAMZ 
+      };
 
       if (sku) {
         mapa[sku] = objInfo;
@@ -339,7 +475,7 @@ function carregarPrecosCadastroAMZ() {
     }
   }
 
-  Logger.log(`Situação Amazon carregada com sucesso: ${Object.keys(mapa).length} chaves indexadas.`);
+  Logger.log(`Situação Amazon carregada com sucesso: ${Object.keys(mapa).length} chaves vinculadas ao inventário real.`);
   return mapa;
 }
 
@@ -383,11 +519,12 @@ function processarMercadoLivre(tabelaCMV, tabelaKits, precosCadastro, mapaDevolu
     const vendas = Number(row[colVendas]) || 0;
 
     const infoCadastro = precosCadastro[idLimpo] || precosCadastro[idAnuncioFormatado] || {};
-    const statusCanal = (infoCadastro.status || 'ativo').toLowerCase();
+    const statusCanal = String(infoCadastro.status || 'ativo').toLowerCase();
     const estoqueCanal = Number(infoCadastro.estoqueCanal) || 0;
     
-    // Status do anúncio no marketplace
-    const isEsgotadoNoMarketplace = estoqueCanal === 0 || statusCanal.includes('paus') || statusCanal.includes('inativ');
+    // Regra Fiel do Marketplace: só é esgotado se estiver inativo/pausado ou zerado no cadastro
+    const isAtivoNoMarketplace = statusCanal.includes('ativ') && !statusCanal.includes('inativ') && !statusCanal.includes('paus');
+    const isEsgotadoNoMarketplace = !isAtivoNoMarketplace || (estoqueCanal === 0 && statusCanal.includes('paus'));
 
     if (isEsgotadoNoMarketplace && vendas === 0) {
       continue;
@@ -416,13 +553,20 @@ function processarMercadoLivre(tabelaCMV, tabelaKits, precosCadastro, mapaDevolu
     const devData = mapaDevolucoes[idLimpo] || mapaDevolucoes[idAnuncioFormatado] || { qtd: 0 };
     const devolucoes = devData.qtd || 0;
 
-    // Cálculo das Novas Colunas (S, T, U)
-    const estoqueFisicoTotal = mapaEstoqueGeral[sku] || mapaEstoqueGeral[sku.toUpperCase()] || 0;
-    const projecaoVendas40d = Math.round((vendas / 60) * 40); // Proporcional de 60d para 40d
-    const necessidadeEstoque = estoqueFisicoTotal - projecaoVendas40d;
+    // Cálculo das Colunas S, T, U: Necessidade = Projeção (40d) - Estoque Atual
+    const estoqueFisicoTotal = mapaEstoqueGeral[sku.toUpperCase()] || 0;
+    const projecaoVendas40d = Math.round((vendas / 60) * 40);
+    const necessidadeEstoque = projecaoVendas40d - estoqueFisicoTotal;
 
-    // Status Inicial Operacional
-    const situacaoInicial = isEsgotadoNoMarketplace ? '📦 Esgotado / Pausado' : '🟢 Validado / Estável';
+    // Classificação semântica operacional
+    let situacaoInicial = '🟡 Em Otimização';
+    if (isEsgotadoNoMarketplace) {
+      situacaoInicial = '📦 Esgotado / Pausado';
+    } else if (vendas >= 5 && cvr >= 0.02) {
+      situacaoInicial = '🟢 Validado / Estável';
+    } else if (vendas === 0 && visitas > 20) {
+      situacaoInicial = '🟡 Em Otimização';
+    }
 
     lista.push({
       canal: 'Mercado Livre',
@@ -451,7 +595,7 @@ function processarMercadoLivre(tabelaCMV, tabelaKits, precosCadastro, mapaDevolu
   return lista;
 }
 
-function processarAmazon(tabelaCMV, tabelaKits, precosCadastro, mapaEstoqueGeral) {
+function processarAmazon(tabelaCMV, tabelaKits, precosCadastro, mapaEstoqueGeral, mapaInventarioAMZ) {
   const arquivo = obterArquivoMaisRecente(CONFIG.FOLDERS.DESEMPENHO_AMZ);
   if (!arquivo) return [];
 
@@ -487,10 +631,26 @@ function processarAmazon(tabelaCMV, tabelaKits, precosCadastro, mapaEstoqueGeral
     const buyBox = colBuyBox !== -1 ? parseNumeroPercentual(row[colBuyBox]) : 0;
 
     const infoCad = precosCadastro[asinChild] || precosCadastro[skuRelatorio] || precosCadastro[skuRelatorio.toUpperCase()] || {};
-    const statusAmazon = (infoCad.status || 'active').toLowerCase();
-    const estoqueCanal = Number(infoCad.estoqueCanal) || 0;
+    const skuFinal = infoCad.sku || skuRelatorio || asinChild;
 
-    const isEsgotadoNoMarketplace = estoqueCanal === 0 || !statusAmazon.includes('activ');
+    // 1. Consulta o saldo real no relatório de inventário da Amazon (vitrine)
+    let saldoVitrineAMZ = 0;
+    let encontrouNoInventario = false;
+
+    if (mapaInventarioAMZ && mapaInventarioAMZ[skuFinal.toUpperCase()] !== undefined) {
+      saldoVitrineAMZ = mapaInventarioAMZ[skuFinal.toUpperCase()];
+      encontrouNoInventario = true;
+    } else if (mapaInventarioAMZ && mapaInventarioAMZ[asinChild] !== undefined) {
+      saldoVitrineAMZ = mapaInventarioAMZ[asinChild];
+      encontrouNoInventario = true;
+    }
+
+    const statusAmazon = String(infoCad.status || 'active').toLowerCase();
+    const isAtivoStatus = (statusAmazon.includes('activ') || statusAmazon.includes('ativ')) && 
+                          !statusAmazon.includes('inactiv') && !statusAmazon.includes('inativ');
+
+    // É considerado esgotado/pausado APENAS se o inventário acusar saldo 0 ou se o status for inativo na plataforma
+    const isEsgotadoNoMarketplace = encontrouNoInventario ? (saldoVitrineAMZ === 0) : (!isAtivoStatus);
 
     if (isEsgotadoNoMarketplace && unidades === 0) {
       continue;
@@ -502,7 +662,6 @@ function processarAmazon(tabelaCMV, tabelaKits, precosCadastro, mapaEstoqueGeral
       if (faturamento > 0) preco = faturamento / unidades;
     }
 
-    const skuFinal = infoCad.sku || skuRelatorio || asinChild;
     const isKit = titulo.toUpperCase().includes('KIT') || skuFinal.toUpperCase().includes('KIT');
     const cmv = obterCMVProduto(skuFinal, isKit, tabelaCMV, tabelaKits);
 
@@ -517,12 +676,18 @@ function processarAmazon(tabelaCMV, tabelaKits, precosCadastro, mapaEstoqueGeral
     const comissao = preco * 0.14;
     const frete = calcularFreteTaxaAMZ(preco, isKit);
 
-    // Cálculo das Novas Colunas (S, T, U)
-    const estoqueFisicoTotal = mapaEstoqueGeral[skuFinal] || mapaEstoqueGeral[skuFinal.toUpperCase()] || 0;
+    // Cálculo das Colunas S, T, U: Necessidade = Projeção (40d) - Estoque Atual
+    const estoqueFisicoTotal = mapaEstoqueGeral[skuFinal.toUpperCase()] || 0;
     const projecaoVendas40d = Math.round((unidades / 60) * 40);
-    const necessidadeEstoque = estoqueFisicoTotal - projecaoVendas40d;
+    const necessidadeEstoque = projecaoVendas40d - estoqueFisicoTotal;
 
-    const situacaoInicial = isEsgotadoNoMarketplace ? '📦 Esgotado / Pausado' : '🟢 Validado / Estável';
+    // Classificação semântica operacional
+    let situacaoInicial = '🟡 Em Otimização';
+    if (isEsgotadoNoMarketplace) {
+      situacaoInicial = '📦 Esgotado / Pausado';
+    } else if (unidades >= 3 && cvr >= 0.02) {
+      situacaoInicial = '🟢 Validado / Estável';
+    }
 
     lista.push({
       canal: 'Amazon',
@@ -690,24 +855,18 @@ function gravarDadosNaMatriz(sheet, novosDados) {
 
     let situacaoFinal = item.situacao;
 
-    // Se houver histórico anterior na planilha:
     if (statusAnteriores.has(item.idAnuncio)) {
       const statusSalvo = statusAnteriores.get(item.idAnuncio);
 
-      // Blindagem: só aceita 'Teste A/B Ativo' se o teste realmente existir aberto no Log
-      if (statusSalvo.includes("Teste") || statusSalvo.includes("Otimiz")) {
-        if (idsEmTesteAberto.has(item.idAnuncio)) {
-          situacaoFinal = statusSalvo;
-        } else {
-          situacaoFinal = item.isEsgotadoNoMarketplace ? '📦 Esgotado / Pausado' : '🟢 Validado / Estável';
-        }
-      } else {
-        // Se no marketplace estiver zerado/pausado, o status de esgotado prevalece
-        if (item.isEsgotadoNoMarketplace) {
-          situacaoFinal = '📦 Esgotado / Pausado';
-        } else {
-          situacaoFinal = statusSalvo;
-        }
+      // Se o anúncio está com Teste A/B aberto no Log, preserva
+      if (statusSalvo.includes("Teste") && idsEmTesteAberto.has(item.idAnuncio)) {
+        situacaoFinal = statusSalvo;
+      } else if (item.isEsgotadoNoMarketplace) {
+        situacaoFinal = '📦 Esgotado / Pausado';
+      } else if (statusSalvo.includes("Excluir") || statusSalvo.includes("Descontinuar")) {
+        situacaoFinal = statusSalvo;
+      } else if (!statusSalvo.includes("Esgotado")) {
+        situacaoFinal = statusSalvo;
       }
     } else {
       if (item.isEsgotadoNoMarketplace) {
