@@ -249,39 +249,210 @@ let ultimoEstoqueConhecido = 0;
 }
 
 /**
- * Mapeia rigorosamente as semanas existentes na coluna B (Data Início).
- * Ignora o getLastRow() global para não ser enganado por fórmulas matriciais (MAP/ARRAYFORMULA).
- * Inserção SEMPRE na linha 4 ou na linha imediatamente seguinte ao último dado real da coluna B.
+ * =========================================================================
+ * IMPLEMENTO / ALTERAÇÃO:
+ * 1. MAPEAMENTO COM LINHAS FÍSICAS (mapaLinhasPorSemana):
+ *    Identifica a linha de cada segunda-feira na planilha.
+ * 2. REPROCESSAMENTO AUTOMÁTICO DA ÚLTIMA SEMANA:
+ *    A data inicial da rotina é a própria última segunda-feira gravada.
+ *    Assim, conforme você alimenta novos relatórios no meio ou no encerramento
+ *    da semana, a última linha é recalculada e atualizada com total precisão,
+ *    adicionando a semana seguinte assim que ela se inicia.
+ * =========================================================================
  */
+
 function mapearSemanasExistentes(sheet) {
   const maxRows = sheet.getMaxRows();
-  // Lê estritamente a coluna B (Data Início) até o fim da grade
   const valoresB = sheet.getRange(1, 2, maxRows, 1).getValues();
   const semanasExistentes = new Set();
+  const mapaLinhasPorSemana = {}; // Guarda { 'YYYY-MM-DD': numeroDaLinha }
   
   let ultimaLinhaComDadoReal = 3; // Linhas 1 a 3 reservadas para cabeçalhos
   let maiorSegundaEncontrada = '';
 
-  // Percorre a partir do índice 3 (Linha 4 da planilha)
   for (let r = 3; r < valoresB.length; r++) {
     const val = normalizarDataChave(valoresB[r][0]);
     if (val) {
       semanasExistentes.add(val);
-      ultimaLinhaComDadoReal = r + 1; // Registra a linha física com dado
+      mapaLinhasPorSemana[val] = r + 1;
+      ultimaLinhaComDadoReal = r + 1;
       if (!maiorSegundaEncontrada || val > maiorSegundaEncontrada) {
         maiorSegundaEncontrada = val;
       }
     }
   }
 
-  // Se não houver nenhum dado lançado da linha 4 para baixo, proximaLinha será exatamente 4
   const proximaLinha = Math.max(ultimaLinhaComDadoReal + 1, 4);
 
   return {
     semanasExistentes: semanasExistentes,
+    mapaLinhasPorSemana: mapaLinhasPorSemana,
     proximaLinhaLivre: proximaLinha,
     ultimaDataSegunda: maiorSegundaEncontrada
   };
+}
+
+function executarRotinaSemanal() {
+  Logger.log("=== INICIANDO ROTINA DE LANÇAMENTO SEMANAL (COM REPROCESSAMENTO) ===");
+
+  const ss = SpreadsheetApp.openById(CONFIG_SEM.SPREADSHEET_ID);
+  const sheet = ss.getSheetByName(CONFIG_SEM.SHEET_NAME);
+  if (!sheet) throw new Error(`Aba "${CONFIG_SEM.SHEET_NAME}" não encontrada.`);
+
+  // 1. Identifica semanas e mapeia suas linhas físicas
+  const { semanasExistentes, mapaLinhasPorSemana, proximaLinhaLivre, ultimaDataSegunda } = mapearSemanasExistentes(sheet);
+  Logger.log(`Semanas cadastradas: ${semanasExistentes.size}`);
+  Logger.log(`Última segunda-feira na planilha: ${ultimaDataSegunda || 'Nenhuma'}`);
+
+  // 2. Extração dos dados
+  const mapaEstoqueSemanal = processarEstoqueACusto();
+  let ultimoEstoqueConhecido = 0;
+  const mapaML = processarVendasMercadoLivre();
+  const mapaAmazon = processarVendasAmazon();
+  const mapaCustosAmazon = processarCustosAmazon();
+  const mapaAds = processarAds();
+  const mapaTrafegoML = processarTrafegoMercadoLivre();
+  const mapaTrafegoAmazon = processarTrafegoAmazon();
+
+  // 3. Determinação da Data Inicial
+  const hoje = new Date();
+  const hojeSegundaIso = obterSegundaFeiraIso(Utilities.formatDate(hoje, "GMT-0300", 'yyyy-MM-dd'));
+  let dataInicialSegundaIso = '';
+
+  // IMPLEMENTO: Começa na própria última segunda-feira para permitir recalcular a semana corrente
+  if (ultimaDataSegunda) {
+    dataInicialSegundaIso = ultimaDataSegunda;
+  } else {
+    const todasAsDatas = [
+      ...Object.keys(mapaML.diario),
+      ...Object.keys(mapaAmazon.diario),
+      ...Object.keys(mapaTrafegoML),
+      ...Object.keys(mapaTrafegoAmazon)
+    ].sort();
+
+    if (todasAsDatas.length > 0) {
+      dataInicialSegundaIso = obterSegundaFeiraIso(todasAsDatas[0]);
+    } else {
+      dataInicialSegundaIso = hojeSegundaIso;
+    }
+  }
+
+  // 4. Lista de semanas a processar
+  const semanasParaProcessar = [];
+  let dLoop = parseDataIso(dataInicialSegundaIso);
+  const dLimite = parseDataIso(hojeSegundaIso);
+
+  while (dLoop <= dLimite) {
+    semanasParaProcessar.push(Utilities.formatDate(dLoop, "GMT-0300", 'yyyy-MM-dd'));
+    dLoop.setDate(dLoop.getDate() + 7);
+  }
+
+  Logger.log(`Semanas no escopo: ${semanasParaProcessar.join(' | ')}`);
+
+  let linhaCursor = proximaLinhaLivre;
+
+  semanasParaProcessar.forEach(segundaStr => {
+    const dInicio = parseDataIso(segundaStr);
+    const numSemana = obterNumeroSemanaIso(dInicio);
+    const semanaLabel = `Sem ${String(numSemana).padStart(2, '0')}`;
+
+    let totalML = 0, custosML = 0;
+    let totalAmazon = 0, custosAmazon = 0;
+    let totalKitsML = 0, totalKitsAmazon = 0;
+    let totalAdsSemana = 0;
+    let adsML = 0, adsAmazon = 0;
+    let totalVisitasML = 0, totalVisitasAmazon = 0;
+
+    let dDia = new Date(dInicio.getTime());
+    for (let i = 0; i < 7; i++) {
+      const diaIso = Utilities.formatDate(dDia, "GMT-0300", 'yyyy-MM-dd');
+      
+      if (mapaML.diario[diaIso]) {
+        totalML += mapaML.diario[diaIso].total;
+        totalKitsML += mapaML.diario[diaIso].kits79;
+        custosML += mapaML.diario[diaIso].custos;
+      }
+      if (mapaAmazon.diario[diaIso]) {
+        totalAmazon += mapaAmazon.diario[diaIso].total;
+        totalKitsAmazon += mapaAmazon.diario[diaIso].kits79;
+      }
+      if (mapaCustosAmazon[diaIso]) {
+        custosAmazon += mapaCustosAmazon[diaIso];
+      }
+      if (mapaAds[diaIso]) {
+        adsAmazon += mapaAds[diaIso];
+        totalAdsSemana += mapaAds[diaIso];
+      }
+      if (mapaTrafegoML[diaIso]) {
+        totalVisitasML += mapaTrafegoML[diaIso];
+      }
+      if (mapaTrafegoAmazon[diaIso]) {
+        totalVisitasAmazon += mapaTrafegoAmazon[diaIso];
+      }
+
+      dDia.setDate(dDia.getDate() + 1);
+    }
+
+    const totalKitsSemana = totalKitsML + totalKitsAmazon;
+    const totalVisitasSemana = totalVisitasML + totalVisitasAmazon;
+    const custoFinalML = custosML + adsML;
+    const custoFinalAmazon = custosAmazon + adsAmazon;
+
+    if (mapaEstoqueSemanal[segundaStr] !== undefined) {
+      ultimoEstoqueConhecido = mapaEstoqueSemanal[segundaStr];
+    } else {
+      const chavesEstoque = Object.keys(mapaEstoqueSemanal).sort();
+      if (chavesEstoque.length > 0) {
+        ultimoEstoqueConhecido = mapaEstoqueSemanal[chavesEstoque[chavesEstoque.length - 1]];
+      }
+    }
+
+    const blocoAB = [[ semanaLabel, formatarDataBR(segundaStr) ]];
+    const blocoD  = [[ ultimoEstoqueConhecido ]];
+    const blocoGQ = [[
+      totalML, custoFinalML, totalAmazon, custoFinalAmazon,
+      0, 0, 0, 0,
+      totalKitsSemana, totalAdsSemana, totalVisitasSemana
+    ]];
+
+    // Reprocessa se a semana já existe na planilha
+    if (mapaLinhasPorSemana[segundaStr]) {
+      const linExistente = mapaLinhasPorSemana[segundaStr];
+      Logger.log(`♻️ Atualizando dados da semana ${semanaLabel} (${segundaStr}) na linha ${linExistente}...`);
+      
+      sheet.getRange(linExistente, 1, 1, 2).setValues(blocoAB);
+      sheet.getRange(linExistente, 4, 1, 1).setValues(blocoD);
+      sheet.getRange(linExistente, 7, 1, 11).setValues(blocoGQ);
+      aplicarFormatacaoSemanalLinha(sheet, linExistente);
+    } 
+    // Insere se for uma nova semana
+    else {
+      Logger.log(`➕ Inserindo nova semana ${semanaLabel} (${segundaStr}) na linha ${linhaCursor}...`);
+      
+      sheet.getRange(linhaCursor, 1, 1, 2).setValues(blocoAB);
+      sheet.getRange(linhaCursor, 4, 1, 1).setValues(blocoD);
+      sheet.getRange(linhaCursor, 7, 1, 11).setValues(blocoGQ);
+      aplicarFormatacaoSemanalLinha(sheet, linhaCursor);
+      mapaLinhasPorSemana[segundaStr] = linhaCursor;
+      linhaCursor++;
+    }
+  });
+
+  registrarArquivosComoProcessados();
+  Logger.log(`✅ Lançamento semanal concluído com sucesso!`);
+  SpreadsheetApp.getActiveSpreadsheet()?.toast("Cockpit Semanal atualizado com sucesso!", "Concluído");
+}
+
+function aplicarFormatacaoSemanalLinha(sheet, linha) {
+  sheet.getRange(linha, 1, 1, 19).setVerticalAlignment('middle');
+  sheet.getRange(linha, 1, 1, 1).setHorizontalAlignment('center');
+  sheet.getRange(linha, 2, 1, 1).setHorizontalAlignment('center').setNumberFormat('dd/mm/yyyy');
+  sheet.getRange(linha, 3, 1, 3).setHorizontalAlignment('right').setNumberFormat('R$ #,##0.00');
+  sheet.getRange(linha, 6, 1, 1).setHorizontalAlignment('center').setNumberFormat('#,##0.0');
+  sheet.getRange(linha, 7, 1, 10).setHorizontalAlignment('right').setNumberFormat('R$ #,##0.00');
+  sheet.getRange(linha, 17, 1, 1).setHorizontalAlignment('center').setNumberFormat('#,##0');
+  sheet.getRange(linha, 18, 1, 1).setHorizontalAlignment('center').setNumberFormat('#,##0');
+  sheet.getRange(linha, 19, 1, 1).setHorizontalAlignment('center');
 }
 
 /**
