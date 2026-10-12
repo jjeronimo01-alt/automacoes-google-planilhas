@@ -2,7 +2,7 @@
  * =========================================================================
  * DASHBOARD GESTÃO - JC FIVELAS E TIRAS
  * Módulo Semanal: Automação em Lote (Append-Only & Reprocessamento Contínuo)
- * Com Trava de Sobrescrita, Leitura Multi-Arquivos e Rateio de Ads (AMZ + ML)
+ * Com Trava de Sobrescrita, Leitura Multi-Arquivos e Ads Separados (AMZ + ML)
  * =========================================================================
  */
 const CONFIG_SEM = {
@@ -69,7 +69,7 @@ function mapearSemanasExistentes(sheet) {
 }
 
 /**
- * ROTINA OFICIAL SEMANAL COM JANELA RETROATIVA (REPROCESSAMENTO MULTI-SEMANAS)
+ * ROTINA OFICIAL SEMANAL COM JANELA RETROATIVA DE 14 DIAS
  */
 function executarRotinaSemanal() {
   Logger.log("=== INICIANDO ROTINA DE LANÇAMENTO SEMANAL (COM REPROCESSAMENTO) ===");
@@ -100,9 +100,8 @@ function executarRotinaSemanal() {
   let dataInicialSegundaIso = '';
 
   if (ultimaDataSegunda) {
-    // Retrocede 14 dias (2 semanas) a partir da última data para reprocessar semanas acumuladas
     const dUltima = parseDataIso(ultimaDataSegunda);
-    dUltima.setDate(dUltima.getDate() - 14);
+    dUltima.setDate(dUltima.getDate() - 14); // Retrocede 2 semanas para reprocessar semanas acumuladas
     dataInicialSegundaIso = Utilities.formatDate(dUltima, "GMT-0300", 'yyyy-MM-dd');
 
     const menorDataPlanilha = Object.keys(mapaLinhasPorSemana).sort()[0];
@@ -110,7 +109,6 @@ function executarRotinaSemanal() {
       dataInicialSegundaIso = menorDataPlanilha;
     }
   } else {
-    // Se a aba estiver vazia, parte da menor data encontrada nos relatórios
     const todasAsDatas = [
       ...Object.keys(mapaML.diario),
       ...Object.keys(mapaAmazon.diario),
@@ -147,9 +145,7 @@ function executarRotinaSemanal() {
     let totalML = 0, custosML = 0;
     let totalAmazon = 0, custosAmazon = 0;
     let totalKitsML = 0, totalKitsAmazon = 0;
-    let totalAdsSemana = 0;
     let adsML = 0, adsAmazon = 0;
-    let totalVisitasML = 0, totalVisitasAmazon = 0;
 
     let dDia = new Date(dInicio.getTime());
     for (let i = 0; i < 7; i++) {
@@ -173,20 +169,11 @@ function executarRotinaSemanal() {
       if (mapaAdsML[diaIso]) {
         adsML += mapaAdsML[diaIso];
       }
-      totalAdsSemana += (mapaAdsAmazon[diaIso] || 0) + (mapaAdsML[diaIso] || 0);
-
-      if (mapaTrafegoML[diaIso]) {
-        totalVisitasML += mapaTrafegoML[diaIso];
-      }
-      if (mapaTrafegoAmazon[diaIso]) {
-        totalVisitasAmazon += mapaTrafegoAmazon[diaIso];
-      }
 
       dDia.setDate(dDia.getDate() + 1);
     }
 
     const totalKitsSemana = totalKitsML + totalKitsAmazon;
-    const totalVisitasSemana = totalVisitasML + totalVisitasAmazon;
     const custoFinalML = custosML + adsML;
     const custoFinalAmazon = custosAmazon + adsAmazon;
 
@@ -201,10 +188,21 @@ function executarRotinaSemanal() {
 
     const blocoAB = [[ semanaLabel, formatarDataBR(segundaStr) ]];
     const blocoD  = [[ ultimoEstoqueConhecido ]];
+    
+    // Colunas G até Q (Exatamente 11 colunas):
+    // P = Invest. Ads AMZ (R$) | Q = Invest. Ads ML (R$)
     const blocoGQ = [[
-      totalML, custoFinalML, totalAmazon, custoFinalAmazon,
-      0, 0, 0, 0,
-      totalKitsSemana, totalAdsSemana, totalVisitasSemana
+      totalML,             // 1  (G): Mercado Livre (R$)
+      custoFinalML,        // 2  (H): Custo Total Mercado Livre
+      totalAmazon,         // 3  (I): Amazon (R$)
+      custoFinalAmazon,    // 4  (J): Custo Total Amazon
+      0,                   // 5  (K): Shopee (R$) - Ocioso
+      0,                   // 6  (L): Custo Total Shopee - Ocioso
+      0,                   // 7  (M): Loja Própria (R$) - Ocioso
+      0,                   // 8  (N): Custo Total Loja Própria - Ocioso
+      totalKitsSemana,     // 9  (O): Vendas Kits >= R$79
+      adsAmazon,           // 10 (P): Invest. Ads AMZ (R$)
+      adsML                // 11 (Q): Invest. Ads ML (R$)
     ]];
 
     // Reprocessa e atualiza se a semana já existe na planilha
@@ -241,8 +239,11 @@ function aplicarFormatacaoSemanalLinha(sheet, linha) {
   sheet.getRange(linha, 2, 1, 1).setHorizontalAlignment('center').setNumberFormat('dd/mm/yyyy');
   sheet.getRange(linha, 3, 1, 3).setHorizontalAlignment('right').setNumberFormat('R$ #,##0.00');
   sheet.getRange(linha, 6, 1, 1).setHorizontalAlignment('center').setNumberFormat('#,##0.0');
-  sheet.getRange(linha, 7, 1, 10).setHorizontalAlignment('right').setNumberFormat('R$ #,##0.00');
-  sheet.getRange(linha, 17, 1, 1).setHorizontalAlignment('center').setNumberFormat('#,##0');
+  
+  // Colunas G até Q (todas formatadas como moeda R$ #,##0.00, incluindo Ads AMZ e Ads ML)
+  sheet.getRange(linha, 7, 1, 11).setHorizontalAlignment('right').setNumberFormat('R$ #,##0.00');
+  
+  // Coluna R (Pedidos - 18) e Coluna S (Status Semanal - 19)
   sheet.getRange(linha, 18, 1, 1).setHorizontalAlignment('center').setNumberFormat('#,##0');
   sheet.getRange(linha, 19, 1, 1).setHorizontalAlignment('center');
 }
@@ -274,11 +275,7 @@ function registrarArquivosComoProcessados() {
 }
 
 /**
- * 1. Processa Estoque a Custo por Semana de forma MULTI-DEPÓSITO:
- * (Depósito Principal + Fullfilment Mercado Livre + Fullfilment Amazon)
- * Regra:
- * - Para o MESMO depósito na mesma semana: a foto mais recente substitui a anterior.
- * - ENTRE depósitos: soma os saldos mais recentes de cada depósito para a semana.
+ * 1. Processa Estoque a Custo por Semana de forma MULTI-DEPÓSITO
  */
 function processarEstoqueACusto() {
   const pastasEstoque = [
@@ -747,8 +744,7 @@ function processarAdsAmazon() {
 
 /**
  * 8. Processa Relatório de Ads do Mercado Livre (.XLSX) - Multi-Arquivos
- * - Lê a 3ª aba: "Relatório de campanha"
- * - Cabeçalho na linha 2, dados a partir da linha 3
+ * - Varre a aba correta ignorando variações de acentuação/caixa
  * - Filtra estritamente campanhas com Status 'Ativa'
  * - Rateia a coluna 'Investimento' entre 'Desde' e 'Até'
  */
@@ -762,23 +758,34 @@ function processarAdsMercadoLivre() {
 
   arquivos.forEach(arq => {
     ARQUIVOS_LIDOS_RODADA[`ADS_ML_${arq.getId()}`] = arq;
-    // Abre especificamente a aba de campanhas
+    
+    // Abre especificamente a aba de campanhas com busca robusta
     const matriz = lerDadosArquivo(arq, 'Relatório de campanha');
-    if (!matriz || matriz.length <= 2) return;
+    if (!matriz || matriz.length <= 1) return;
 
-    // Cabeçalho está na Linha 2 (índice 1)
-    const cab = matriz[1].map(c => String(c).trim().toLowerCase());
-    const idxStatus = cab.findIndex(c => c === 'status');
-    const idxDesde = cab.findIndex(c => c === 'desde');
-    const idxAte = cab.findIndex(c => c === 'até' || c === 'ate');
+    // Localiza dinamicamente a linha do cabeçalho
+    let idxCab = -1;
+    for (let r = 0; r < Math.min(matriz.length, 10); r++) {
+      const linhaStr = matriz[r].map(c => String(c).trim().toLowerCase()).join(' ');
+      if (linhaStr.includes('status') && (linhaStr.includes('desde') || linhaStr.includes('investimento') || linhaStr.includes('nome'))) {
+        idxCab = r;
+        break;
+      }
+    }
+    if (idxCab === -1) idxCab = 1;
+
+    const cab = matriz[idxCab].map(c => String(c).trim().toLowerCase());
+    const idxStatus = cab.findIndex(c => c === 'status' || c.includes('status'));
+    const idxDesde = cab.findIndex(c => c === 'desde' || c.includes('desde'));
+    const idxAte = cab.findIndex(c => c === 'até' || c === 'ate' || c.includes('at'));
     const idxInvest = cab.findIndex(c => c.includes('investimento') && !c.includes('acos') && !c.includes('roas'));
 
-    for (let i = 2; i < matriz.length; i++) {
+    for (let i = idxCab + 1; i < matriz.length; i++) {
       const linha = matriz[i];
       if (!linha || linha.length === 0) continue;
 
       const status = idxStatus !== -1 ? String(linha[idxStatus]).trim().toLowerCase() : '';
-      if (status !== 'ativa') continue; // Filtro estrito: apenas campanhas ativas
+      if (!status.includes('ativ')) continue; // Filtro estrito para campanhas ativas
 
       const invest = idxInvest !== -1 ? limparNumero(linha[idxInvest]) : 0;
       if (invest <= 0) continue;
@@ -801,6 +808,7 @@ function processarAdsMercadoLivre() {
         dCurr.setDate(dCurr.getDate() + 1);
       }
       totalCapturadoML += invest;
+      Logger.log(`  -> Campanha ML Ativa: "${linha[0]}" | R$ ${invest.toFixed(2)} rateado entre ${dInicioStr} e ${dFimStr}`);
     }
   });
 
@@ -826,7 +834,7 @@ function localizarIndiceCabecalho(matriz, termosChave) {
 
 /**
  * Converte e lê arquivos .xlsx, .csv e .txt
- * Identificação dinâmica do delimitador e suporte à seleção de aba específica no Excel
+ * Identificação dinâmica do delimitador e seleção blindada de aba no Excel
  */
 function lerDadosArquivo(arquivo, nomeAba) {
   if (!arquivo) return null;
@@ -857,13 +865,28 @@ function lerDadosArquivo(arquivo, nomeAba) {
       tempFileId = fileInserido.id;
 
       const ssConvertida = SpreadsheetApp.openById(tempFileId);
-      let sheet = null;
+      const todasAbas = ssConvertida.getSheets();
+      let abaAlvo = null;
+
       if (nomeAba) {
-        // Busca tolerante a maiúsculas/minúsculas e acentos
-        sheet = ssConvertida.getSheetByName(nomeAba) || ssConvertida.getSheets().find(s => s.getName().toLowerCase().includes(nomeAba.toLowerCase()));
+        // Busca normalizada sem acentos e minúscula
+        const nomeNorm = nomeAba.toLowerCase().normalize("NFD").replace(/[\u0300-\u036f]/g, "").trim();
+        abaAlvo = todasAbas.find(s => {
+          const sNorm = s.getName().toLowerCase().normalize("NFD").replace(/[\u0300-\u036f]/g, "").trim();
+          return sNorm === nomeNorm || sNorm.includes(nomeNorm) || sNorm.includes("campanha") || sNorm.includes("relat");
+        });
       }
-      if (!sheet) sheet = ssConvertida.getSheets()[0];
-      return sheet.getDataRange().getValues();
+      
+      // Fallback: se houver 3 abas (padrão ML Ads), seleciona a 3ª aba (índice 2)
+      if (!abaAlvo && todasAbas.length >= 3) {
+        abaAlvo = todasAbas[2];
+      }
+      if (!abaAlvo) {
+        abaAlvo = todasAbas[0];
+      }
+
+      Logger.log(`  Aba selecionada no XLSX: "${abaAlvo.getName()}" (Linhas: ${abaAlvo.getLastRow()})`);
+      return abaAlvo.getDataRange().getValues();
     } catch (e) {
       Logger.log("Erro na conversão automática do XLSX: " + e.message);
     } finally {
@@ -931,30 +954,6 @@ function obterTodosArquivosRecursivo(pasta) {
   }
   vasculhar(pasta);
   return lista;
-}
-
-function obterArquivoMaisRecenteRecursivo(pasta) {
-  let maisRecente = null;
-  let maiorTime = 0;
-
-  function vasculhar(f) {
-    const files = f.getFiles();
-    while (files.hasNext()) {
-      const arq = files.next();
-      const nome = arq.getName();
-      if (nome.startsWith('~') || nome.startsWith('.')) continue;
-      const t = arq.getLastUpdated().getTime();
-      if (t > maiorTime) {
-        maiorTime = t;
-        maisRecente = arq;
-      }
-    }
-    const sub = f.getFolders();
-    while (sub.hasNext()) vasculhar(sub.next());
-  }
-
-  vasculhar(pasta);
-  return maisRecente;
 }
 
 function parseDataIso(strIso) {
