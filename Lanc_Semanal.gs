@@ -315,7 +315,8 @@ function executarRotinaSemanal() {
   const mapaML = processarVendasMercadoLivre();
   const mapaAmazon = processarVendasAmazon();
   const mapaCustosAmazon = processarCustosAmazon();
-  const mapaAds = processarAdsAmazon();
+  const mapaAdsAmazon = processarAdsAmazon();
+  const mapaAdsML = processarAdsMercadoLivre();
   const mapaTrafegoML = processarTrafegoMercadoLivre();
   const mapaTrafegoAmazon = processarTrafegoAmazon();
 
@@ -384,9 +385,13 @@ function executarRotinaSemanal() {
       if (mapaCustosAmazon[diaIso]) {
         custosAmazon += mapaCustosAmazon[diaIso];
       }
-      if (mapaAds[diaIso]) {
-        adsAmazon += mapaAds[diaIso];
-        totalAdsSemana += mapaAds[diaIso];
+      if (mapaAdsAmazon[diaIso]) {
+        adsAmazon += mapaAdsAmazon[diaIso];
+        totalAdsSemana += mapaAdsAmazon[diaIso];
+      }
+      if (mapaAdsML[diaIso]) {
+        adsML += mapaAdsML[diaIso];
+        totalAdsSemana += mapaAdsML[diaIso];
       }
       if (mapaTrafegoML[diaIso]) {
         totalVisitasML += mapaTrafegoML[diaIso];
@@ -613,217 +618,207 @@ function processarEstoqueACusto() {
 }
 
 /**
- * 2. Processa Vendas e Custos do Mercado Livre (CSV)
+ * 2. Processa Vendas e Custos do Mercado Livre (CSV) - Multi-Arquivos
  * Faturamento, Kits >= R$79 e Custos (Comissões + Frete)
  */
 function processarVendasMercadoLivre() {
   const pasta = DriveApp.getFolderById(CONFIG_SEM.FOLDER_ML_VENDAS_ID);
-  const arq = obterArquivoMaisRecenteRecursivo(pasta);
-  if (!arq) return { diario: {} };
-  ARQUIVOS_LIDOS_RODADA['ML_VENDAS'] = arq;
-
-  const matriz = lerDadosArquivo(arq);
-  if (!matriz || matriz.length <= 1) return { diario: {} };
-
-  const idxCabecalho = localizarIndiceCabecalho(matriz, ['date_created', 'data da compra', 'transaction_amount', 'seller_custom_field']);
-  const cabecalho = matriz[idxCabecalho].map(c => String(c).trim().toLowerCase());
-
-  const idxData = cabecalho.findIndex(c => c.includes('date_created') || c.includes('data da compra'));
-  const idxStatus = cabecalho.findIndex(c => c === 'status' || c.includes('status da operação'));
-  const idxValor = cabecalho.findIndex(c => c.includes('transaction_amount') || c.includes('valor do produto'));
-  const idxSku = cabecalho.findIndex(c => c.includes('seller_custom_field') || c.includes('sku'));
-
-  // Colunas de Custo ML
-  const idxMktFee = cabecalho.findIndex(c => c.includes('marketplace_fee') || c.includes('tarifa pelo uso'));
-  const idxMpFee = cabecalho.findIndex(c => c.includes('mercadopago_fee') || c.includes('tarifa do mercado pago'));
-  const idxFinFee = cabecalho.findIndex(c => c.includes('financing_fee') || c.includes('custos de parcelamento'));
-  const idxShipCost = cabecalho.findIndex(c => c.includes('shipping_cost') || c.includes('frete'));
+  const arquivos = obterTodosArquivosRecursivo(pasta);
+  if (arquivos.length === 0) return { diario: {} };
 
   const diario = {};
 
-  for (let i = idxCabecalho + 1; i < matriz.length; i++) {
-    const linha = matriz[i];
-    const status = idxStatus !== -1 ? String(linha[idxStatus]).toLowerCase().trim() : 'approved';
-    if (status.includes('cancel') || status.includes('refund') || status.includes('rejected')) continue;
+  arquivos.forEach(arq => {
+    ARQUIVOS_LIDOS_RODADA[`ML_VENDAS_${arq.getId()}`] = arq;
+    const matriz = lerDadosArquivo(arq);
+    if (!matriz || matriz.length <= 1) return;
 
-    const dataIso = normalizarDataChave(linha[idxData]);
-    if (!dataIso) continue;
+    const idxCabecalho = localizarIndiceCabecalho(matriz, ['date_created', 'data da compra', 'transaction_amount', 'seller_custom_field']);
+    const cabecalho = matriz[idxCabecalho].map(c => String(c).trim().toLowerCase());
 
-    const valor = idxValor !== -1 ? limparNumero(linha[idxValor]) : 0;
-    const sku = idxSku !== -1 ? String(linha[idxSku]).trim().toUpperCase() : '';
+    const idxData = cabecalho.findIndex(c => c.includes('date_created') || c.includes('data da compra'));
+    const idxStatus = cabecalho.findIndex(c => c === 'status' || c.includes('status da operação'));
+    const idxValor = cabecalho.findIndex(c => c.includes('transaction_amount') || c.includes('valor do produto'));
+    const idxSku = cabecalho.findIndex(c => c.includes('seller_custom_field') || c.includes('sku'));
 
-    // Custos ML: No relatório podem vir negativos ou positivos, usamos Math.abs para somar o valor absoluto debitado
-    const mktFee = idxMktFee !== -1 ? Math.abs(limparNumero(linha[idxMktFee])) : 0;
-    const mpFee = idxMpFee !== -1 ? Math.abs(limparNumero(linha[idxMpFee])) : 0;
-    const finFee = idxFinFee !== -1 ? Math.abs(limparNumero(linha[idxFinFee])) : 0;
-    const shipCost = idxShipCost !== -1 ? Math.abs(limparNumero(linha[idxShipCost])) : 0;
-    const custoLinha = mktFee + mpFee + finFee + shipCost;
+    const idxMktFee = cabecalho.findIndex(c => c.includes('marketplace_fee') || c.includes('tarifa pelo uso'));
+    const idxMpFee = cabecalho.findIndex(c => c.includes('mercadopago_fee') || c.includes('tarifa do mercado pago'));
+    const idxFinFee = cabecalho.findIndex(c => c.includes('financing_fee') || c.includes('custos de parcelamento'));
+    const idxShipCost = cabecalho.findIndex(c => c.includes('shipping_cost') || c.includes('frete'));
 
-    if (!diario[dataIso]) {
-      diario[dataIso] = { total: 0, kits79: 0, custos: 0 };
+    for (let i = idxCabecalho + 1; i < matriz.length; i++) {
+      const linha = matriz[i];
+      const status = idxStatus !== -1 ? String(linha[idxStatus]).toLowerCase().trim() : 'approved';
+      if (status.includes('cancel') || status.includes('refund') || status.includes('rejected')) continue;
+
+      const dataIso = normalizarDataChave(linha[idxData]);
+      if (!dataIso) continue;
+
+      const valor = idxValor !== -1 ? limparNumero(linha[idxValor]) : 0;
+      const sku = idxSku !== -1 ? String(linha[idxSku]).trim().toUpperCase() : '';
+
+      const mktFee = idxMktFee !== -1 ? Math.abs(limparNumero(linha[idxMktFee])) : 0;
+      const mpFee = idxMpFee !== -1 ? Math.abs(limparNumero(linha[idxMpFee])) : 0;
+      const finFee = idxFinFee !== -1 ? Math.abs(limparNumero(linha[idxFinFee])) : 0;
+      const shipCost = idxShipCost !== -1 ? Math.abs(limparNumero(linha[idxShipCost])) : 0;
+      const custoLinha = mktFee + mpFee + finFee + shipCost;
+
+      if (!diario[dataIso]) {
+        diario[dataIso] = { total: 0, kits79: 0, custos: 0 };
+      }
+
+      diario[dataIso].total += valor;
+      diario[dataIso].custos += custoLinha;
+
+      if (sku.startsWith('KIT') && valor >= 79.00) {
+        diario[dataIso].kits79 += valor;
+      }
     }
-
-    diario[dataIso].total += valor;
-    diario[dataIso].custos += custoLinha;
-
-    if (sku.startsWith('KIT') && valor >= 79.00) {
-      diario[dataIso].kits79 += valor;
-    }
-  }
+  });
 
   return { diario };
 }
 
 /**
- * 3. Processa Relatório de Vendas da Amazon (.TXT)
+ * 3. Processa Relatórios de Vendas da Amazon (.TXT) - Multi-Arquivos
  */
 function processarVendasAmazon() {
   const pasta = DriveApp.getFolderById(CONFIG_SEM.FOLDER_AMAZON_VENDAS_ID);
-  const arq = obterArquivoMaisRecenteRecursivo(pasta);
-  if (!arq) return { diario: {} };
-  ARQUIVOS_LIDOS_RODADA['AMAZON_VENDAS'] = arq;
-
-  const matriz = lerDadosArquivo(arq);
-  if (!matriz || matriz.length <= 1) return { diario: {} };
-
-  const idxCabecalho = localizarIndiceCabecalho(matriz, ['purchase-date', 'item-price', 'order-status', 'sku']);
-  const cabecalho = matriz[idxCabecalho].map(c => String(c).trim().toLowerCase());
-
-  const idxData = cabecalho.findIndex(c => c.includes('purchase-date'));
-  const idxStatus = cabecalho.findIndex(c => c.includes('order-status'));
-  const idxValor = cabecalho.findIndex(c => c.includes('item-price'));
-  const idxSku = cabecalho.findIndex(c => c === 'sku');
+  const arquivos = obterTodosArquivosRecursivo(pasta);
+  if (arquivos.length === 0) return { diario: {} };
 
   const diario = {};
 
-  for (let i = idxCabecalho + 1; i < matriz.length; i++) {
-    const linha = matriz[i];
-    const status = idxStatus !== -1 ? String(linha[idxStatus]).toLowerCase().trim() : '';
-    if (status.includes('cancelled') || status.includes('cancelado')) continue;
+  arquivos.forEach(arq => {
+    ARQUIVOS_LIDOS_RODADA[`AMAZON_VENDAS_${arq.getId()}`] = arq;
+    const matriz = lerDadosArquivo(arq);
+    if (!matriz || matriz.length <= 1) return;
 
-    const dataIso = normalizarDataChave(linha[idxData]);
-    if (!dataIso) continue;
+    const idxCabecalho = localizarIndiceCabecalho(matriz, ['purchase-date', 'item-price', 'order-status', 'sku']);
+    const cabecalho = matriz[idxCabecalho].map(c => String(c).trim().toLowerCase());
 
-    const valor = idxValor !== -1 ? limparNumero(linha[idxValor]) : 0;
-    const sku = idxSku !== -1 ? String(linha[idxSku]).trim().toUpperCase() : '';
+    const idxData = cabecalho.findIndex(c => c.includes('purchase-date'));
+    const idxStatus = cabecalho.findIndex(c => c.includes('order-status'));
+    const idxValor = cabecalho.findIndex(c => c.includes('item-price'));
+    const idxSku = cabecalho.findIndex(c => c === 'sku');
 
-    if (!diario[dataIso]) {
-      diario[dataIso] = { total: 0, kits79: 0 };
+    for (let i = idxCabecalho + 1; i < matriz.length; i++) {
+      const linha = matriz[i];
+      const status = idxStatus !== -1 ? String(linha[idxStatus]).toLowerCase().trim() : '';
+      if (status.includes('cancelled') || status.includes('cancelado')) continue;
+
+      const dataIso = normalizarDataChave(linha[idxData]);
+      if (!dataIso) continue;
+
+      const valor = idxValor !== -1 ? limparNumero(linha[idxValor]) : 0;
+      const sku = idxSku !== -1 ? String(linha[idxSku]).trim().toUpperCase() : '';
+
+      if (!diario[dataIso]) {
+        diario[dataIso] = { total: 0, kits79: 0 };
+      }
+
+      diario[dataIso].total += valor;
+
+      if (sku.startsWith('KIT') && valor >= 79.00) {
+        diario[dataIso].kits79 += valor;
+      }
     }
-
-    diario[dataIso].total += valor;
-
-    if (sku.startsWith('KIT') && valor >= 79.00) {
-      diario[dataIso].kits79 += valor;
-    }
-  }
+  });
 
   return { diario };
 }
 
 /**
- * 4. Processa Visitas do Mercado Livre (Relatorio_evolucao_negocio)
+ * 4. Processa Visitas do Mercado Livre - Multi-Arquivos
  */
 function processarTrafegoMercadoLivre() {
   const pasta = DriveApp.getFolderById(CONFIG_SEM.FOLDER_ML_TRAFEGO_ID);
-  const arq = obterArquivoMaisRecenteRecursivo(pasta);
-  if (!arq) {
-    Logger.log("⚠️ Nenhum arquivo de tráfego ML encontrado.");
-    return {};
-  }
-  ARQUIVOS_LIDOS_RODADA['ML_TRAFEGO'] = arq;
-
-  const matriz = lerDadosArquivo(arq);
-  if (!matriz || matriz.length <= 1) return {};
-
-  // Varre até a linha 30 para localizar o cabeçalho mesmo com metadados no topo
-  let idxCabecalho = -1;
-  for (let r = 0; r < Math.min(matriz.length, 30); r++) {
-    const linhaStr = matriz[r].map(c => String(c).trim().toLowerCase()).join(' ');
-    if (linhaStr.includes('visitas') && (linhaStr.includes('data') || linhaStr.includes('compradores'))) {
-      idxCabecalho = r;
-      break;
-    }
-  }
-
-  if (idxCabecalho === -1) idxCabecalho = 0;
-  const cabecalho = matriz[idxCabecalho].map(c => String(c).trim().toLowerCase());
-
-  const idxData = cabecalho.findIndex(c => c === 'data' || c.includes('data'));
-  const idxVisitas = cabecalho.findIndex(c => c === 'visitas' || c.includes('visitas'));
+  const arquivos = obterTodosArquivosRecursivo(pasta);
+  if (arquivos.length === 0) return {};
 
   const trafego = {};
   let totalCapturado = 0;
 
-  for (let i = idxCabecalho + 1; i < matriz.length; i++) {
-    const linha = matriz[i];
-    const dataIso = normalizarDataChave(linha[idxData]);
-    if (!dataIso) continue;
+  arquivos.forEach(arq => {
+    ARQUIVOS_LIDOS_RODADA[`ML_TRAFEGO_${arq.getId()}`] = arq;
+    const matriz = lerDadosArquivo(arq);
+    if (!matriz || matriz.length <= 1) return;
 
-    const visitas = idxVisitas !== -1 ? Math.round(limparNumero(linha[idxVisitas])) : 0;
-    trafego[dataIso] = (trafego[dataIso] || 0) + visitas;
-    totalCapturado += visitas;
-  }
+    let idxCabecalho = -1;
+    for (let r = 0; r < Math.min(matriz.length, 30); r++) {
+      const linhaStr = matriz[r].map(c => String(c).trim().toLowerCase()).join(' ');
+      if (linhaStr.includes('visitas') && (linhaStr.includes('data') || linhaStr.includes('compradores'))) {
+        idxCabecalho = r;
+        break;
+      }
+    }
+
+    if (idxCabecalho === -1) idxCabecalho = 0;
+    const cabecalho = matriz[idxCabecalho].map(c => String(c).trim().toLowerCase());
+    const idxData = cabecalho.findIndex(c => c === 'data' || c.includes('data'));
+    const idxVisitas = cabecalho.findIndex(c => c === 'visitas' || c.includes('visitas'));
+
+    for (let i = idxCabecalho + 1; i < matriz.length; i++) {
+      const linha = matriz[i];
+      const dataIso = normalizarDataChave(linha[idxData]);
+      if (!dataIso) continue;
+
+      const visitas = idxVisitas !== -1 ? Math.round(limparNumero(linha[idxVisitas])) : 0;
+      trafego[dataIso] = (trafego[dataIso] || 0) + visitas;
+      totalCapturado += visitas;
+    }
+  });
 
   Logger.log(`Tráfego ML processado: ${totalCapturado} visitas acumuladas.`);
   return trafego;
 }
 
 /**
- * 5. Processa Visitas/Sessões da Amazon (BusinessReport CSV)
+ * 5. Processa Visitas/Sessões da Amazon - Multi-Arquivos
  */
 function processarTrafegoAmazon() {
   const pasta = DriveApp.getFolderById(CONFIG_SEM.FOLDER_AMAZON_TRAFEGO_ID);
-  const arq = obterArquivoMaisRecenteRecursivo(pasta);
-  if (!arq) {
-    Logger.log("⚠️ Nenhum arquivo de tráfego Amazon encontrado.");
-    return {};
-  }
-  ARQUIVOS_LIDOS_RODADA['AMAZON_TRAFEGO'] = arq;
-
-  const matriz = lerDadosArquivo(arq);
-  if (!matriz || matriz.length <= 1) return {};
-
-  let idxCabecalho = -1;
-  for (let r = 0; r < Math.min(matriz.length, 30); r++) {
-    const linhaStr = matriz[r].map(c => String(c).trim().toLowerCase()).join(' ');
-    if (linhaStr.includes('sess') || linhaStr.includes('session')) {
-      idxCabecalho = r;
-      break;
-    }
-  }
-
-  if (idxCabecalho === -1) idxCabecalho = 0;
-  const cabecalho = matriz[idxCabecalho].map(c => String(c).trim().toLowerCase());
-  Logger.log(`Cabeçalho BusinessReport Amazon na linha ${idxCabecalho + 1}: [${cabecalho.slice(0, 5).join(' | ')}]`);
-
-  const idxData = cabecalho.findIndex(c => c === 'data' || c.includes('data') || c.includes('date'));
-  
-  // Captura tolerante a traço normal (-), travessão (–), total ou sessões puras
-  const idxSessoes = cabecalho.findIndex(c => 
-    (c.includes('sess') || c.includes('session')) && (c.includes('total') || !c.includes('móvel') && !c.includes('navegador'))
-  );
+  const arquivos = obterTodosArquivosRecursivo(pasta);
+  if (arquivos.length === 0) return {};
 
   const trafego = {};
   let totalCapturado = 0;
 
-  for (let i = idxCabecalho + 1; i < matriz.length; i++) {
-    const linha = matriz[i];
-    let rawData = idxData !== -1 ? String(linha[idxData]).trim() : '';
-    if (!rawData) continue;
+  arquivos.forEach(arq => {
+    ARQUIVOS_LIDOS_RODADA[`AMAZON_TRAFEGO_${arq.getId()}`] = arq;
+    const matriz = lerDadosArquivo(arq);
+    if (!matriz || matriz.length <= 1) return;
 
-    // Normaliza datas com ponto (ex: 14.09.2026 -> 14/09/2026)
-    if (rawData.includes('.')) {
-      rawData = rawData.replace(/\./g, '/');
+    let idxCabecalho = -1;
+    for (let r = 0; r < Math.min(matriz.length, 30); r++) {
+      const linhaStr = matriz[r].map(c => String(c).trim().toLowerCase()).join(' ');
+      if (linhaStr.includes('sess') || linhaStr.includes('session')) {
+        idxCabecalho = r;
+        break;
+      }
     }
 
-    const dataIso = normalizarDataChave(rawData);
-    if (!dataIso) continue;
+    if (idxCabecalho === -1) idxCabecalho = 0;
+    const cabecalho = matriz[idxCabecalho].map(c => String(c).trim().toLowerCase());
+    const idxData = cabecalho.findIndex(c => c === 'data' || c.includes('data') || c.includes('date'));
+    const idxSessoes = cabecalho.findIndex(c => 
+      (c.includes('sess') || c.includes('session')) && (c.includes('total') || (!c.includes('móvel') && !c.includes('navegador')))
+    );
 
-    const sessoes = idxSessoes !== -1 ? Math.round(limparNumero(linha[idxSessoes])) : 0;
-    trafego[dataIso] = (trafego[dataIso] || 0) + sessoes;
-    totalCapturado += sessoes;
-  }
+    for (let i = idxCabecalho + 1; i < matriz.length; i++) {
+      const linha = matriz[i];
+      let rawData = idxData !== -1 ? String(linha[idxData]).trim() : '';
+      if (!rawData) continue;
+      if (rawData.includes('.')) rawData = rawData.replace(/\./g, '/');
+
+      const dataIso = normalizarDataChave(rawData);
+      if (!dataIso) continue;
+
+      const sessoes = idxSessoes !== -1 ? Math.round(limparNumero(linha[idxSessoes])) : 0;
+      trafego[dataIso] = (trafego[dataIso] || 0) + sessoes;
+      totalCapturado += sessoes;
+    }
+  });
 
   Logger.log(`Tráfego Amazon processado: ${totalCapturado} sessões acumuladas.`);
   return trafego;
@@ -835,147 +830,97 @@ function processarTrafegoAmazon() {
  * - Comissão: tarifas de venda + taxas fba
  * - Frete DBA: taxas de outras transações (quando descrição contiver Delivery by Amazon)
  */
+/**
+ * 6. Processa Custos da Amazon através do Relatório de Transações (.CSV) - Multi-Arquivos
+ */
 function processarCustosAmazon() {
   const pasta = DriveApp.getFolderById(CONFIG_SEM.FOLDER_AMAZON_CUSTOS_ID);
-  const arq = obterArquivoMaisRecenteRecursivo(pasta);
-  if (!arq) {
-    Logger.log("⚠️ Nenhum arquivo de custos Amazon encontrado na pasta.");
-    return {};
-  }
-  ARQUIVOS_LIDOS_RODADA['AMAZON_CUSTOS'] = arq;
-
-  const matriz = lerDadosArquivo(arq);
-  if (!matriz || matriz.length <= 1) return {};
-
-  // Localiza a linha do cabeçalho real
-  let idxCabecalho = -1;
-  for (let r = 0; r < Math.min(matriz.length, 30); r++) {
-    const linhaStr = matriz[r].map(c => String(c).trim().toLowerCase()).join(' ');
-    const temData = linhaStr.includes('data');
-    const temPedido = linhaStr.includes('pedido') || linhaStr.includes('order');
-    if (temData && temPedido) {
-      idxCabecalho = r;
-      break;
-    }
-  }
-
-  if (idxCabecalho === -1) idxCabecalho = 0;
-  const cabecalho = matriz[idxCabecalho].map(c => String(c).trim().toLowerCase());
-
-  const idxData = cabecalho.findIndex(c => c.includes('data'));
-  const idxPedido = cabecalho.findIndex(c => c.includes('pedido'));
-  const idxDesc = cabecalho.findIndex(c => c.includes('descri') || c.includes('description'));
-  const idxTarifaVenda = cabecalho.findIndex(c => c.includes('tarifas de venda') || c.includes('selling fee'));
-  const idxTaxaFba = cabecalho.findIndex(c => c.includes('taxas fba') || c.includes('fba fee'));
-  
-  // Mapeamento tolerante a acentos para "taxas de outras transações"
-  let idxOutrasTrans = cabecalho.findIndex(c => c.includes('outras') && (c.includes('transa') || c.includes('taxa')));
-  if (idxOutrasTrans === -1) {
-    // Caso padrão de coluna U (índice 20)
-    idxOutrasTrans = 20;
-  }
-
-  Logger.log(`Colunas mapeadas Custos Amazon: Data=${idxData}, Pedido=${idxPedido}, Desc=${idxDesc}, TarifaVenda=${idxTarifaVenda}, TaxaFBA=${idxTaxaFba}, OutrasTrans=${idxOutrasTrans}`);
+  const arquivos = obterTodosArquivosRecursivo(pasta);
+  if (arquivos.length === 0) return {};
 
   const custosDiarios = {};
   let totalComissao = 0;
   let totalFreteDba = 0;
   let linhasFreteEncontradas = 0;
 
-  for (let i = idxCabecalho + 1; i < matriz.length; i++) {
-    const linha = matriz[i];
-    
-    let rawData = idxData !== -1 ? String(linha[idxData]).trim() : '';
-    if (!rawData) continue;
+  arquivos.forEach(arq => {
+    ARQUIVOS_LIDOS_RODADA[`AMAZON_CUSTOS_${arq.getId()}`] = arq;
+    const matriz = lerDadosArquivo(arq);
+    if (!matriz || matriz.length <= 1) return;
 
-    let dataIso = normalizarDataChave(rawData);
-    
-    // Normalização para datas textuais em português ("8 de set. de 2026")
-    if (!dataIso && (rawData.includes('de') || rawData.includes('.'))) {
-      const meses = { 'jan': '01', 'fev': '02', 'mar': '03', 'abr': '04', 'mai': '05', 'jun': '06', 'jul': '07', 'ago': '08', 'set': '09', 'out': '10', 'nov': '11', 'dez': '12' };
-      const limpo = rawData.replace(/de/gi, ' ').replace(/\./g, ' ').replace(/\s+/g, ' ').trim();
-      const partes = limpo.split(' ');
-      if (partes.length >= 3) {
-        const dia = partes[0].padStart(2, '0');
-        const mesTxt = partes[1].toLowerCase().substring(0, 3);
-        const ano = partes[2];
-        if (meses[mesTxt]) {
-          dataIso = `${ano}-${meses[mesTxt]}-${dia}`;
+    let idxCabecalho = -1;
+    for (let r = 0; r < Math.min(matriz.length, 30); r++) {
+      const linhaStr = matriz[r].map(c => String(c).trim().toLowerCase()).join(' ');
+      if (linhaStr.includes('data') && (linhaStr.includes('pedido') || linhaStr.includes('order'))) {
+        idxCabecalho = r;
+        break;
+      }
+    }
+
+    if (idxCabecalho === -1) idxCabecalho = 0;
+    const cabecalho = matriz[idxCabecalho].map(c => String(c).trim().toLowerCase());
+
+    const idxData = cabecalho.findIndex(c => c.includes('data'));
+    const idxDesc = cabecalho.findIndex(c => c.includes('descri') || c.includes('description'));
+    const idxTarifaVenda = cabecalho.findIndex(c => c.includes('tarifas de venda') || c.includes('selling fee'));
+    const idxTaxaFba = cabecalho.findIndex(c => c.includes('taxas fba') || c.includes('fba fee'));
+    let idxOutrasTrans = cabecalho.findIndex(c => c.includes('outras') && (c.includes('transa') || c.includes('taxa')));
+    if (idxOutrasTrans === -1) idxOutrasTrans = 20;
+
+    for (let i = idxCabecalho + 1; i < matriz.length; i++) {
+      const linha = matriz[i];
+      let rawData = idxData !== -1 ? String(linha[idxData]).trim() : '';
+      if (!rawData) continue;
+
+      let dataIso = normalizarDataChave(rawData);
+      if (!dataIso && (rawData.includes('de') || rawData.includes('.'))) {
+        const meses = { 'jan': '01', 'fev': '02', 'mar': '03', 'abr': '04', 'mai': '05', 'jun': '06', 'jul': '07', 'ago': '08', 'set': '09', 'out': '10', 'nov': '11', 'dez': '12' };
+        const limpo = rawData.replace(/de/gi, ' ').replace(/\./g, ' ').replace(/\s+/g, ' ').trim();
+        const partes = limpo.split(' ');
+        if (partes.length >= 3) {
+          const dia = partes[0].padStart(2, '0');
+          const mesTxt = partes[1].toLowerCase().substring(0, 3);
+          const ano = partes[2];
+          if (meses[mesTxt]) dataIso = `${ano}-${meses[mesTxt]}-${dia}`;
         }
       }
-    }
 
-    if (!dataIso) continue;
+      if (!dataIso) continue;
 
-    const desc = idxDesc !== -1 ? String(linha[idxDesc]).toLowerCase() : '';
-    
-    // 1. Comissão: tarifas de venda + taxas fba
-    const tarifaVenda = idxTarifaVenda !== -1 ? Math.abs(limparNumero(linha[idxTarifaVenda])) : 0;
-    const taxaFba = idxTaxaFba !== -1 ? Math.abs(limparNumero(linha[idxTaxaFba])) : 0;
-    const comissaoLinha = tarifaVenda + taxaFba;
+      const desc = idxDesc !== -1 ? String(linha[idxDesc]).toLowerCase() : '';
+      const tarifaVenda = idxTarifaVenda !== -1 ? Math.abs(limparNumero(linha[idxTarifaVenda])) : 0;
+      const taxaFba = idxTaxaFba !== -1 ? Math.abs(limparNumero(linha[idxTaxaFba])) : 0;
+      const comissaoLinha = tarifaVenda + taxaFba;
 
-    // 2. Frete DBA: busca abrangente por termos do Delivery by Amazon
-    let freteLinha = 0;
-    const isLinhaDba = desc.includes('delivery by amazon') || 
-                       desc.includes('dba') || 
-                       desc.includes('manuseio com base no peso') ||
-                       (desc.includes('manuseio') && desc.includes('peso'));
+      let freteLinha = 0;
+      const isLinhaDba = desc.includes('delivery by amazon') || desc.includes('dba') || desc.includes('manuseio com base no peso');
+      if (isLinhaDba && idxOutrasTrans !== -1) {
+        freteLinha = Math.abs(limparNumero(linha[idxOutrasTrans]));
+        if (freteLinha > 0) linhasFreteEncontradas++;
+      }
 
-    if (isLinhaDba && idxOutrasTrans !== -1) {
-      freteLinha = Math.abs(limparNumero(linha[idxOutrasTrans]));
-      if (freteLinha > 0) {
-        linhasFreteEncontradas++;
+      const custoTotalLinha = comissaoLinha + freteLinha;
+      if (custoTotalLinha > 0) {
+        custosDiarios[dataIso] = (custosDiarios[dataIso] || 0) + custoTotalLinha;
+        totalComissao += comissaoLinha;
+        totalFreteDba += freteLinha;
       }
     }
+  });
 
-    const custoTotalLinha = comissaoLinha + freteLinha;
-
-    if (custoTotalLinha > 0) {
-      custosDiarios[dataIso] = (custosDiarios[dataIso] || 0) + custoTotalLinha;
-      totalComissao += comissaoLinha;
-      totalFreteDba += freteLinha;
-    }
-  }
-
-  Logger.log(`Custos Amazon Apurados: Comissão = R$ ${totalComissao.toFixed(2)} | Frete DBA = R$ ${totalFreteDba.toFixed(2)} (${linhasFreteEncontradas} itens) | Total = R$ ${(totalComissao + totalFreteDba).toFixed(2)}`);
+  Logger.log(`Custos Amazon Apurados: Comissão = R$ ${totalComissao.toFixed(2)} | Frete DBA = R$ ${totalFreteDba.toFixed(2)} (${linhasFreteEncontradas} itens)`);
   return custosDiarios;
 }
 
 /**
- * 7. Processa Relatório de Investimento em Ads da Amazon (.CSV)
- * Faz o rateio do 'Custo total' pelos dias do 'Intervalo de datas'
+ * 7. Processa Relatórios de Ads da Amazon (.CSV)
  */
 function processarAdsAmazon() {
   const pasta = DriveApp.getFolderById(CONFIG_SEM.FOLDER_ADS_ID_AMZ);
-  const arq = obterArquivoMaisRecenteRecursivo(pasta);
-  if (!arq) {
-    Logger.log("⚠️ Nenhum arquivo de Ads Amazon encontrado na pasta.");
-    return {};
-  }
-  ARQUIVOS_LIDOS_RODADA['ADS_AMZ'] = arq;
-
-  const matriz = lerDadosArquivo(arq);
-  if (!matriz || matriz.length <= 1) return {};
-
-  let idxCabecalho = -1;
-  for (let r = 0; r < Math.min(matriz.length, 30); r++) {
-    const linhaStr = matriz[r].map(c => String(c).trim().toLowerCase()).join(' ');
-    if (linhaStr.includes('intervalo de datas') || linhaStr.includes('custo total') || linhaStr.includes('campanha')) {
-      idxCabecalho = r;
-      break;
-    }
-  }
-
-  if (idxCabecalho === -1) idxCabecalho = 0;
-  const cabecalho = matriz[idxCabecalho].map(c => String(c).trim().toLowerCase());
-  Logger.log(`Cabeçalho Ads na linha ${idxCabecalho + 1}: [${cabecalho.slice(0, 5).join(' | ')}]`);
-
-  const idxIntervalo = cabecalho.findIndex(c => c.includes('intervalo de datas') || c.includes('intervalo') || c === 'data');
-  const idxCustoTotal = cabecalho.findIndex(c => c.includes('custo total') || c === 'custo');
+  const arquivos = obterTodosArquivosRecursivo(pasta);
+  if (arquivos.length === 0) return {};
 
   const mapaAdsDiario = {};
-  let totalAdsApurado = 0;
-
   const mesesMap = { 'jan': 0, 'fev': 1, 'mar': 2, 'abr': 3, 'mai': 4, 'jun': 5, 'jul': 6, 'ago': 7, 'set': 8, 'out': 9, 'nov': 10, 'dez': 11 };
 
   function extrairDataPt(str) {
@@ -993,111 +938,103 @@ function processarAdsAmazon() {
     return null;
   }
 
-  for (let i = idxCabecalho + 1; i < matriz.length; i++) {
-    const linha = matriz[i];
-    const intervaloStr = idxIntervalo !== -1 ? String(linha[idxIntervalo]).trim() : '';
-    const custo = idxCustoTotal !== -1 ? limparNumero(linha[idxCustoTotal]) : 0;
+  arquivos.forEach(arq => {
+    ARQUIVOS_LIDOS_RODADA[`ADS_AMZ_${arq.getId()}`] = arq;
+    const matriz = lerDadosArquivo(arq);
+    if (!matriz || matriz.length <= 1) return;
 
-    if (!intervaloStr || custo <= 0) continue;
+    let idxCab = localizarIndiceCabecalho(matriz, ['intervalo de datas', 'custo total', 'campanha']);
+    const cab = matriz[idxCab].map(c => String(c).trim().toLowerCase());
+    const idxIntervalo = cab.findIndex(c => c.includes('intervalo de datas') || c === 'data');
+    const idxCusto = cab.findIndex(c => c.includes('custo total') || c === 'custo');
 
-    // Quebra o intervalo (ex: '14 de set. de 2026 - 14 de set. de 2026')
-    const partesIntervalo = intervaloStr.split(/\s*-\s*/);
-    const dInicio = extrairDataPt(partesIntervalo[0]);
-    const dFim = partesIntervalo.length > 1 ? extrairDataPt(partesIntervalo[1]) : dInicio;
+    for (let i = idxCab + 1; i < matriz.length; i++) {
+      const linha = matriz[i];
+      const intervaloStr = idxIntervalo !== -1 ? String(linha[idxIntervalo]).trim() : '';
+      const custo = idxCusto !== -1 ? limparNumero(linha[idxCusto]) : 0;
+      if (!intervaloStr || custo <= 0) continue;
 
-    if (!dInicio) continue;
-    const dTermino = dFim || dInicio;
+      const partes = intervaloStr.split(/\s*-\s*/);
+      const dInicio = extrairDataPt(partes[0]);
+      const dTermino = partes.length > 1 ? (extrairDataPt(partes[1]) || dInicio) : dInicio;
+      if (!dInicio) continue;
 
-    // Quantidade de dias compreendidos no período
-    const diffTime = Math.abs(dTermino.getTime() - dInicio.getTime());
-    const qtdDias = Math.round(diffTime / (1000 * 60 * 60 * 24)) + 1;
-    const custoRateadoDiario = custo / (qtdDias > 0 ? qtdDias : 1);
+      const diffTime = Math.abs(dTermino.getTime() - dInicio.getTime());
+      const qtdDias = Math.round(diffTime / (1000 * 60 * 60 * 24)) + 1;
+      const rateio = custo / (qtdDias > 0 ? qtdDias : 1);
 
-    // Distribui o custo proporcional por dia
-    let dCurr = new Date(dInicio.getTime());
-    for (let d = 0; d < qtdDias; d++) {
-      const dataIso = Utilities.formatDate(dCurr, "GMT-0300", 'yyyy-MM-dd');
-      mapaAdsDiario[dataIso] = (mapaAdsDiario[dataIso] || 0) + custoRateadoDiario;
-      dCurr.setDate(dCurr.getDate() + 1);
+      let dCurr = new Date(dInicio.getTime());
+      for (let d = 0; d < qtdDias; d++) {
+        const dIso = Utilities.formatDate(dCurr, "GMT-0300", 'yyyy-MM-dd');
+        mapaAdsDiario[dIso] = (mapaAdsDiario[dIso] || 0) + rateio;
+        dCurr.setDate(dCurr.getDate() + 1);
+      }
     }
+  });
 
-    totalAdsApurado += custo;
-  }
-
-  Logger.log(`Investimento em Ads apurado: R$ ${totalAdsApurado.toFixed(2)}`);
   return mapaAdsDiario;
 }
 
 /**
- * 8. Processa Relatório de Investimento em Ads do Mercado Livre (.XLSX)
+ * 8. Processa Relatório de Ads do Mercado Livre (.XLSX)
  * - Lê a 3ª aba: "Relatório de campanha"
- * - Cabeçalho na Linha 2, dados a partir da Linha 3
- * - Filtra apenas campanhas com Status 'Ativa'
- * - Rateia a coluna 'Investimento' entre as datas 'Desde' e 'Até'
+ * - Cabeçalho na linha 2, dados a partir da linha 3
+ * - Filtra estritamente campanhas com Status 'Ativa'
+ * - Rateia a coluna 'Investimento' entre 'Desde' e 'Até'
  */
 function processarAdsMercadoLivre() {
   const pasta = DriveApp.getFolderById(CONFIG_SEM.FOLDER_ADS_ID_ML);
-  const arq = obterArquivoMaisRecenteRecursivo(pasta);
-  if (!arq) {
-    Logger.log("⚠️ Nenhum arquivo de Ads Mercado Livre encontrado na pasta.");
-    return {};
-  }
-  ARQUIVOS_LIDOS_RODADA['ADS_ML'] = arq;
-
-  // Lê especificamente a 3ª aba ("Relatório de campanha")
-  const matriz = lerDadosArquivo(arq, 'Relatório de campanha');
-  if (!matriz || matriz.length <= 2) return {};
-
-  // O cabeçalho está na Linha 2 (índice 1)
-  let idxCab = 1;
-  const cabecalho = matriz[idxCab].map(c => String(c).trim().toLowerCase());
-
-  const idxStatus = cabecalho.findIndex(c => c === 'status');
-  const idxDesde = cabecalho.findIndex(c => c === 'desde');
-  const idxAte = cabecalho.findIndex(c => c === 'até' || c === 'ate');
-  const idxInvest = cabecalho.findIndex(c => c.includes('investimento') && !c.includes('acos') && !c.includes('roas'));
+  const arquivos = obterTodosArquivosRecursivo(pasta);
+  if (arquivos.length === 0) return {};
 
   const mapaAdsDiario = {};
-  let totalInvestAtivo = 0;
+  let totalCapturadoML = 0;
 
-  // Dados começam na Linha 3 (índice 2)
-  for (let i = idxCab + 1; i < matriz.length; i++) {
-    const linha = matriz[i];
-    if (!linha || linha.length === 0) continue;
+  arquivos.forEach(arq => {
+    ARQUIVOS_LIDOS_RODADA[`ADS_ML_${arq.getId()}`] = arq;
+    // Força a abertura da aba 'Relatório de campanha'
+    const matriz = lerDadosArquivo(arq, 'Relatório de campanha');
+    if (!matriz || matriz.length <= 2) return;
 
-    const status = idxStatus !== -1 ? String(linha[idxStatus]).trim().toLowerCase() : '';
-    
-    // Filtro restrito: apenas campanhas ATIVAS
-    if (status !== 'ativa') continue;
+    // Cabeçalho está na Linha 2 (índice 1)
+    const cab = matriz[1].map(c => String(c).trim().toLowerCase());
+    const idxStatus = cab.findIndex(c => c === 'status');
+    const idxDesde = cab.findIndex(c => c === 'desde');
+    const idxAte = cab.findIndex(c => c === 'até' || c === 'ate');
+    const idxInvest = cab.findIndex(c => c.includes('investimento') && !c.includes('acos') && !c.includes('roas'));
 
-    const invest = idxInvest !== -1 ? limparNumero(linha[idxInvest]) : 0;
-    if (invest <= 0) continue;
+    for (let i = 2; i < matriz.length; i++) {
+      const linha = matriz[i];
+      if (!linha || linha.length === 0) continue;
 
-    const rawDesde = idxDesde !== -1 ? normalizarDataChave(linha[idxDesde]) : null;
-    const rawAte = idxAte !== -1 ? normalizarDataChave(linha[idxAte]) : null;
+      const status = idxStatus !== -1 ? String(linha[idxStatus]).trim().toLowerCase() : '';
+      if (status !== 'ativa') continue; // Apenas campanhas ativas
 
-    if (!rawDesde) continue;
-    const dataFimStr = rawAte || rawDesde;
+      const invest = idxInvest !== -1 ? limparNumero(linha[idxInvest]) : 0;
+      if (invest <= 0) continue;
 
-    const dInicio = parseDataIso(rawDesde);
-    const dTermino = parseDataIso(dataFimStr);
+      const dInicioStr = idxDesde !== -1 ? normalizarDataChave(linha[idxDesde]) : null;
+      const dFimStr = idxAte !== -1 ? normalizarDataChave(linha[idxAte]) : dInicioStr;
+      if (!dInicioStr) continue;
 
-    const diffTime = Math.abs(dTermino.getTime() - dInicio.getTime());
-    const qtdDias = Math.round(diffTime / (1000 * 60 * 60 * 24)) + 1;
-    const custoRateadoDiario = invest / (qtdDias > 0 ? qtdDias : 1);
+      const dInicio = parseDataIso(dInicioStr);
+      const dTermino = parseDataIso(dFimStr || dInicioStr);
 
-    // Distribui o investimento pelos dias da semana
-    let dCurr = new Date(dInicio.getTime());
-    for (let d = 0; d < qtdDias; d++) {
-      const dataIso = Utilities.formatDate(dCurr, "GMT-0300", 'yyyy-MM-dd');
-      mapaAdsDiario[dataIso] = (mapaAdsDiario[dataIso] || 0) + custoRateadoDiario;
-      dCurr.setDate(dCurr.getDate() + 1);
+      const diffTime = Math.abs(dTermino.getTime() - dInicio.getTime());
+      const qtdDias = Math.round(diffTime / (1000 * 60 * 60 * 24)) + 1;
+      const rateio = invest / (qtdDias > 0 ? qtdDias : 1);
+
+      let dCurr = new Date(dInicio.getTime());
+      for (let d = 0; d < qtdDias; d++) {
+        const dIso = Utilities.formatDate(dCurr, "GMT-0300", 'yyyy-MM-dd');
+        mapaAdsDiario[dIso] = (mapaAdsDiario[dIso] || 0) + rateio;
+        dCurr.setDate(dCurr.getDate() + 1);
+      }
+      totalCapturadoML += invest;
     }
+  });
 
-    totalInvestAtivo += invest;
-  }
-
-  Logger.log(`Investimento Ads ML (Campanhas Ativas): R$ ${totalInvestAtivo.toFixed(2)}`);
+  Logger.log(`Investimento Ads ML apurado: R$ ${totalCapturadoML.toFixed(2)}`);
   return mapaAdsDiario;
 }
 
@@ -1144,6 +1081,8 @@ function lerDadosArquivo(arquivo) {
       tempFileId = fileInserido.id;
 
       const ssConvertida = SpreadsheetApp.openById(tempFileId);
+      const abaAlvo = (nomeAba && ssConvertida.getSheetByName(nomeAba)) ? ssConvertida.getSheetByName(nomeAba) : ssConvertida.getSheets()[0];
+      return abaAlvo.getDataRange().getValues();
       let sheet = null;
       if (typeof nomeOuIndiceAba === 'string') {
         sheet = ssConvertida.getSheetByName(nomeOuIndiceAba) || ssConvertida.getSheets().find(s => s.getName().toLowerCase().includes(nomeOuIndiceAba.toLowerCase()));
@@ -1201,6 +1140,25 @@ function lerDadosArquivo(arquivo) {
     valores.push(atual.trim());
     return valores;
   });
+}
+
+/**
+ * Retorna todos os arquivos válidos da pasta e subpastas para leitura multi-semanas
+ */
+function obterTodosArquivosRecursivo(pasta) {
+  const lista = [];
+  function vasculhar(f) {
+    const files = f.getFiles();
+    while (files.hasNext()) {
+      const arq = files.next();
+      const n = arq.getName();
+      if (!n.startsWith('~') && !n.startsWith('.')) lista.push(arq);
+    }
+    const sub = f.getFolders();
+    while (sub.hasNext()) vasculhar(sub.next());
+  }
+  vasculhar(pasta);
+  return lista;
 }
 
 function obterArquivoMaisRecenteRecursivo(pasta) {
