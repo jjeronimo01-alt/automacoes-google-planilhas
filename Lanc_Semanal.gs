@@ -2,7 +2,8 @@
  * =========================================================================
  * DASHBOARD GESTÃO - JC FIVELAS E TIRAS
  * Módulo Semanal: Automação em Lote (Append-Only & Reprocessamento Contínuo)
- * Com Trava de Sobrescrita, Leitura Multi-Arquivos e Ads Separados (AMZ + ML)
+ * Com Trava de Sobrescrita, Multi-Arquivos e Ads Segmentados (AMZ: Col P | ML: Col Q)
+ * Grade: Col G até R (12 colunas) | Fórmulas preservadas: C, E, F, S e T
  * =========================================================================
  */
 const CONFIG_SEM = {
@@ -28,22 +29,22 @@ function onOpen() {
     .createMenu('🚀 Automações Gestão')
     .addItem('Lançar Novos Dados Diários', 'executarRotinaOficial')
     .addItem('📊 Lançar Novos Dados Semanais', 'executarRotinaSemanal')
+    .addItem('🔄 Reprocessar Todo o Histórico Semanal', 'reprocessarTodoHistoricoSemanal')
     .addSeparator()
-    .addItem('🔄 Limpar Memória Anti-Duplicidade', 'limparMemoriaAntiDuplicidade')
+    .addItem('🧹 Limpar Memória Anti-Duplicidade', 'limparMemoriaAntiDuplicidade')
     .addToUi();
 }
 
 /**
  * Mapeia rigorosamente as semanas existentes na coluna B (Data Início).
- * Ignora o getLastRow() global para não ser enganado por fórmulas matriciais.
  */
 function mapearSemanasExistentes(sheet) {
   const maxRows = sheet.getMaxRows();
   const valoresB = sheet.getRange(1, 2, maxRows, 1).getValues();
   const semanasExistentes = new Set();
-  const mapaLinhasPorSemana = {}; // Guarda { 'YYYY-MM-DD': numeroDaLinha }
+  const mapaLinhasPorSemana = {};
   
-  let ultimaLinhaComDadoReal = 3; // Linhas 1 a 3 reservadas para cabeçalhos
+  let ultimaLinhaComDadoReal = 3;
   let maiorSegundaEncontrada = '';
 
   for (let r = 3; r < valoresB.length; r++) {
@@ -69,21 +70,34 @@ function mapearSemanasExistentes(sheet) {
 }
 
 /**
- * ROTINA OFICIAL SEMANAL COM JANELA RETROATIVA DE 14 DIAS
+ * Rotina normal de atualização semanal (Janela retroativa de 14 dias)
  */
 function executarRotinaSemanal() {
-  Logger.log("=== INICIANDO ROTINA DE LANÇAMENTO SEMANAL (COM REPROCESSAMENTO) ===");
+  executarMotorLancamentoSemanal(false);
+}
+
+/**
+ * Rotina especial para reprocessar todo o histórico desde a primeira semana da planilha
+ */
+function reprocessarTodoHistoricoSemanal() {
+  executarMotorLancamentoSemanal(true);
+}
+
+/**
+ * Motor central de consolidação semanal
+ */
+function executarMotorLancamentoSemanal(reprocessarTudo) {
+  Logger.log(`=== INICIANDO ROTINA SEMANAL (${reprocessarTudo ? 'HISTÓRICO COMPLETO' : 'JANELA RECENTE 14D'}) ===`);
 
   const ss = SpreadsheetApp.openById(CONFIG_SEM.SPREADSHEET_ID);
   const sheet = ss.getSheetByName(CONFIG_SEM.SHEET_NAME);
   if (!sheet) throw new Error(`Aba "${CONFIG_SEM.SHEET_NAME}" não encontrada.`);
 
-  // 1. Identifica semanas e mapeia suas linhas físicas
   const { semanasExistentes, mapaLinhasPorSemana, proximaLinhaLivre, ultimaDataSegunda } = mapearSemanasExistentes(sheet);
   Logger.log(`Semanas cadastradas: ${semanasExistentes.size}`);
   Logger.log(`Última segunda-feira na planilha: ${ultimaDataSegunda || 'Nenhuma'}`);
 
-  // 2. Extração dos dados de todos os relatórios disponíveis no Drive
+  // Extração dos dados
   const mapaEstoqueSemanal = processarEstoqueACusto();
   let ultimoEstoqueConhecido = 0;
   const mapaML = processarVendasMercadoLivre();
@@ -94,19 +108,22 @@ function executarRotinaSemanal() {
   const mapaTrafegoML = processarTrafegoMercadoLivre();
   const mapaTrafegoAmazon = processarTrafegoAmazon();
 
-  // 3. Determinação da Data Inicial com Janela Retroativa de 14 Dias (2 Semanas)
   const hoje = new Date();
   const hojeSegundaIso = obterSegundaFeiraIso(Utilities.formatDate(hoje, "GMT-0300", 'yyyy-MM-dd'));
   let dataInicialSegundaIso = '';
 
-  if (ultimaDataSegunda) {
-    const dUltima = parseDataIso(ultimaDataSegunda);
-    dUltima.setDate(dUltima.getDate() - 14); // Retrocede 2 semanas para reprocessar semanas acumuladas
-    dataInicialSegundaIso = Utilities.formatDate(dUltima, "GMT-0300", 'yyyy-MM-dd');
+  const listaSemanasPlanilha = Object.keys(mapaLinhasPorSemana).sort();
+  const menorSemanaPlanilha = listaSemanasPlanilha.length > 0 ? listaSemanasPlanilha[0] : '';
 
-    const menorDataPlanilha = Object.keys(mapaLinhasPorSemana).sort()[0];
-    if (menorDataPlanilha && dataInicialSegundaIso < menorDataPlanilha) {
-      dataInicialSegundaIso = menorDataPlanilha;
+  if (reprocessarTudo && menorSemanaPlanilha) {
+    dataInicialSegundaIso = menorSemanaPlanilha;
+  } else if (ultimaDataSegunda) {
+    // Janela retroativa de 14 dias (2 semanas atrás)
+    const dUltima = parseDataIso(ultimaDataSegunda);
+    dUltima.setDate(dUltima.getDate() - 14);
+    dataInicialSegundaIso = Utilities.formatDate(dUltima, "GMT-0300", 'yyyy-MM-dd');
+    if (menorSemanaPlanilha && dataInicialSegundaIso < menorSemanaPlanilha) {
+      dataInicialSegundaIso = menorSemanaPlanilha;
     }
   } else {
     const todasAsDatas = [
@@ -116,14 +133,9 @@ function executarRotinaSemanal() {
       ...Object.keys(mapaTrafegoAmazon)
     ].sort();
 
-    if (todasAsDatas.length > 0) {
-      dataInicialSegundaIso = obterSegundaFeiraIso(todasAsDatas[0]);
-    } else {
-      dataInicialSegundaIso = hojeSegundaIso;
-    }
+    dataInicialSegundaIso = todasAsDatas.length > 0 ? obterSegundaFeiraIso(todasAsDatas[0]) : hojeSegundaIso;
   }
 
-  // 4. Lista sequencial de semanas a processar/atualizar
   const semanasParaProcessar = [];
   let dLoop = parseDataIso(dataInicialSegundaIso);
   const dLimite = parseDataIso(hojeSegundaIso);
@@ -146,6 +158,7 @@ function executarRotinaSemanal() {
     let totalAmazon = 0, custosAmazon = 0;
     let totalKitsML = 0, totalKitsAmazon = 0;
     let adsML = 0, adsAmazon = 0;
+    let totalVisitasML = 0, totalVisitasAmazon = 0;
 
     let dDia = new Date(dInicio.getTime());
     for (let i = 0; i < 7; i++) {
@@ -169,11 +182,18 @@ function executarRotinaSemanal() {
       if (mapaAdsML[diaIso]) {
         adsML += mapaAdsML[diaIso];
       }
+      if (mapaTrafegoML[diaIso]) {
+        totalVisitasML += mapaTrafegoML[diaIso];
+      }
+      if (mapaTrafegoAmazon[diaIso]) {
+        totalVisitasAmazon += mapaTrafegoAmazon[diaIso];
+      }
 
       dDia.setDate(dDia.getDate() + 1);
     }
 
     const totalKitsSemana = totalKitsML + totalKitsAmazon;
+    const totalVisitasSemana = totalVisitasML + totalVisitasAmazon;
     const custoFinalML = custosML + adsML;
     const custoFinalAmazon = custosAmazon + adsAmazon;
 
@@ -189,9 +209,9 @@ function executarRotinaSemanal() {
     const blocoAB = [[ semanaLabel, formatarDataBR(segundaStr) ]];
     const blocoD  = [[ ultimoEstoqueConhecido ]];
     
-    // Colunas G até Q (Exatamente 11 colunas):
-    // P = Invest. Ads AMZ (R$) | Q = Invest. Ads ML (R$)
-    const blocoGQ = [[
+    // Colunas G até R (Exatamente 12 colunas):
+    // P = Invest. Ads AMZ (R$) | Q = Invest. Ads ML (R$) | R = Visitas Únicas
+    const blocoGR = [[
       totalML,             // 1  (G): Mercado Livre (R$)
       custoFinalML,        // 2  (H): Custo Total Mercado Livre
       totalAmazon,         // 3  (I): Amazon (R$)
@@ -202,26 +222,24 @@ function executarRotinaSemanal() {
       0,                   // 8  (N): Custo Total Loja Própria - Ocioso
       totalKitsSemana,     // 9  (O): Vendas Kits >= R$79
       adsAmazon,           // 10 (P): Invest. Ads AMZ (R$)
-      adsML                // 11 (Q): Invest. Ads ML (R$)
+      adsML,               // 11 (Q): Invest. Ads ML (R$)
+      totalVisitasSemana   // 12 (R): Visitas Únicas
     ]];
 
-    // Reprocessa e atualiza se a semana já existe na planilha
     if (mapaLinhasPorSemana[segundaStr]) {
       const linExistente = mapaLinhasPorSemana[segundaStr];
-      Logger.log(`♻️ Atualizando dados da semana ${semanaLabel} (${segundaStr}) na linha ${linExistente}...`);
+      Logger.log(`♻️ Atualizando semana ${semanaLabel} (${segundaStr}) na linha ${linExistente}...`);
       
       sheet.getRange(linExistente, 1, 1, 2).setValues(blocoAB);
       sheet.getRange(linExistente, 4, 1, 1).setValues(blocoD);
-      sheet.getRange(linExistente, 7, 1, 11).setValues(blocoGQ);
+      sheet.getRange(linExistente, 7, 1, 12).setValues(blocoGR);
       aplicarFormatacaoSemanalLinha(sheet, linExistente);
-    } 
-    // Insere no fim da grade se for uma nova semana
-    else {
+    } else {
       Logger.log(`➕ Inserindo nova semana ${semanaLabel} (${segundaStr}) na linha ${linhaCursor}...`);
       
       sheet.getRange(linhaCursor, 1, 1, 2).setValues(blocoAB);
       sheet.getRange(linhaCursor, 4, 1, 1).setValues(blocoD);
-      sheet.getRange(linhaCursor, 7, 1, 11).setValues(blocoGQ);
+      sheet.getRange(linhaCursor, 7, 1, 12).setValues(blocoGR);
       aplicarFormatacaoSemanalLinha(sheet, linhaCursor);
       mapaLinhasPorSemana[segundaStr] = linhaCursor;
       linhaCursor++;
@@ -229,27 +247,29 @@ function executarRotinaSemanal() {
   });
 
   registrarArquivosComoProcessados();
-  Logger.log(`✅ Lançamento semanal concluído com sucesso!`);
+  Logger.log(`✅ Lançamento semanal concluído!`);
   SpreadsheetApp.getActiveSpreadsheet()?.toast("Cockpit Semanal atualizado com sucesso!", "Concluído");
 }
 
 function aplicarFormatacaoSemanalLinha(sheet, linha) {
-  sheet.getRange(linha, 1, 1, 19).setVerticalAlignment('middle');
+  sheet.getRange(linha, 1, 1, 20).setVerticalAlignment('middle');
   sheet.getRange(linha, 1, 1, 1).setHorizontalAlignment('center');
   sheet.getRange(linha, 2, 1, 1).setHorizontalAlignment('center').setNumberFormat('dd/mm/yyyy');
   sheet.getRange(linha, 3, 1, 3).setHorizontalAlignment('right').setNumberFormat('R$ #,##0.00');
   sheet.getRange(linha, 6, 1, 1).setHorizontalAlignment('center').setNumberFormat('#,##0.0');
   
-  // Colunas G até Q (todas formatadas como moeda R$ #,##0.00, incluindo Ads AMZ e Ads ML)
+  // Colunas G até Q (valores monetários, incluindo Ads AMZ e Ads ML)
   sheet.getRange(linha, 7, 1, 11).setHorizontalAlignment('right').setNumberFormat('R$ #,##0.00');
   
-  // Coluna R (Pedidos - 18) e Coluna S (Status Semanal - 19)
-  sheet.getRange(linha, 18, 1, 1).setHorizontalAlignment('center').setNumberFormat('#,##0');
-  sheet.getRange(linha, 19, 1, 1).setHorizontalAlignment('center');
+  // Coluna R (Visitas Únicas - 18) e Coluna S (Pedidos - 19)
+  sheet.getRange(linha, 18, 1, 2).setHorizontalAlignment('center').setNumberFormat('#,##0');
+  
+  // Coluna T (Status Semanal - 20)
+  sheet.getRange(linha, 20, 1, 1).setHorizontalAlignment('center');
 }
 
 /**
- * GESTÃO ANTI-DUPLICIDADE DE ARQUIVOS (PropertiesService)
+ * GESTÃO ANTI-DUPLICIDADE DE ARQUIVOS
  */
 function verificarArquivoJaProcessado(chaveTipo, arquivo) {
   if (!arquivo) return false;
@@ -744,9 +764,9 @@ function processarAdsAmazon() {
 
 /**
  * 8. Processa Relatório de Ads do Mercado Livre (.XLSX) - Multi-Arquivos
- * - Varre a aba correta ignorando variações de acentuação/caixa
- * - Filtra estritamente campanhas com Status 'Ativa'
- * - Rateia a coluna 'Investimento' entre 'Desde' e 'Até'
+ * - Varre a aba 'Relatório de campanha' (índice 2)
+ * - Identifica o cabeçalho na linha 2 com 'status', 'desde', 'até' e 'investimento'
+ * - Filtra campanhas Ativas e faz o rateio
  */
 function processarAdsMercadoLivre() {
   const pasta = DriveApp.getFolderById(CONFIG_SEM.FOLDER_ADS_ID_ML);
@@ -759,15 +779,15 @@ function processarAdsMercadoLivre() {
   arquivos.forEach(arq => {
     ARQUIVOS_LIDOS_RODADA[`ADS_ML_${arq.getId()}`] = arq;
     
-    // Abre especificamente a aba de campanhas com busca robusta
+    // Força a leitura da 3ª aba ('Relatório de campanha')
     const matriz = lerDadosArquivo(arq, 'Relatório de campanha');
     if (!matriz || matriz.length <= 1) return;
 
-    // Localiza dinamicamente a linha do cabeçalho
+    // Localiza a linha do cabeçalho
     let idxCab = -1;
     for (let r = 0; r < Math.min(matriz.length, 10); r++) {
       const linhaStr = matriz[r].map(c => String(c).trim().toLowerCase()).join(' ');
-      if (linhaStr.includes('status') && (linhaStr.includes('desde') || linhaStr.includes('investimento') || linhaStr.includes('nome'))) {
+      if (linhaStr.includes('status') && (linhaStr.includes('desde') || linhaStr.includes('investimento'))) {
         idxCab = r;
         break;
       }
@@ -775,9 +795,10 @@ function processarAdsMercadoLivre() {
     if (idxCab === -1) idxCab = 1;
 
     const cab = matriz[idxCab].map(c => String(c).trim().toLowerCase());
-    const idxStatus = cab.findIndex(c => c === 'status' || c.includes('status'));
-    const idxDesde = cab.findIndex(c => c === 'desde' || c.includes('desde'));
-    const idxAte = cab.findIndex(c => c === 'até' || c === 'ate' || c.includes('at'));
+    const idxStatus = cab.findIndex(c => c === 'status');
+    const idxDesde = cab.findIndex(c => c === 'desde');
+    // Busca estrita para 'até' ou 'ate' (evitando que 'status' coincida com 'at')
+    const idxAte = cab.findIndex(c => c === 'até' || c === 'ate' || c.startsWith('at') && c !== 'status');
     const idxInvest = cab.findIndex(c => c.includes('investimento') && !c.includes('acos') && !c.includes('roas'));
 
     for (let i = idxCab + 1; i < matriz.length; i++) {
@@ -785,7 +806,7 @@ function processarAdsMercadoLivre() {
       if (!linha || linha.length === 0) continue;
 
       const status = idxStatus !== -1 ? String(linha[idxStatus]).trim().toLowerCase() : '';
-      if (!status.includes('ativ')) continue; // Filtro estrito para campanhas ativas
+      if (!status.includes('ativ')) continue;
 
       const invest = idxInvest !== -1 ? limparNumero(linha[idxInvest]) : 0;
       if (invest <= 0) continue;
@@ -834,7 +855,7 @@ function localizarIndiceCabecalho(matriz, termosChave) {
 
 /**
  * Converte e lê arquivos .xlsx, .csv e .txt
- * Identificação dinâmica do delimitador e seleção blindada de aba no Excel
+ * Identificação dinâmica de aba no Excel com seleção direta da 3ª aba para relatórios de campanha
  */
 function lerDadosArquivo(arquivo, nomeAba) {
   if (!arquivo) return null;
@@ -869,15 +890,14 @@ function lerDadosArquivo(arquivo, nomeAba) {
       let abaAlvo = null;
 
       if (nomeAba) {
-        // Busca normalizada sem acentos e minúscula
         const nomeNorm = nomeAba.toLowerCase().normalize("NFD").replace(/[\u0300-\u036f]/g, "").trim();
         abaAlvo = todasAbas.find(s => {
           const sNorm = s.getName().toLowerCase().normalize("NFD").replace(/[\u0300-\u036f]/g, "").trim();
-          return sNorm === nomeNorm || sNorm.includes(nomeNorm) || sNorm.includes("campanha") || sNorm.includes("relat");
+          return sNorm.includes("campanha") || sNorm.includes("relat") || sNorm === nomeNorm;
         });
       }
       
-      // Fallback: se houver 3 abas (padrão ML Ads), seleciona a 3ª aba (índice 2)
+      // Fallback para ML Ads: se houver 3 abas, seleciona a 3ª aba ('Relatório de campanha')
       if (!abaAlvo && todasAbas.length >= 3) {
         abaAlvo = todasAbas[2];
       }
@@ -896,7 +916,7 @@ function lerDadosArquivo(arquivo, nomeAba) {
     }
   }
 
-  // 3. Arquivos de texto (CSV, TXT, TSV) - Prioriza UTF-8 nativo
+  // Arquivos de texto (CSV, TXT, TSV)
   let texto = '';
   try {
     texto = arquivo.getBlob().getDataAsString('UTF-8');
@@ -937,9 +957,6 @@ function lerDadosArquivo(arquivo, nomeAba) {
   });
 }
 
-/**
- * Retorna todos os arquivos válidos da pasta e subpastas para leitura multi-semanas
- */
 function obterTodosArquivosRecursivo(pasta) {
   const lista = [];
   function vasculhar(f) {
