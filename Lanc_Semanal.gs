@@ -16,10 +16,11 @@ const CONFIG_SEM = {
 
   FOLDER_ML_VENDAS_ID: '1eek1wEcGgqV6wYO_E2QVVJfaZM_mySoY',
   FOLDER_AMAZON_VENDAS_ID: '1ll5m739SgxbbGsYv9KOdHm8PM0kbcqSv',
-  FOLDER_ML_TRAFEGO_ID: '1Uy0FgfivecVrNaxwhRw-dcwajhQuAEcg',
+  FOLDER_ML_TRAFEGO_ID: '11LTjgAE9qrd_UgmpzBLWJy_kUHodQFAm',
   FOLDER_AMAZON_TRAFEGO_ID: '1E-JeQIwWEcjmGLqUQpuncCsNH34BqdVS',
   FOLDER_AMAZON_CUSTOS_ID: '1ZLZeoCqCKP1vfKMl3v_p0BBalbiFzV8H',
-  FOLDER_ADS_ID: '1xBS1AMFHwVenIYpHKtUad9-uP3e232hY'
+  FOLDER_ADS_ID_AMZ: '1xBS1AMFHwVenIYpHKtUad9-uP3e232hY',
+  FOLDER_ADS_ID_ML: '1sp0YrEJe6qh9Z6gqfayEZuu12uD2YgAq'
 };
 
 /**
@@ -44,7 +45,8 @@ let ultimoEstoqueConhecido = 0;
   const mapaML = processarVendasMercadoLivre();
   const mapaAmazon = processarVendasAmazon();
   const mapaCustosAmazon = processarCustosAmazon();
-  const mapaAds = processarAds();
+  const mapaAdsAmazon = processarAdsAmazon();
+  const mapaAdsML = processarAdsMercadoLivre();
   const mapaTrafegoML = processarTrafegoMercadoLivre();
   const mapaTrafegoAmazon = processarTrafegoAmazon();
 
@@ -139,10 +141,13 @@ let ultimoEstoqueConhecido = 0;
       if (mapaCustosAmazon[diaIso]) {
         custosAmazon += mapaCustosAmazon[diaIso];
       }
-      if (mapaAds[diaIso]) {
-        adsAmazon += mapaAds[diaIso];      // Soma no canal Amazon
-        totalAdsSemana += mapaAds[diaIso]; // Soma no consolidado de Ads
+      if (mapaAdsAmazon[diaIso]) {
+        adsAmazon += mapaAdsAmazon[diaIso];
       }
+      if (mapaAdsML[diaIso]) {
+        adsML += mapaAdsML[diaIso];
+      }
+      totalAdsSemana += (mapaAdsAmazon[diaIso] || 0) + (mapaAdsML[diaIso] || 0);
       if (mapaTrafegoML[diaIso]) {
         totalVisitasML += mapaTrafegoML[diaIso];
       }
@@ -310,7 +315,7 @@ function executarRotinaSemanal() {
   const mapaML = processarVendasMercadoLivre();
   const mapaAmazon = processarVendasAmazon();
   const mapaCustosAmazon = processarCustosAmazon();
-  const mapaAds = processarAds();
+  const mapaAds = processarAdsAmazon();
   const mapaTrafegoML = processarTrafegoMercadoLivre();
   const mapaTrafegoAmazon = processarTrafegoAmazon();
 
@@ -937,17 +942,17 @@ function processarCustosAmazon() {
 }
 
 /**
- * 7. Processa Relatório de Investimento em Ads (.CSV)
+ * 7. Processa Relatório de Investimento em Ads da Amazon (.CSV)
  * Faz o rateio do 'Custo total' pelos dias do 'Intervalo de datas'
  */
-function processarAds() {
-  const pasta = DriveApp.getFolderById(CONFIG_SEM.FOLDER_ADS_ID);
+function processarAdsAmazon() {
+  const pasta = DriveApp.getFolderById(CONFIG_SEM.FOLDER_ADS_ID_AMZ);
   const arq = obterArquivoMaisRecenteRecursivo(pasta);
   if (!arq) {
-    Logger.log("⚠️ Nenhum arquivo de Ads encontrado na pasta.");
+    Logger.log("⚠️ Nenhum arquivo de Ads Amazon encontrado na pasta.");
     return {};
   }
-  ARQUIVOS_LIDOS_RODADA['ADS'] = arq;
+  ARQUIVOS_LIDOS_RODADA['ADS_AMZ'] = arq;
 
   const matriz = lerDadosArquivo(arq);
   if (!matriz || matriz.length <= 1) return {};
@@ -1023,6 +1028,79 @@ function processarAds() {
   return mapaAdsDiario;
 }
 
+/**
+ * 8. Processa Relatório de Investimento em Ads do Mercado Livre (.XLSX)
+ * - Lê a 3ª aba: "Relatório de campanha"
+ * - Cabeçalho na Linha 2, dados a partir da Linha 3
+ * - Filtra apenas campanhas com Status 'Ativa'
+ * - Rateia a coluna 'Investimento' entre as datas 'Desde' e 'Até'
+ */
+function processarAdsMercadoLivre() {
+  const pasta = DriveApp.getFolderById(CONFIG_SEM.FOLDER_ADS_ID_ML);
+  const arq = obterArquivoMaisRecenteRecursivo(pasta);
+  if (!arq) {
+    Logger.log("⚠️ Nenhum arquivo de Ads Mercado Livre encontrado na pasta.");
+    return {};
+  }
+  ARQUIVOS_LIDOS_RODADA['ADS_ML'] = arq;
+
+  // Lê especificamente a 3ª aba ("Relatório de campanha")
+  const matriz = lerDadosArquivo(arq, 'Relatório de campanha');
+  if (!matriz || matriz.length <= 2) return {};
+
+  // O cabeçalho está na Linha 2 (índice 1)
+  let idxCab = 1;
+  const cabecalho = matriz[idxCab].map(c => String(c).trim().toLowerCase());
+
+  const idxStatus = cabecalho.findIndex(c => c === 'status');
+  const idxDesde = cabecalho.findIndex(c => c === 'desde');
+  const idxAte = cabecalho.findIndex(c => c === 'até' || c === 'ate');
+  const idxInvest = cabecalho.findIndex(c => c.includes('investimento') && !c.includes('acos') && !c.includes('roas'));
+
+  const mapaAdsDiario = {};
+  let totalInvestAtivo = 0;
+
+  // Dados começam na Linha 3 (índice 2)
+  for (let i = idxCab + 1; i < matriz.length; i++) {
+    const linha = matriz[i];
+    if (!linha || linha.length === 0) continue;
+
+    const status = idxStatus !== -1 ? String(linha[idxStatus]).trim().toLowerCase() : '';
+    
+    // Filtro restrito: apenas campanhas ATIVAS
+    if (status !== 'ativa') continue;
+
+    const invest = idxInvest !== -1 ? limparNumero(linha[idxInvest]) : 0;
+    if (invest <= 0) continue;
+
+    const rawDesde = idxDesde !== -1 ? normalizarDataChave(linha[idxDesde]) : null;
+    const rawAte = idxAte !== -1 ? normalizarDataChave(linha[idxAte]) : null;
+
+    if (!rawDesde) continue;
+    const dataFimStr = rawAte || rawDesde;
+
+    const dInicio = parseDataIso(rawDesde);
+    const dTermino = parseDataIso(dataFimStr);
+
+    const diffTime = Math.abs(dTermino.getTime() - dInicio.getTime());
+    const qtdDias = Math.round(diffTime / (1000 * 60 * 60 * 24)) + 1;
+    const custoRateadoDiario = invest / (qtdDias > 0 ? qtdDias : 1);
+
+    // Distribui o investimento pelos dias da semana
+    let dCurr = new Date(dInicio.getTime());
+    for (let d = 0; d < qtdDias; d++) {
+      const dataIso = Utilities.formatDate(dCurr, "GMT-0300", 'yyyy-MM-dd');
+      mapaAdsDiario[dataIso] = (mapaAdsDiario[dataIso] || 0) + custoRateadoDiario;
+      dCurr.setDate(dCurr.getDate() + 1);
+    }
+
+    totalInvestAtivo += invest;
+  }
+
+  Logger.log(`Investimento Ads ML (Campanhas Ativas): R$ ${totalInvestAtivo.toFixed(2)}`);
+  return mapaAdsDiario;
+}
+
 // =========================================================================
 // UTILITÁRIOS E PARSERS
 // =========================================================================
@@ -1066,7 +1144,14 @@ function lerDadosArquivo(arquivo) {
       tempFileId = fileInserido.id;
 
       const ssConvertida = SpreadsheetApp.openById(tempFileId);
-      return ssConvertida.getSheets()[0].getDataRange().getValues();
+      let sheet = null;
+      if (typeof nomeOuIndiceAba === 'string') {
+        sheet = ssConvertida.getSheetByName(nomeOuIndiceAba) || ssConvertida.getSheets().find(s => s.getName().toLowerCase().includes(nomeOuIndiceAba.toLowerCase()));
+      } else if (typeof nomeOuIndiceAba === 'number') {
+        sheet = ssConvertida.getSheets()[nomeOuIndiceAba];
+      }
+      if (!sheet) sheet = ssConvertida.getSheets()[0];
+      return sheet.getDataRange().getValues();
     } catch (e) {
       Logger.log("Erro na conversão automática do XLSX: " + e.message);
     } finally {
