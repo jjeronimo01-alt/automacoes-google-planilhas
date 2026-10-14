@@ -9,8 +9,11 @@ function onOpen() {
   
   ui.createMenu('🚀 Cockpits & Rotinas')
     .addItem('📅 Atualizar Cockpit Diário', 'executarRotinaOficial')
-    .addItem('📊 Atualizar Cockpit Semanal', 'executarRotinaSemanal')
+    .addItem('📊 Atualizar Cockpit Semanal (14d Recente)', 'executarRotinaSemanal')
+    .addItem('🔄 Reprocessar Todo o Histórico Semanal', 'reprocessarTodoHistoricoSemanal')
+    .addSeparator()
     .addItem('📈 Atualizar Cockpit Mensal', 'executarRotinaMensal')
+    .addItem('🔄 Reprocessar Todo o Histórico Mensal', 'reprocessarTodoHistoricoMensal')
     .addToUi();
 
   ui.createMenu('⚡ Central 5W2H')

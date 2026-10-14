@@ -19,19 +19,29 @@ const CONFIG_MENSAL = {
   FOLDER_CONTAS_RECEBER_ID: '1xvN-nrVrjBSogvVzqHg87AVNHrVLLG9u',
   FOLDER_CATEGORIAS_ID: '1flEEX7RJQqgxbaQ5BMLLInuEWQMxZr01',
   FOLDER_NOTAS_ENTRADA_ID: '103Kmu7cK9mEPQlLj6LR45iYzw8oNiZ_B',
-  FOLDER_ADS_ID: '1xBS1AMFHwVenIYpHKtUad9-uP3e232hY', 
+  FOLDER_ADS_ID_AMZ: '1xBS1AMFHwVenIYpHKtUad9-uP3e232hY', 
+  FOLDER_ADS_ID_ML: '1sp0YrEJe6qh9Z6gqfayEZuu12uD2YgAq',
   FOLDER_FINANCEIRO_AMAZON_ID: '1ZLZeoCqCKP1vfKMl3v_p0BBalbiFzV8H',
   FOLDER_ML_VENDAS_ID: '1eek1wEcGgqV6wYO_E2QVVJfaZM_mySoY',
   FOLDER_FLUXO_CAIXA_90D_ID: '1Vz2OWF_KnOyyFg7Cx-BlCgkkO0yPGH9V'
 };
 
 /**
- * ROTINA OFICIAL DE PROCESSAMENTO MENSAL (UPSERT CONTÍNUO & AUDITORIA PARCIAL)
- * Permite auditar parciais em qualquer dia do mês, atualizando a linha existente
- * sem exigir exclusão manual de dados.
+ * Rotina normal de processamento mensal (Upsert)
  */
 function executarRotinaMensal() {
-  Logger.log("=== INICIANDO ROTINA DE LANÇAMENTO MENSAL (COM AUDITORIA PARCIAL) ===");
+  executarMotorLancamentoMensal(false);
+}
+
+/**
+ * Reprocessa todo o histórico mensal desde o início
+ */
+function reprocessarTodoHistoricoMensal() {
+  executarMotorLancamentoMensal(true);
+}
+
+function executarMotorLancamentoMensal(reprocessarTudo) {
+  Logger.log(`=== INICIANDO ROTINA DE LANÇAMENTO MENSAL (${reprocessarTudo ? 'HISTÓRICO COMPLETO' : 'UPSERT REGULAR'}) ===`);
 
   const ss = SpreadsheetApp.openById(CONFIG_MENSAL.SPREADSHEET_ID);
   const sheetMensal = ss.getSheetByName(CONFIG_MENSAL.SHEET_MENSAL);
@@ -40,11 +50,9 @@ function executarRotinaMensal() {
   if (!sheetMensal) throw new Error(`Aba "${CONFIG_MENSAL.SHEET_MENSAL}" não encontrada.`);
   if (!sheetDiario) throw new Error(`Aba "${CONFIG_MENSAL.SHEET_DIARIO}" não encontrada.`);
 
-  // 1. Diagnóstico de Linhas Existentes (Mapeia a linha física de cada mês)
   let { mapaMesesExistentes, proximaLinhaLivre } = mapearMesesExistentes(sheetMensal);
   Logger.log(`Meses já registrados na planilha: ${Object.keys(mapaMesesExistentes).join(', ') || 'Nenhum'}`);
 
-  // 2. Determinação do Período (De 2026-09 até o mês civil atual)
   const hoje = new Date();
   const mesAtualIso = Utilities.formatDate(hoje, "GMT-0300", 'yyyy-MM');
 
@@ -59,72 +67,48 @@ function executarRotinaMensal() {
     dLoop.setMonth(dLoop.getMonth() + 1);
   }
 
-  Logger.log(`Meses elegíveis para consolidação/revisão: ${mesesParaProcessar.join(' | ')}`);
+  Logger.log(`Meses elegíveis: ${mesesParaProcessar.join(' | ')}`);
 
-  // 3. Extração dos Dados do Diário (Faturamento, Margem Contribuição, CMV, Custos Variáveis)
   const resumoDiario = consolidarMetricasDiario(sheetDiario);
 
-  // 4. Processamento dos Meses em Lote
   mesesParaProcessar.forEach(mesIso => {
     const isMesCorrente = (mesIso === mesAtualIso);
-    Logger.log(`---> Processando Mês: ${mesIso} ${isMesCorrente ? '[MÊS CORRENTE - PARCIAL/PRÉVIA]' : '[FECHAMENTO]'} <---`);
+    Logger.log(`---> Processando Mês: ${mesIso} ${isMesCorrente ? '[MÊS CORRENTE]' : '[FECHAMENTO]'} <---`);
 
     const rotuloMes = formatarMesRotulo(mesIso);
     const diasNoMes = new Date(Number(mesIso.split('-')[0]), Number(mesIso.split('-')[1]), 0).getDate();
 
-    // A. Métricas consolidadas do Diário até o momento
     const dadosDia = resumoDiario[mesIso] || { faturamento: 0, margemContrib: 0, cmv: 0, custosVariaveis: 0 };
-
-    // B. Compras de NF-e Faturadas no Mês
     const { totalCompras: totalComprasNfe, setNfs: setNfValidasMes } = processarComprasNfeEntrada(mesIso);
-
-    // C. DRE e Classificação de Contas a Pagar
     const mapaCategorias = processarCategoriasERP(mesIso);
     const { despFixas, custOperacionais, custPessoal, custFinanceiros, impostos, duplicatasCompras } = processarContasPagar(mesIso, mapaCategorias, setNfValidasMes);
 
-    // D. PMP Ponderado da Safra de Compras
     let somaPonderadaPrazo = 0;
     duplicatasCompras.forEach(dup => {
       somaPonderadaPrazo += (dup.valor * dup.diasPrazo);
     });
     const pmpDias = totalComprasNfe > 0 ? Math.round(somaPonderadaPrazo / totalComprasNfe) : 0;
 
-    // E. Despesas Variáveis: Custos Variáveis Diários + Ads Mensais (Amazon + ML)
+    // Despesas Variáveis: Diário + Ads Consolidado (Amazon + Mercado Livre)
     const adsTotalMes = processarAdsMensal(mesIso);
     const totalDespesasVariaveis = dadosDia.custosVariaveis + adsTotalMes;
 
-    // F. Contas a Receber (Regime de Caixa Líquido)
     const valorVendasLiquidoRecebido = processarContasReceber(mesIso);
-
-    // G. PME (Prazo Médio de Estoque Multi-Depósito)
     const estoqueMedio = calcularEstoqueMedioMensal(mesIso);
     const pmeDias = dadosDia.cmv > 0 ? Math.round((estoqueMedio / dadosDia.cmv) * diasNoMes) : 0;
-
-    // H. PMR Ponderado Geral
     const pmrDias = calcularPmrGeral(mesIso);
-
-    // I. Projeção de Caixa 90 Dias
     const saldoCaixa90d = processarFluxoCaixa90d(mesIso);
-
-    // J. RBT12 Acumulado
     const rbt12 = calcularRbt12(resumoDiario, mesIso);
-
-    // K. Alíquota Efetiva do Simples Nacional
     const aliquotaSimples = calcularAliquotaEfetivaSimples(rbt12);
 
-    // L. Apuração Fiscal (Competência)
     let impostosCompetencia = 0;
     const isRegimeMei = (rbt12 <= 81000);
     if (isRegimeMei) {
-      impostosCompetencia = 82.05; // DAS MEI Fixo
+      impostosCompetencia = 82.05;
     } else {
       impostosCompetencia = dadosDia.faturamento * aliquotaSimples;
     }
 
-    // =========================================================================
-    // UPSERT INTELIGENTE: Se o mês já existe, atualiza na mesma linha.
-    // Se for um novo mês, insere na próxima linha livre sem apagar nada!
-    // =========================================================================
     let linhaDestino = mapaMesesExistentes[mesIso];
     let isAtualizacao = true;
 
@@ -135,7 +119,7 @@ function executarRotinaMensal() {
       isAtualizacao = false;
     }
 
-    Logger.log(`${isAtualizacao ? '♻️ Atualizando dados existentes' : '➕ Inserindo novo registro'} do mês ${mesIso} na Linha ${linhaDestino}...`);
+    Logger.log(`${isAtualizacao ? '♻️ Atualizando' : '➕ Inserindo'} mês ${mesIso} na Linha ${linhaDestino}...`);
 
     // Bloco 1: Colunas A até J (1 a 10)
     sheetMensal.getRange(linhaDestino, 1, 1, 10).setValues([[
@@ -151,17 +135,11 @@ function executarRotinaMensal() {
       impostosCompetencia
     ]]);
 
-    // Pula Coluna K (11): Lucro Líquido (Fórmula)
-
     // Bloco 2: Coluna L (12) -> Valor Vendas Líquido Recebido
     sheetMensal.getRange(linhaDestino, 12, 1, 1).setValue(valorVendasLiquidoRecebido);
 
-    // Pula Coluna M (13): Ponto de Equilíbrio (Fórmula)
-
     // Bloco 3: Colunas N até P (14 a 16) -> [PME, PMR, PMP]
     sheetMensal.getRange(linhaDestino, 14, 1, 3).setValues([[pmeDias, pmrDias, pmpDias]]);
-
-    // Pula Colunas Q (17) e R (18): Fórmulas CCC e Dia Break-Even
 
     // Bloco 4: Colunas S até U (19 a 21) -> [Caixa 90D, RBT12, Alíquota Simples]
     sheetMensal.getRange(linhaDestino, 19, 1, 3).setValues([[
@@ -170,7 +148,6 @@ function executarRotinaMensal() {
       aliquotaSimples
     ]]);
 
-    // Padronização e Máscaras Numéricas
     sheetMensal.getRange(linhaDestino, 1, 1, 22).setVerticalAlignment('middle');
     sheetMensal.getRange(linhaDestino, 1, 1, 1).setHorizontalAlignment('center');
     sheetMensal.getRange(linhaDestino, 2, 1, 12).setHorizontalAlignment('right').setNumberFormat('R$ #,##0.00');
@@ -184,89 +161,10 @@ function executarRotinaMensal() {
   SpreadsheetApp.getActiveSpreadsheet()?.toast("Cockpit Mensal atualizado com sucesso!", "Concluído");
 }
 
-/**
- * Aplica alinhamentos, cabeçalhos executivos e formatos numéricos nativos
- * mantendo a integridade dos tipos de dados para extrações futuras.
- */
-function estilizarAbaLancMensal(sheet) {
-  // 1. SUPER-CABEÇALHO (Linha 2) - Divisão por Áreas de Gestão
-  sheet.getRange("A2:K2").merge().setValue("DRE GERENCIAL & RESULTADO LÍQUIDO")
-       .setBackground("#1A365D").setFontColor("#FFFFFF").setFontWeight("bold")
-       .setHorizontalAlignment("center").setVerticalAlignment("middle");
-  
-  sheet.getRange("L2:M2").merge().setValue("EQUILÍBRIO & CAIXA")
-       .setBackground("#4A154B").setFontColor("#FFFFFF").setFontWeight("bold")
-       .setHorizontalAlignment("center").setVerticalAlignment("middle");
-
-  sheet.getRange("N2:R2").merge().setValue("CICLO DE CAIXA & TESOURARIA")
-       .setBackground("#7C2D12").setFontColor("#FFFFFF").setFontWeight("bold")
-       .setHorizontalAlignment("center").setVerticalAlignment("middle");
-
-  sheet.getRange("S2:U2").merge().setValue("PROJEÇÃO DE CAIXA & TRIBUTOS")
-       .setBackground("#064E3B").setFontColor("#FFFFFF").setFontWeight("bold")
-       .setHorizontalAlignment("center").setVerticalAlignment("middle");
-
-  // 2. CABEÇALHOS DAS COLUNAS (Linha 3)
-  const cabecalhos = [
-    "Mês/Ano", "Faturamento", "Margem Contrib.", "CMV", "Desp. Fixas", 
-    "Desp. Variáveis", "Custos Operac.", "Pessoal", "Financeiro", "Impostos (DAS)", "Lucro Líquido",
-    "Rec. Caixa", "Break-Even (R$)",
-    "PME (Dias)", "PMR (Dias)", "PMP (Dias)", "CCC (Dias)", "Dia Equilíbrio",
-    "Caixa 90D", "RBT12 Acum.", "Alíquota Simples"
-  ];
-  sheet.getRange(3, 1, 1, 21).setValues([cabecalhos])
-       .setFontWeight("bold")
-       .setHorizontalAlignment("center")
-       .setVerticalAlignment("middle")
-       .setWrap(true);
-
-  // Cores de fundo suaves para identificação dos blocos na Linha 3
-  sheet.getRange("A3:K3").setBackground("#EBF8FF").setFontColor("#1A365D");
-  sheet.getRange("L3:M3").setBackground("#FAF5FF").setFontColor("#4A154B");
-  sheet.getRange("N3:R3").setBackground("#FFF7ED").setFontColor("#7C2D12");
-  sheet.getRange("S3:U3").setBackground("#ECFDF5").setFontColor("#064E3B");
-
-  // 3. POSICIONAMENTO E ALINHAMENTO NA ÁREA DE DADOS (Linhas 4 a 15)
-  // Alinhamento vertical centralizado em toda a grade
-  sheet.getRange("A4:U15").setVerticalAlignment("middle");
-
-  // Rótulo do Mês e Status do Dia de Equilíbrio centralizados
-  sheet.getRange("A4:A15").setHorizontalAlignment("center");
-  sheet.getRange("R4:R15").setHorizontalAlignment("center");
-
-  // Valores Financeiros alinhados à direita (Padrão contábil com formato nativo)
-  sheet.getRange("B4:M15").setNumberFormat('R$ #,##0.00').setHorizontalAlignment("right");
-  sheet.getRange("S4:T15").setNumberFormat('R$ #,##0.00').setHorizontalAlignment("right");
-
-  // Prazos em Dias: Número inteiro puro (0), centralizado para fácil leitura
-  sheet.getRange("N4:Q15").setNumberFormat('0').setHorizontalAlignment("center");
-
-  // Alíquota Percentual nativa, centralizada
-  sheet.getRange("U4:U15").setNumberFormat('0.00%').setHorizontalAlignment("center");
-
-  // 4. DESTAQUES DE ESTRUTURA
-  // Negrito nos indicadores de desfecho (Lucro Líquido e Projeção de Caixa)
-  sheet.getRange("K4:K15").setFontWeight("bold");
-  sheet.getRange("S4:S15").setFontWeight("bold");
-
-  // 5. DIMENSÕES E BORDAS
-  sheet.getRange("A2:U15").setBorder(true, true, true, true, true, true, "#CBD5E1", SpreadsheetApp.BorderStyle.SOLID);
-  sheet.setRowHeights(2, 2, 26);
-}
-
-// =========================================================================
-// FUNÇÕES DE AGREGAÇÃO E PROCESSAMENTO
-// =========================================================================
-
-/**
- * Consolida dados da aba Lanc_Diario agrupados por 'YYYY-MM'
- */
 function consolidarMetricasDiario(sheetDiario) {
   const maxRows = sheetDiario.getLastRow();
   if (maxRows < 4) return {};
 
-  // Colunas do Diário:
-  // Col A (1): Data | Col C (3): Faturamento | Col G (7): CMV | Col H (8): Custos Variáveis | Col I (9): Margem Contrib.
   const dados = sheetDiario.getRange(4, 1, maxRows - 3, 9).getValues();
   const resumo = {};
 
@@ -280,25 +178,22 @@ function consolidarMetricasDiario(sheetDiario) {
       resumo[anoMes] = { faturamento: 0, margemContrib: 0, cmv: 0, custosVariaveis: 0 };
     }
 
-    resumo[anoMes].faturamento += limparNumero(linha[2]);       // Coluna C
-    resumo[anoMes].cmv += limparNumero(linha[6]);               // Coluna G
-    resumo[anoMes].custosVariaveis += limparNumero(linha[7]);   // Coluna H
-    resumo[anoMes].margemContrib += limparNumero(linha[8]);     // Coluna I
+    resumo[anoMes].faturamento += limparNumero(linha[2]);
+    resumo[anoMes].cmv += limparNumero(linha[6]);
+    resumo[anoMes].custosVariaveis += limparNumero(linha[7]);
+    resumo[anoMes].margemContrib += limparNumero(linha[8]);
   });
 
   return resumo;
 }
 
-/**
- * Lê o Relatório de Categorias e Mapeia: ID / Descrição -> Grupo
- */
 function processarCategoriasERP(mesIso) {
   const pasta = obterSubpastaDoMes(CONFIG_MENSAL.FOLDER_CATEGORIAS_ID, mesIso);
   const arq = obterArquivoMaisRecenteOuConsolidado(pasta);
   const mapa = {};
   if (!arq) return mapa;
 
-  const matriz = lerDadosArquivo(arq);
+  const matriz = lerDadosArquivoMensal(arq);
   if (!matriz || matriz.length <= 1) return mapa;
 
   const idxCab = localizarIndiceCabecalho(matriz, ['descrição', 'descricao', 'grupo']);
@@ -318,12 +213,6 @@ function processarCategoriasERP(mesIso) {
   return mapa;
 }
 
-/**
- * Processa Contas a Pagar:
- * - Despesas (Fixas, Operacionais, Pessoal, Fin, Impostos): Apenas com vencimento no mês corrente
- * - Duplicatas de Fornecedores: Captura títulos (atuais e futuros) para cruzar com as NF-es do mês via número de documento
- */
-
 function processarContasPagar(mesIso, mapaCategorias, setNfValidasMes) {
   const pasta = obterSubpastaDoMes(CONFIG_MENSAL.FOLDER_CONTAS_PAGAR_ID, mesIso);
   const arq = obterArquivoMaisRecenteOuConsolidado(pasta);
@@ -333,7 +222,7 @@ function processarContasPagar(mesIso, mapaCategorias, setNfValidasMes) {
 
   if (!arq) return { despFixas, custOperacionais, custPessoal, custFinanceiros, impostos, duplicatasCompras };
 
-  const matriz = lerDadosArquivo(arq);
+  const matriz = lerDadosArquivoMensal(arq);
   if (!matriz || matriz.length <= 1) return { despFixas, custOperacionais, custPessoal, custFinanceiros, impostos, duplicatasCompras };
 
   const idxCab = localizarIndiceCabecalho(matriz, ['categoria', 'vencimento', 'valor', 'pago', 'documento']);
@@ -347,7 +236,6 @@ function processarContasPagar(mesIso, mapaCategorias, setNfValidasMes) {
   const idxPago = cabecalho.findIndex(c => c === 'pago' || c.includes('valor pago'));
   const idxValor = cabecalho.findIndex(c => c.includes('valor') || c.includes('saldo'));
 
-  // NFs da safra para cálculo do PMP
   const nfsBusca = [];
   if (setNfValidasMes && setNfValidasMes.size > 0) {
     setNfValidasMes.forEach(n => {
@@ -374,7 +262,6 @@ function processarContasPagar(mesIso, mapaCategorias, setNfValidasMes) {
     const textoCompletoLinha = `${catOriginal} ${docStr} ${histStr}`.toLowerCase();
     const grupo = (mapaCategorias[catOriginal] || '').toLowerCase();
 
-    // 1. DUPLICATAS DE COMPRAS DA SAFRA (PMP)
     let vinculadaANfDoMes = false;
     if (nfsBusca.length > 0) {
       for (const numNf of nfsBusca) {
@@ -395,7 +282,6 @@ function processarContasPagar(mesIso, mapaCategorias, setNfValidasMes) {
       continue;
     }
 
-    // Se for compra de mercadoria em geral, descarta do DRE
     const isCompraMercadoria = catOriginal.includes('compra de mercadoria') || 
                                catOriginal.includes('fornecedor') || 
                                grupo.includes('custo de mercadoria') || 
@@ -404,25 +290,18 @@ function processarContasPagar(mesIso, mapaCategorias, setNfValidasMes) {
                                textoCompletoLinha.includes('novapelli');
     if (isCompraMercadoria) continue;
 
-    // 2. DEMAIS GASTOS: Apenas pagos/vencidos dentro do mês de referência
     if (!dVencStr || !dVencStr.startsWith(mesIso)) continue;
 
     const valorDespesa = valorPago > 0 ? valorPago : valorNominal;
 
-    // A) TRAVA ANTI-DUPLICIDADE: Descarta comissões/fretes debitados no cartão/boleto,
-    // pois eles já foram integralmente apurados via Lanc_Diario
     const isComissaoOuFreteMarketplace = textoCompletoLinha.includes('comiss') ||
                                          textoCompletoLinha.includes('comissão') ||
                                          (textoCompletoLinha.includes('amazon') && !textoCompletoLinha.includes('seller mensalidade')) ||
                                          textoCompletoLinha.includes('fatura mercado livre') ||
                                          (catOriginal.includes('frete') && !textoCompletoLinha.includes('coleta'));
 
-    if (isComissaoOuFreteMarketplace) {
-      Logger.log(`  -> TRAVA ATIVA: Ignorando [${docStr || histStr || catOriginal} - R$ ${valorDespesa.toFixed(2)}] no Contas a Pagar para evitar duplicidade com o Lanc_Diario.`);
-      continue;
-    }
+    if (isComissaoOuFreteMarketplace) continue;
 
-    // B) Impostos (DAS MEI ou Guias Fiscais pagas em caixa)
     const isImposto = textoCompletoLinha.includes('das') ||
                       textoCompletoLinha.includes('imposto') ||
                       textoCompletoLinha.includes('tribut') ||
@@ -430,7 +309,6 @@ function processarContasPagar(mesIso, mapaCategorias, setNfValidasMes) {
                       grupo.includes('imposto') ||
                       Math.abs(valorDespesa - 82.05) < 0.01;
 
-    // C) Pessoal (Pró-labore, Salários, Benefícios)
     const isPessoal = textoCompletoLinha.includes('pró-labore') ||
                       textoCompletoLinha.includes('pro-labore') ||
                       textoCompletoLinha.includes('salário') ||
@@ -439,7 +317,6 @@ function processarContasPagar(mesIso, mapaCategorias, setNfValidasMes) {
                       textoCompletoLinha.includes('beneficio') ||
                       grupo.includes('pessoal');
 
-    // D) Custos Financeiros (Taxas Bancárias, Tarifas de Conta, Juros)
     const isFinanceiro = textoCompletoLinha.includes('taxa bancária') ||
                          textoCompletoLinha.includes('taxa bancaria') ||
                          textoCompletoLinha.includes('tarifa') ||
@@ -447,7 +324,6 @@ function processarContasPagar(mesIso, mapaCategorias, setNfValidasMes) {
                          textoCompletoLinha.includes('banco') ||
                          grupo.includes('financeir');
 
-    // E) Despesas Fixas Estruturais
     const isFixa = textoCompletoLinha.includes('aluguel') ||
                    textoCompletoLinha.includes('água') ||
                    textoCompletoLinha.includes('agua') ||
@@ -457,39 +333,28 @@ function processarContasPagar(mesIso, mapaCategorias, setNfValidasMes) {
                    textoCompletoLinha.includes('contabilidade') ||
                    grupo.includes('fixa');
 
-    // Classificação sem duplicidade
     if (isImposto) {
       impostos += valorDespesa;
-      Logger.log(`  -> IMPOSTO (Caixa): [${docStr || histStr || catOriginal}] = R$ ${valorDespesa.toFixed(2)}`);
     } else if (isPessoal) {
       custPessoal += valorDespesa;
-      Logger.log(`  -> PESSOAL: [${docStr || histStr || catOriginal}] = R$ ${valorDespesa.toFixed(2)}`);
     } else if (isFinanceiro) {
       custFinanceiros += valorDespesa;
-      Logger.log(`  -> FINANCEIRO: [${docStr || histStr || catOriginal}] = R$ ${valorDespesa.toFixed(2)}`);
     } else if (isFixa) {
       despFixas += valorDespesa;
-      Logger.log(`  -> DESPESA FIXA: [${docStr || histStr || catOriginal}] = R$ ${valorDespesa.toFixed(2)}`);
     } else {
-      // Itens operacionais legítimos: Impressora, parcelas de ferramentas/softwares e insumos
       custOperacionais += valorDespesa;
-      Logger.log(`  -> CUSTO OPERACIONAL (Software/Embalagem/Equipamento): [${docStr || histStr || catOriginal}] = R$ ${valorDespesa.toFixed(2)}`);
     }
   }
 
-  Logger.log(`Contas a Pagar Apurado: Fixas=R$ ${despFixas.toFixed(2)}, Operacional=R$ ${custOperacionais.toFixed(2)}, Pessoal=R$ ${custPessoal.toFixed(2)}, Fin=R$ ${custFinanceiros.toFixed(2)}, Impostos=R$ ${impostos.toFixed(2)} | Duplicatas PMP=${duplicatasCompras.length}`);
   return { despFixas, custOperacionais, custPessoal, custFinanceiros, impostos, duplicatasCompras };
 }
 
-/**
- * Processa Contas a Receber (Regime de Caixa Líquido com Anti-Duplicidade)
- */
 function processarContasReceber(mesIso) {
   const pasta = obterSubpastaDoMes(CONFIG_MENSAL.FOLDER_CONTAS_RECEBER_ID, mesIso);
   const arq = obterArquivoMaisRecenteOuConsolidado(pasta);
   if (!arq) return 0;
 
-  const matriz = lerDadosArquivo(arq);
+  const matriz = lerDadosArquivoMensal(arq);
   if (!matriz || matriz.length <= 1) return 0;
 
   let idxCab = -1;
@@ -508,9 +373,8 @@ function processarContasReceber(mesIso) {
   const idxHist = cabecalho.findIndex(c => c.includes('histórico') || c.includes('historico'));
   const idxDoc = cabecalho.findIndex(c => c.includes('documento') || c.includes('doc'));
   
-  // Coluna J física: 'recebido'
   let idxRecebido = cabecalho.findIndex(c => c === 'recebido' || c.includes('recebido'));
-  if (idxRecebido === -1) idxRecebido = 9; // Índice da coluna J
+  if (idxRecebido === -1) idxRecebido = 9;
 
   let totalRecebido = 0;
   const ocsProcessadas = new Set();
@@ -529,19 +393,15 @@ function processarContasReceber(mesIso) {
 
     if (valorRecebido <= 0) continue;
 
-    // Extrai o número do OC (Mercado Livre ou Amazon: "OC nº XXXXXXXX")
     const matchOc = hist.match(/OC\s*n[ºo°]?\s*([A-Za-z0-9\-_]+)/i);
 
     if (matchOc && matchOc[1]) {
       const numOc = matchOc[1].trim();
-
-      // TRAVA DE SEGURANÇA: Se esse OC já foi processado (mesmo sendo parcela 2/5, 3/5), não soma de novo
       if (!ocsProcessadas.has(numOc)) {
         ocsProcessadas.add(numOc);
         totalRecebido += valorRecebido;
       }
     } else {
-      // Fallback para títulos/recebimentos sem identificação de OC
       const chaveFallback = `${cliente}_${doc}_${valorRecebido}`;
       if (!docsSemOcProcessados.has(chaveFallback)) {
         docsSemOcProcessados.add(chaveFallback);
@@ -550,60 +410,65 @@ function processarContasReceber(mesIso) {
     }
   }
 
-  Logger.log(`Total Vendas Líquido Recebido: R$ ${totalRecebido.toFixed(2)} (${ocsProcessadas.size} OCs únicas somadas | ${docsSemOcProcessados.size} outros títulos)`);
   return totalRecebido;
 }
 
 /**
- * Processa Investimento de Ads Mensal (Consolidado ou Somatório do Mês)
+ * Processa Investimento de Ads Mensal Consolidado (Amazon Ads + Mercado Livre Ads)
  */
 function processarAdsMensal(mesIso) {
-  const pasta = obterSubpastaDoMes(CONFIG_MENSAL.FOLDER_ADS_ID, mesIso);
-  const arq = obterArquivoMaisRecenteOuConsolidado(pasta);
-  if (!arq) {
-    Logger.log("⚠️ Nenhum relatório de Ads encontrado para o mês.");
-    return 0;
-  }
-
-  const matriz = lerDadosArquivo(arq);
-  if (!matriz || matriz.length <= 1) return 0;
-
-  // Localiza cabeçalho dinamicamente até a linha 30
-  let idxCab = -1;
-  for (let r = 0; r < Math.min(matriz.length, 30); r++) {
-    const linhaStr = matriz[r].map(c => String(c).trim().toLowerCase()).join(' ');
-    if (linhaStr.includes('custo') || linhaStr.includes('spend') || linhaStr.includes('investimento') || linhaStr.includes('gasto')) {
-      idxCab = r;
-      break;
-    }
-  }
-
-  if (idxCab === -1) idxCab = 0;
-  const cabecalho = matriz[idxCab].map(c => String(c).trim().toLowerCase());
-  Logger.log(`Cabeçalho Ads na linha ${idxCab + 1}: [${cabecalho.slice(0, 6).join(' | ')}]`);
-
-  // Identifica a coluna de custo/investimento
-  const idxCusto = cabecalho.findIndex(c => c.includes('custo total') || c === 'custo' || c.includes('spend') || c.includes('gasto'));
-
   let adsAmazon = 0;
-  let adsML = 0; // Estrutura reservada para ativação futura de Mercado Livre Ads
+  let adsML = 0;
 
-  for (let i = idxCab + 1; i < matriz.length; i++) {
-    const linha = matriz[i];
-    const valorLinha = idxCusto !== -1 ? limparNumero(linha[idxCusto]) : 0;
-    adsAmazon += valorLinha;
+  // 1. Ads Amazon
+  try {
+    const pastaAmz = obterSubpastaDoMes(CONFIG_MENSAL.FOLDER_ADS_ID_AMZ, mesIso);
+    const arqAmz = obterArquivoMaisRecenteOuConsolidado(pastaAmz);
+    if (arqAmz) {
+      const matriz = lerDadosArquivoMensal(arqAmz);
+      if (matriz && matriz.length > 1) {
+        let idxCab = localizarIndiceCabecalho(matriz, ['custo total', 'spend', 'investimento', 'gasto']);
+        const cabecalho = matriz[idxCab].map(c => String(c).trim().toLowerCase());
+        const idxCusto = cabecalho.findIndex(c => c.includes('custo total') || c === 'custo' || c.includes('spend'));
+
+        for (let i = idxCab + 1; i < matriz.length; i++) {
+          adsAmazon += (idxCusto !== -1 ? limparNumero(matriz[i][idxCusto]) : 0);
+        }
+      }
+    }
+  } catch (e) {
+    Logger.log(`Aviso ao ler Ads Amazon Mensal: ${e.message}`);
+  }
+
+  // 2. Ads Mercado Livre (Aba 'Relatório de campanha')
+  try {
+    const pastaML = obterSubpastaDoMes(CONFIG_MENSAL.FOLDER_ADS_ID_ML, mesIso);
+    const arqML = obterArquivoMaisRecenteOuConsolidado(pastaML);
+    if (arqML) {
+      const matrizML = lerDadosArquivoMensal(arqML, 'Relatório de campanha');
+      if (matrizML && matrizML.length > 1) {
+        let idxCab = 1;
+        const cab = matrizML[idxCab].map(c => String(c).trim().toLowerCase());
+        const idxStatus = cab.findIndex(c => c === 'status');
+        const idxInvest = cab.findIndex(c => c.includes('investimento') && !c.includes('acos') && !c.includes('roas'));
+
+        for (let i = idxCab + 1; i < matrizML.length; i++) {
+          const status = idxStatus !== -1 ? String(matrizML[i][idxStatus]).trim().toLowerCase() : '';
+          if (status.includes('ativ')) {
+            adsML += (idxInvest !== -1 ? limparNumero(matrizML[i][idxInvest]) : 0);
+          }
+        }
+      }
+    }
+  } catch (e) {
+    Logger.log(`Aviso ao ler Ads ML Mensal: ${e.message}`);
   }
 
   const totalAds = adsAmazon + adsML;
-  Logger.log(`Investimento Ads Mês: Amazon=R$ ${adsAmazon.toFixed(2)} | ML=R$ ${adsML.toFixed(2)} | Total=R$ ${totalAds.toFixed(2)}`);
+  Logger.log(`Investimento Ads Mês (${mesIso}): Amazon=R$ ${adsAmazon.toFixed(2)} | ML=R$ ${adsML.toFixed(2)} | Total=R$ ${totalAds.toFixed(2)}`);
   return totalAds;
 }
 
-/**
- * Calcula Estoque Médio a Custo de forma MULTI-DEPÓSITO
- * (Depósito Principal + Full ML + Full Amazon)
- * Foto Inicial (início do mês) vs. Foto Final (dia mais recente)
- */
 function calcularEstoqueMedioMensal(mesIso) {
   const pastasEstoque = [
     { nome: 'Principal', id: CONFIG_MENSAL.FOLDER_ESTOQUE_PRINCIPAL_ID },
@@ -651,8 +516,6 @@ function calcularEstoqueMedioMensal(mesIso) {
 
       somaEstoqueInicioTodosDepositos += custoInicio;
       somaEstoqueFimTodosDepositos += custoFim;
-
-      Logger.log(`Estoque Médio [${dep.nome}]: Início = R$ ${custoInicio.toFixed(2)} | Fim = R$ ${custoFim.toFixed(2)}`);
     } catch (e) {
       Logger.log(`Aviso ao calcular estoque de ${dep.nome}: ${e.message}`);
     }
@@ -665,12 +528,11 @@ function calcularEstoqueMedioMensal(mesIso) {
     estoqueMedio = Math.max(somaEstoqueInicioTodosDepositos, somaEstoqueFimTodosDepositos);
   }
 
-  Logger.log(`Estoque Médio Consolidado (Todos os Depósitos): R$ ${estoqueMedio.toFixed(2)}`);
   return estoqueMedio;
 }
 
 function calcularCustoEstoqueArquivo(arquivo) {
-  const matriz = lerDadosArquivo(arquivo);
+  const matriz = lerDadosArquivoMensal(arquivo);
   if (!matriz || matriz.length <= 1) return 0;
 
   const cabecalho = matriz[0].map(c => String(c).trim().toLowerCase());
@@ -697,9 +559,6 @@ function calcularCustoEstoqueArquivo(arquivo) {
   return totalCusto;
 }
 
-/**
- * PMR Geral Ponderado: Soma(Ponderado ML + Ponderado Amazon) / Soma(Faturamento Líquido ML + Amazon)
- */
 function calcularPmrGeral(mesIso) {
   const dadosMl = calcularPmrMercadoLivre(mesIso);
   const dadosAmz = calcularPmrAmazon(mesIso);
@@ -712,22 +571,15 @@ function calcularPmrGeral(mesIso) {
     pmrFinal = Math.round(somaPonderadaGeral / faturamentoLiquidoGeral);
   }
 
-  Logger.log(`PMR Ponderado Geral: ${pmrFinal} dias (Ponderado: ${somaPonderadaGeral.toFixed(2)} | Fat. Líquido: R$ ${faturamentoLiquidoGeral.toFixed(2)})`);
   return pmrFinal;
 }
 
-/**
- * PMR Mercado Livre via Relatório de Vendas (Coluna Z: order_id)
- */
 function calcularPmrMercadoLivre(mesIso) {
   const pasta = obterSubpastaDoMes(CONFIG_MENSAL.FOLDER_ML_VENDAS_ID, mesIso);
   const arq = obterArquivoMaisRecenteOuConsolidado(pasta);
-  if (!arq) {
-    Logger.log("⚠️ Nenhum relatório de vendas do Mercado Livre encontrado.");
-    return { somaPonderada: 0, fatLiquido: 0 };
-  }
+  if (!arq) return { somaPonderada: 0, fatLiquido: 0 };
 
-  const matriz = lerDadosArquivo(arq);
+  const matriz = lerDadosArquivoMensal(arq);
   if (!matriz || matriz.length <= 1) return { somaPonderada: 0, fatLiquido: 0 };
 
   let idxCab = 0;
@@ -740,7 +592,6 @@ function calcularPmrMercadoLivre(mesIso) {
   }
 
   const cabecalho = matriz[idxCab].map(c => String(c).trim().toLowerCase());
-
   const idxOrderId = cabecalho.findIndex(c => c.includes('order_id') || c.includes('número da venda'));
   const idxDataVenda = cabecalho.findIndex(c => c.includes('date_approved') || c.includes('data de creditação') || c.includes('date_created') || c.includes('data da compra'));
   const idxDataLib = cabecalho.findIndex(c => (c.includes('date_released') || c.includes('liberação') || c.includes('liberacao')) && !c.includes('amount'));
@@ -773,58 +624,39 @@ function calcularPmrMercadoLivre(mesIso) {
       const dL = dLibIso ? parseDataIso(dLibIso) : null;
 
       if (!pedidosMl[orderId]) {
-        pedidosMl[orderId] = {
-          dVenda: dV,
-          dLibMax: dL,
-          valorProduto: valorProd,
-          valorLiquido: valorLiq
-        };
+        pedidosMl[orderId] = { dVenda: dV, dLibMax: dL, valorProduto: valorProd, valorLiquido: valorLiq };
       } else {
         if (dL && (!pedidosMl[orderId].dLibMax || dL.getTime() > pedidosMl[orderId].dLibMax.getTime())) {
           pedidosMl[orderId].dLibMax = dL;
         }
-        if (valorProd > pedidosMl[orderId].valorProduto) {
-          pedidosMl[orderId].valorProduto = valorProd;
-        }
-        if (valorLiq > pedidosMl[orderId].valorLiquido) {
-          pedidosMl[orderId].valorLiquido = valorLiq;
-        }
+        if (valorProd > pedidosMl[orderId].valorProduto) pedidosMl[orderId].valorProduto = valorProd;
+        if (valorLiq > pedidosMl[orderId].valorLiquido) pedidosMl[orderId].valorLiquido = valorLiq;
       }
     }
   }
 
   let somaPonderada = 0;
   let fatLiquidoTotal = 0;
-  let qtdPedidos = 0;
 
   for (const id in pedidosMl) {
     const p = pedidosMl[id];
     let dias = 8;
-
     if (p.dVenda && p.dLibMax) {
       dias = Math.max(Math.round((p.dLibMax.getTime() - p.dVenda.getTime()) / (1000 * 60 * 60 * 24)), 0);
     }
-
     somaPonderada += (p.valorProduto * dias);
     fatLiquidoTotal += p.valorLiquido;
-    qtdPedidos++;
   }
 
   return { somaPonderada, fatLiquido: fatLiquidoTotal };
 }
 
-/**
- * PMR Amazon via Relatório CustomUnifiedTransaction
- */
 function calcularPmrAmazon(mesIso) {
   const pasta = obterSubpastaDoMes(CONFIG_MENSAL.FOLDER_FINANCEIRO_AMAZON_ID, mesIso);
   const arq = obterArquivoMaisRecenteOuConsolidado(pasta);
-  if (!arq) {
-    Logger.log("⚠️ Nenhum relatório financeiro da Amazon encontrado.");
-    return { somaPonderada: 0, fatLiquido: 0 };
-  }
+  if (!arq) return { somaPonderada: 0, fatLiquido: 0 };
 
-  const matriz = lerDadosArquivo(arq);
+  const matriz = lerDadosArquivoMensal(arq);
   if (!matriz || matriz.length <= 1) return { somaPonderada: 0, fatLiquido: 0 };
 
   let idxCab = -1;
@@ -843,16 +675,12 @@ function calcularPmrAmazon(mesIso) {
   const idxIdPedido = cabecalho.findIndex(c => c.includes('id do pedido') || c.includes('order'));
   const idxDataVenda = cabecalho.findIndex(c => c.includes('data/hora') || c === 'data');
   const idxDataLib = cabecalho.findIndex(c => c.includes('liberação da transação') || c.includes('liberacao da transacao') || c.includes('libera'));
-
   let idxVendasProd = cabecalho.findIndex(c => c.includes('vendas do produto') || c.includes('product sales'));
   if (idxVendasProd === -1) idxVendasProd = 13;
-
   let idxTarifaVenda = cabecalho.findIndex(c => c.includes('tarifas de venda') || c.includes('selling fees'));
   if (idxTarifaVenda === -1) idxTarifaVenda = 18;
-
   let idxTaxaFba = cabecalho.findIndex(c => c.includes('taxas fba') || c.includes('fba fees'));
   if (idxTaxaFba === -1) idxTaxaFba = 19;
-
   let idxFreteOutras = cabecalho.findIndex(c => c.includes('outras transações') || c.includes('outras transacoes') || c.includes('other transaction fees'));
   if (idxFreteOutras === -1) idxFreteOutras = 20;
 
@@ -861,7 +689,6 @@ function calcularPmrAmazon(mesIso) {
   for (let i = idxCab + 1; i < matriz.length; i++) {
     const linha = matriz[i];
     const tipo = idxTipo !== -1 ? String(linha[idxTipo]).trim().toLowerCase() : '';
-
     if (tipo !== 'pedido' && !tipo.includes('pagamento do pedido') && tipo !== 'order') continue;
 
     const idPedido = idxIdPedido !== -1 ? String(linha[idxIdPedido]).trim() : `linha_${i}`;
@@ -880,50 +707,36 @@ function calcularPmrAmazon(mesIso) {
     const valorLiquidoItem = valorVenda - (frete + comissaoTotal);
 
     if (!pedidosAmazon[idPedido]) {
-      pedidosAmazon[idPedido] = {
-        dVenda: dVenda,
-        dLib: dLib,
-        valorTotalVenda: valorVenda,
-        valorLiquido: valorLiquidoItem
-      };
+      pedidosAmazon[idPedido] = { dVenda: dVenda, dLib: dLib, valorTotalVenda: valorVenda, valorLiquido: valorLiquidoItem };
     } else {
       pedidosAmazon[idPedido].valorTotalVenda += valorVenda;
       pedidosAmazon[idPedido].valorLiquido += valorLiquidoItem;
-      if (!pedidosAmazon[idPedido].dLib && dLib) {
-        pedidosAmazon[idPedido].dLib = dLib;
-      }
+      if (!pedidosAmazon[idPedido].dLib && dLib) pedidosAmazon[idPedido].dLib = dLib;
     }
   }
 
   let somaPonderada = 0;
   let fatLiquidoTotal = 0;
-  let qtdPedidos = 0;
 
   for (const id in pedidosAmazon) {
     const p = pedidosAmazon[id];
     let dias = 14;
-
     if (p.dVenda && p.dLib) {
       dias = Math.max(Math.round((p.dLib.getTime() - p.dVenda.getTime()) / (1000 * 60 * 60 * 24)), 0);
     }
-
     somaPonderada += (p.valorTotalVenda * dias);
     fatLiquidoTotal += Math.max(p.valorLiquido, 0);
-    qtdPedidos++;
   }
 
   return { somaPonderada, fatLiquido: fatLiquidoTotal };
 }
 
-/**
- * Lê Notas Fiscais de Entrada do Mês e retorna o Total Comprado e o Set com os números de NF
- */
 function processarComprasNfeEntrada(mesIso) {
   const pasta = obterSubpastaDoMes(CONFIG_MENSAL.FOLDER_NOTAS_ENTRADA_ID, mesIso);
   const arq = obterArquivoMaisRecenteOuConsolidado(pasta);
   if (!arq) return { totalCompras: 0, setNfs: new Set() };
 
-  const matriz = lerDadosArquivo(arq);
+  const matriz = lerDadosArquivoMensal(arq);
   if (!matriz || matriz.length <= 1) return { totalCompras: 0, setNfs: new Set() };
 
   let idxCab = 0;
@@ -936,7 +749,6 @@ function processarComprasNfeEntrada(mesIso) {
   }
 
   const cabecalho = matriz[idxCab].map(c => String(c).trim().toLowerCase());
-
   let idxNumNf = cabecalho.findIndex(c => c.includes('nº nf') || c.includes('no nf') || c.includes('número') || c.includes('numero'));
   if (idxNumNf === -1) idxNumNf = 2;
 
@@ -950,10 +762,7 @@ function processarComprasNfeEntrada(mesIso) {
     const linha = matriz[i];
     const rawNumNf = linha[idxNumNf] ? String(linha[idxNumNf]).trim() : '';
 
-    if (!rawNumNf || rawNumNf.toLowerCase().includes('total') || isNaN(limparNumero(rawNumNf))) {
-      continue;
-    }
-
+    if (!rawNumNf || rawNumNf.toLowerCase().includes('total') || isNaN(limparNumero(rawNumNf))) continue;
     if (setNfs.has(rawNumNf)) continue;
 
     const valorNota = limparNumero(linha[idxValorNota]);
@@ -966,15 +775,12 @@ function processarComprasNfeEntrada(mesIso) {
   return { totalCompras, setNfs };
 }
 
-/**
- * Lê o Fluxo de Caixa Projetado 90 Dias e extrai o saldo acumulado
- */
 function processarFluxoCaixa90d(mesIso) {
   const pasta = obterSubpastaDoMes(CONFIG_MENSAL.FOLDER_FLUXO_CAIXA_90D_ID, mesIso);
   const arq = obterArquivoMaisRecenteOuConsolidado(pasta);
   if (!arq) return 0;
 
-  const matriz = lerDadosArquivo(arq);
+  const matriz = lerDadosArquivoMensal(arq);
   if (!matriz || matriz.length <= 1) return 0;
 
   const idxCab = localizarIndiceCabecalho(matriz, ['tipo', 'grupo', 'categoria']);
@@ -992,19 +798,12 @@ function processarFluxoCaixa90d(mesIso) {
     const tipo = idxTipo !== -1 ? String(linha[idxTipo]).trim().toLowerCase() : '';
     const cat = idxCat !== -1 ? String(linha[idxCat]).trim().toLowerCase() : '';
 
-    if (tipo.includes('total') || cat.includes('total') || cat.includes('subtotal') || cat.includes('saldo')) {
-      continue;
-    }
-
+    if (tipo.includes('total') || cat.includes('total') || cat.includes('subtotal') || cat.includes('saldo')) continue;
     if (!cat) continue;
 
     const valorTotalLinha = limparNumeroComSinal(linha[ultimaColIdx]);
-
-    if (tipo.includes('receita')) {
-      totalReceitas += valorTotalLinha;
-    } else if (tipo.includes('despesa')) {
-      totalDespesas += Math.abs(valorTotalLinha);
-    }
+    if (tipo.includes('receita')) totalReceitas += valorTotalLinha;
+    else if (tipo.includes('despesa')) totalDespesas += Math.abs(valorTotalLinha);
   }
 
   return (totalReceitas - totalDespesas);
@@ -1031,9 +830,7 @@ function calcularRbt12(resumoDiario, mesAtualIso) {
 
   for (let i = 0; i < 12; i++) {
     const iso = Utilities.formatDate(d, "GMT-0300", 'yyyy-MM');
-    if (resumoDiario[iso]) {
-      faturamentoTotal12M += resumoDiario[iso].faturamento;
-    }
+    if (resumoDiario[iso]) faturamentoTotal12M += resumoDiario[iso].faturamento;
     d.setMonth(d.getMonth() - 1);
   }
 
@@ -1071,9 +868,9 @@ function mapearMesesExistentes(sheet) {
   let ultimaLinhaComDadoReal = 3;
 
   for (let r = 3; r < valoresA.length; r++) {
-    const val = String(valoresA[r][0]).trim().toLowerCase();
-    if (val) {
-      const mesIso = converterRotuloParaIso(val);
+    const rawVal = valoresA[r][0];
+    if (rawVal) {
+      const mesIso = converterRotuloParaIso(rawVal);
       if (mesIso) {
         mapa[mesIso] = r + 1;
         ultimaLinhaComDadoReal = r + 1;
@@ -1082,11 +879,7 @@ function mapearMesesExistentes(sheet) {
   }
 
   const proximaLinha = Math.max(ultimaLinhaComDadoReal + 1, 4);
-
-  return { 
-    mapaMesesExistentes: mapa, 
-    proximaLinhaLivre: proximaLinha 
-  };
+  return { mapaMesesExistentes: mapa, proximaLinhaLivre: proximaLinha };
 }
 
 function obterSubpastaDoMes(idPastaRaiz, mesIso) {
@@ -1118,9 +911,7 @@ function obterArquivoMaisRecenteOuConsolidado(pasta) {
       const nome = arq.getName().toLowerCase();
       if (nome.startsWith('~') || nome.startsWith('.')) continue;
 
-      if (nome.includes('consolidado') || nome.includes('mensal')) {
-        return arq;
-      }
+      if (nome.includes('consolidado') || nome.includes('mensal')) return arq;
 
       const t = arq.getLastUpdated().getTime();
       if (t > maiorTime) {
@@ -1146,17 +937,25 @@ function formatarMesRotulo(mesIso) {
   return `${mesesAbrev[parseInt(m, 10) - 1]}/${y}`;
 }
 
-function converterRotuloParaIso(rotulo) {
-  if (!rotulo) return null;
+/**
+ * Converte rótulo textual ('set./2026'), string ISO ('2026-09-01') ou objeto Date em chave 'YYYY-MM'
+ */
+function converterRotuloParaIso(valor) {
+  if (!valor) return null;
+  if (valor instanceof Date) {
+    return Utilities.formatDate(valor, "GMT-0300", 'yyyy-MM');
+  }
+  let str = String(valor).trim();
+  if (/^\d{4}-\d{2}/.test(str)) {
+    return str.substring(0, 7);
+  }
   const mesesMap = { 'jan': '01', 'fev': '02', 'mar': '03', 'abr': '04', 'mai': '05', 'jun': '06', 'jul': '07', 'ago': '08', 'set': '09', 'out': '10', 'nov': '11', 'dez': '12' };
-  const limpo = rotulo.replace('.', '').replace('/', ' ').trim();
+  const limpo = str.replace('.', '').replace('/', ' ').trim();
   const partes = limpo.split(' ');
   if (partes.length === 2) {
     const mStr = partes[0].substring(0, 3).toLowerCase();
     const yStr = partes[1];
-    if (mesesMap[mStr]) {
-      return `${yStr}-${mesesMap[mStr]}`;
-    }
+    if (mesesMap[mStr]) return `${yStr}-${mesesMap[mStr]}`;
   }
   return null;
 }
@@ -1206,26 +1005,25 @@ function localizarIndiceCabecalho(matriz, termosChave) {
   for (let r = 0; r < Math.min(matriz.length, 25); r++) {
     const linhaStr = matriz[r].map(c => String(c).trim().toLowerCase()).join(' ');
     for (let t = 0; t < termosChave.length; t++) {
-      if (linhaStr.includes(termosChave[t])) {
-        return r;
-      }
+      if (linhaStr.includes(termosChave[t])) return r;
     }
   }
   return 0;
 }
 
-/**
- * Conversor Universal de Arquivos (.xlsx com Drive API v2, Sheets, CSV, TXT e TSV)
- */
-function lerDadosArquivo(arquivo) {
+function lerDadosArquivoMensal(arquivo, nomeAba) {
   if (!arquivo) return null;
   const mimeType = arquivo.getMimeType();
   const nome = arquivo.getName().toLowerCase();
 
-  Logger.log(`Lendo arquivo: "${arquivo.getName()}" (${mimeType})`);
-
   if (mimeType === MimeType.GOOGLE_SHEETS) {
-    return SpreadsheetApp.openById(arquivo.getId()).getSheets()[0].getDataRange().getValues();
+    const ss = SpreadsheetApp.openById(arquivo.getId());
+    let sheet = null;
+    if (nomeAba) {
+      sheet = ss.getSheetByName(nomeAba) || ss.getSheets().find(s => s.getName().toLowerCase().includes(nomeAba.toLowerCase()));
+    }
+    if (!sheet) sheet = ss.getSheets()[0];
+    return sheet.getDataRange().getValues();
   }
 
   if (nome.endsWith('.xlsx') || nome.endsWith('.xls') || mimeType.includes('spreadsheetml') || mimeType.includes('ms-excel')) {
@@ -1240,9 +1038,22 @@ function lerDadosArquivo(arquivo) {
       tempFileId = fileInserido.id;
 
       const ssConvertida = SpreadsheetApp.openById(tempFileId);
-      return ssConvertida.getSheets()[0].getDataRange().getValues();
+      const todasAbas = ssConvertida.getSheets();
+      let abaAlvo = null;
+
+      if (nomeAba) {
+        const nomeNorm = nomeAba.toLowerCase().normalize("NFD").replace(/[\u0300-\u036f]/g, "").trim();
+        abaAlvo = todasAbas.find(s => {
+          const sNorm = s.getName().toLowerCase().normalize("NFD").replace(/[\u0300-\u036f]/g, "").trim();
+          return sNorm.includes("campanha") || sNorm.includes("relat") || sNorm === nomeNorm;
+        });
+      }
+      if (!abaAlvo && todasAbas.length >= 3) abaAlvo = todasAbas[2];
+      if (!abaAlvo) abaAlvo = todasAbas[0];
+
+      return abaAlvo.getDataRange().getValues();
     } catch (e) {
-      Logger.log("Erro na conversão do Excel: " + e.message);
+      Logger.log("Erro na conversão automática do XLSX: " + e.message);
     } finally {
       if (tempFileId) {
         try { Drive.Files.remove(tempFileId); } catch (ex) {}
@@ -1290,18 +1101,11 @@ function lerDadosArquivo(arquivo) {
   });
 }
 
-/**
- * Converte data textual da Amazon ("4 de set. de 2026 15:56:47 GMT-7") em objeto Date
- */
 function parseDataAmazonExtenso(textoData) {
   if (!textoData) return null;
   if (textoData instanceof Date) return textoData;
 
-  const mesesMap = {
-    'jan': 0, 'fev': 1, 'mar': 2, 'abr': 3, 'mai': 4, 'jun': 5,
-    'jul': 6, 'ago': 7, 'set': 8, 'out': 9, 'nov': 10, 'dez': 11
-  };
-
+  const mesesMap = { 'jan': 0, 'fev': 1, 'mar': 2, 'abr': 3, 'mai': 4, 'jun': 5, 'jul': 6, 'ago': 7, 'set': 8, 'out': 9, 'nov': 10, 'dez': 11 };
   const limpo = String(textoData).toLowerCase().replace(/de/g, ' ').replace(/\./g, ' ').trim();
   const partes = limpo.split(/\s+/);
 

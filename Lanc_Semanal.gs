@@ -2,7 +2,7 @@
  * =========================================================================
  * DASHBOARD GESTÃO - JC FIVELAS E TIRAS
  * Módulo Semanal: Automação em Lote (Append-Only & Reprocessamento Contínuo)
- * Com Trava de Sobrescrita, Multi-Arquivos e Ads Segmentados (AMZ: Col P | ML: Col Q)
+ * Com Trava de Sobrescrita, Otimização de Estoque e Ads Separados (AMZ: Col P | ML: Col Q)
  * Grade: Col G até R (12 colunas) | Fórmulas preservadas: C, E, F, S e T
  * =========================================================================
  */
@@ -23,17 +23,6 @@ const CONFIG_SEM = {
   FOLDER_ADS_ID_AMZ: '1xBS1AMFHwVenIYpHKtUad9-uP3e232hY',
   FOLDER_ADS_ID_ML: '1sp0YrEJe6qh9Z6gqfayEZuu12uD2YgAq'
 };
-
-function onOpen() {
-  SpreadsheetApp.getUi()
-    .createMenu('🚀 Automações Gestão')
-    .addItem('Lançar Novos Dados Diários', 'executarRotinaOficial')
-    .addItem('📊 Lançar Novos Dados Semanais', 'executarRotinaSemanal')
-    .addItem('🔄 Reprocessar Todo o Histórico Semanal', 'reprocessarTodoHistoricoSemanal')
-    .addSeparator()
-    .addItem('🧹 Limpar Memória Anti-Duplicidade', 'limparMemoriaAntiDuplicidade')
-    .addToUi();
-}
 
 /**
  * Mapeia rigorosamente as semanas existentes na coluna B (Data Início).
@@ -70,7 +59,7 @@ function mapearSemanasExistentes(sheet) {
 }
 
 /**
- * Rotina normal de atualização semanal (Janela retroativa de 14 dias)
+ * Rotina normal de atualização semanal (Janela deslizante de 14 dias)
  */
 function executarRotinaSemanal() {
   executarMotorLancamentoSemanal(false);
@@ -97,7 +86,7 @@ function executarMotorLancamentoSemanal(reprocessarTudo) {
   Logger.log(`Semanas cadastradas: ${semanasExistentes.size}`);
   Logger.log(`Última segunda-feira na planilha: ${ultimaDataSegunda || 'Nenhuma'}`);
 
-  // Extração dos dados
+  // Extração dos dados otimizada
   const mapaEstoqueSemanal = processarEstoqueACusto();
   let ultimoEstoqueConhecido = 0;
   const mapaML = processarVendasMercadoLivre();
@@ -209,7 +198,7 @@ function executarMotorLancamentoSemanal(reprocessarTudo) {
     const blocoAB = [[ semanaLabel, formatarDataBR(segundaStr) ]];
     const blocoD  = [[ ultimoEstoqueConhecido ]];
     
-    // Colunas G até R (Exatamente 12 colunas):
+    // Colunas G até R (12 colunas exatas):
     // P = Invest. Ads AMZ (R$) | Q = Invest. Ads ML (R$) | R = Visitas Únicas
     const blocoGR = [[
       totalML,             // 1  (G): Mercado Livre (R$)
@@ -295,7 +284,9 @@ function registrarArquivosComoProcessados() {
 }
 
 /**
- * 1. Processa Estoque a Custo por Semana de forma MULTI-DEPÓSITO
+ * 1. Processa Estoque a Custo por Semana de forma MULTI-DEPÓSITO (OTIMIZADO)
+ * Pré-agrupa arquivos por semana e converte APENAS o snapshot mais recente de cada semana,
+ * evitando estouro do limite de 6 minutos de execução.
  */
 function processarEstoqueACusto() {
   const pastasEstoque = [
@@ -331,15 +322,14 @@ function processarEstoqueACusto() {
         return;
       }
 
-      arquivos.sort((a, b) => a.getLastUpdated().getTime() - b.getLastUpdated().getTime());
+      // 1. Pré-agrupa os arquivos de estoque por semana antes de converter
+      const maisRecentePorSemana = {};
 
       arquivos.forEach(arq => {
         const nome = arq.getName();
-        ARQUIVOS_LIDOS_RODADA[`ESTOQUE_${arq.getId()}`] = arq;
-
         let dataIso = null;
-        const matchDiaMes = nome.match(/(\d{1,2})[-_](\d{1,2})/);
         const matchCompleto = nome.match(/(\d{4})[-_](\d{1,2})[-_](\d{1,2})/);
+        const matchDiaMes = nome.match(/(\d{1,2})[-_](\d{1,2})/);
 
         if (matchCompleto) {
           dataIso = `${matchCompleto[1]}-${matchCompleto[2].padStart(2, '0')}-${matchCompleto[3].padStart(2, '0')}`;
@@ -351,8 +341,27 @@ function processarEstoqueACusto() {
         }
 
         const segundaIso = obterSegundaFeiraIso(dataIso);
+        const chaveTempo = `${dataIso}_${arq.getLastUpdated().getTime()}`;
 
-        const matriz = lerDadosArquivo(arq);
+        // Mantém apenas o snapshot com a data real mais avançada daquela semana
+        if (!maisRecentePorSemana[segundaIso] || chaveTempo > maisRecentePorSemana[segundaIso].chaveTempo) {
+          maisRecentePorSemana[segundaIso] = {
+            arq: arq,
+            nome: nome,
+            segundaIso: segundaIso,
+            chaveTempo: chaveTempo
+          };
+        }
+      });
+
+      // 2. Converte e lê APENAS o snapshot mais recente de cada semana
+      Object.keys(maisRecentePorSemana).sort().forEach(segundaIso => {
+        const item = maisRecentePorSemana[segundaIso];
+        const arq = item.arq;
+        const nome = item.nome;
+        ARQUIVOS_LIDOS_RODADA[`ESTOQUE_${arq.getId()}`] = arq;
+
+        const matriz = lerDadosArquivoSemanal(arq);
         if (!matriz || matriz.length <= 1) return;
 
         const cabecalho = matriz[0].map(c => String(c).trim().toLowerCase());
@@ -384,7 +393,7 @@ function processarEstoqueACusto() {
         }
 
         mapaPorDeposito[dep.nome][segundaIso] = valorFinalEstoque;
-        Logger.log(`Estoque [${dep.nome}] (${segundaIso}) atualizado via "${nome}" [${metodoUtilizado}]: R$ ${valorFinalEstoque.toFixed(2)}`);
+        Logger.log(`Estoque [${dep.nome}] (${segundaIso}) apurado via "${nome}" [${metodoUtilizado}]: R$ ${valorFinalEstoque.toFixed(2)}`);
       });
 
     } catch (err) {
@@ -423,7 +432,7 @@ function processarVendasMercadoLivre() {
 
   arquivos.forEach(arq => {
     ARQUIVOS_LIDOS_RODADA[`ML_VENDAS_${arq.getId()}`] = arq;
-    const matriz = lerDadosArquivo(arq);
+    const matriz = lerDadosArquivoSemanal(arq);
     if (!matriz || matriz.length <= 1) return;
 
     const idxCabecalho = localizarIndiceCabecalho(matriz, ['date_created', 'data da compra', 'transaction_amount', 'seller_custom_field']);
@@ -484,7 +493,7 @@ function processarVendasAmazon() {
 
   arquivos.forEach(arq => {
     ARQUIVOS_LIDOS_RODADA[`AMAZON_VENDAS_${arq.getId()}`] = arq;
-    const matriz = lerDadosArquivo(arq);
+    const matriz = lerDadosArquivoSemanal(arq);
     if (!matriz || matriz.length <= 1) return;
 
     const idxCabecalho = localizarIndiceCabecalho(matriz, ['purchase-date', 'item-price', 'order-status', 'sku']);
@@ -534,7 +543,7 @@ function processarTrafegoMercadoLivre() {
 
   arquivos.forEach(arq => {
     ARQUIVOS_LIDOS_RODADA[`ML_TRAFEGO_${arq.getId()}`] = arq;
-    const matriz = lerDadosArquivo(arq);
+    const matriz = lerDadosArquivoSemanal(arq);
     if (!matriz || matriz.length <= 1) return;
 
     let idxCabecalho = -1;
@@ -579,7 +588,7 @@ function processarTrafegoAmazon() {
 
   arquivos.forEach(arq => {
     ARQUIVOS_LIDOS_RODADA[`AMAZON_TRAFEGO_${arq.getId()}`] = arq;
-    const matriz = lerDadosArquivo(arq);
+    const matriz = lerDadosArquivoSemanal(arq);
     if (!matriz || matriz.length <= 1) return;
 
     let idxCabecalho = -1;
@@ -632,7 +641,7 @@ function processarCustosAmazon() {
 
   arquivos.forEach(arq => {
     ARQUIVOS_LIDOS_RODADA[`AMAZON_CUSTOS_${arq.getId()}`] = arq;
-    const matriz = lerDadosArquivo(arq);
+    const matriz = lerDadosArquivoSemanal(arq);
     if (!matriz || matriz.length <= 1) return;
 
     let idxCabecalho = -1;
@@ -727,7 +736,7 @@ function processarAdsAmazon() {
 
   arquivos.forEach(arq => {
     ARQUIVOS_LIDOS_RODADA[`ADS_AMZ_${arq.getId()}`] = arq;
-    const matriz = lerDadosArquivo(arq);
+    const matriz = lerDadosArquivoSemanal(arq);
     if (!matriz || matriz.length <= 1) return;
 
     let idxCab = localizarIndiceCabecalho(matriz, ['intervalo de datas', 'custo total', 'campanha']);
@@ -765,8 +774,8 @@ function processarAdsAmazon() {
 /**
  * 8. Processa Relatório de Ads do Mercado Livre (.XLSX) - Multi-Arquivos
  * - Varre a aba 'Relatório de campanha' (índice 2)
- * - Identifica o cabeçalho na linha 2 com 'status', 'desde', 'até' e 'investimento'
- * - Filtra campanhas Ativas e faz o rateio
+ * - Identifica o cabeçalho com busca estrita
+ * - Filtra campanhas Ativas e rateia a coluna Investimento
  */
 function processarAdsMercadoLivre() {
   const pasta = DriveApp.getFolderById(CONFIG_SEM.FOLDER_ADS_ID_ML);
@@ -779,8 +788,8 @@ function processarAdsMercadoLivre() {
   arquivos.forEach(arq => {
     ARQUIVOS_LIDOS_RODADA[`ADS_ML_${arq.getId()}`] = arq;
     
-    // Força a leitura da 3ª aba ('Relatório de campanha')
-    const matriz = lerDadosArquivo(arq, 'Relatório de campanha');
+    // Força a leitura da 3ª aba ('Relatório de campanha') via função blindada
+    const matriz = lerDadosArquivoSemanal(arq, 'Relatório de campanha');
     if (!matriz || matriz.length <= 1) return;
 
     // Localiza a linha do cabeçalho
@@ -797,8 +806,7 @@ function processarAdsMercadoLivre() {
     const cab = matriz[idxCab].map(c => String(c).trim().toLowerCase());
     const idxStatus = cab.findIndex(c => c === 'status');
     const idxDesde = cab.findIndex(c => c === 'desde');
-    // Busca estrita para 'até' ou 'ate' (evitando que 'status' coincida com 'at')
-    const idxAte = cab.findIndex(c => c === 'até' || c === 'ate' || c.startsWith('at') && c !== 'status');
+    const idxAte = cab.findIndex(c => c === 'até' || c === 'ate');
     const idxInvest = cab.findIndex(c => c.includes('investimento') && !c.includes('acos') && !c.includes('roas'));
 
     for (let i = idxCab + 1; i < matriz.length; i++) {
@@ -838,7 +846,7 @@ function processarAdsMercadoLivre() {
 }
 
 // =========================================================================
-// UTILITÁRIOS E PARSERS
+// UTILITÁRIOS E PARSERS BLINDADOS (EXCLUSIVOS DO MÓDULO SEMANAL)
 // =========================================================================
 
 function localizarIndiceCabecalho(matriz, termosChave) {
@@ -854,10 +862,10 @@ function localizarIndiceCabecalho(matriz, termosChave) {
 }
 
 /**
- * Converte e lê arquivos .xlsx, .csv e .txt
- * Identificação dinâmica de aba no Excel com seleção direta da 3ª aba para relatórios de campanha
+ * Leitor blindado exclusivo do Semanal:
+ * Garante Sheet1 para estoque/vendas e a 3ª aba para o ML Ads
  */
-function lerDadosArquivo(arquivo, nomeAba) {
+function lerDadosArquivoSemanal(arquivo, nomeAba) {
   if (!arquivo) return null;
   const mimeType = arquivo.getMimeType();
   const nome = arquivo.getName().toLowerCase();
@@ -895,12 +903,11 @@ function lerDadosArquivo(arquivo, nomeAba) {
           const sNorm = s.getName().toLowerCase().normalize("NFD").replace(/[\u0300-\u036f]/g, "").trim();
           return sNorm.includes("campanha") || sNorm.includes("relat") || sNorm === nomeNorm;
         });
+        if (!abaAlvo && todasAbas.length >= 3) {
+          abaAlvo = todasAbas[2]; // 3ª aba para ML Ads
+        }
       }
       
-      // Fallback para ML Ads: se houver 3 abas, seleciona a 3ª aba ('Relatório de campanha')
-      if (!abaAlvo && todasAbas.length >= 3) {
-        abaAlvo = todasAbas[2];
-      }
       if (!abaAlvo) {
         abaAlvo = todasAbas[0];
       }
