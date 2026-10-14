@@ -6,13 +6,13 @@
  */
 function onOpen() {
   const ui = SpreadsheetApp.getUi();
-  
+
   ui.createMenu('🚀 Cockpits & Rotinas')
     .addItem('📅 Atualizar Cockpit Diário', 'executarRotinaOficial')
     .addItem('📊 Atualizar Cockpit Semanal (14d Recente)', 'executarRotinaSemanal')
     .addItem('🔄 Reprocessar Todo o Histórico Semanal', 'reprocessarTodoHistoricoSemanal')
     .addSeparator()
-    .addItem('📈 Atualizar Cockpit Mensal', 'executarRotinaMensal')
+    .addItem('📈 Atualizar Cockpit Mensal (2m Recente)', 'executarRotinaMensal')
     .addItem('🔄 Reprocessar Todo o Histórico Mensal', 'reprocessarTodoHistoricoMensal')
     .addToUi();
 
@@ -32,45 +32,46 @@ function onOpen() {
     .addToUi();
 }
 
-/**
- * Funções de Reset Parcial com Confirmação do Gestor
- */
 function resetarTravaDiaria() {
-  confirmarERemoverChaves('DIARIO_', 'Travas da rotina diária resetadas com sucesso!');
+  confirmarERemoverChaves(['DIARIO_'], 'Travas da rotina diária resetadas com sucesso!');
 }
 
 function resetarTravaSemanal() {
-  confirmarERemoverChaves('HASH_', 'Travas de arquivos semanais resetadas com sucesso!');
+  confirmarERemoverChaves(['HASH_', 'SEMANAL_', 'ESTOQUE_', 'ML_', 'AMAZON_', 'ADS_'], 'Travas de arquivos semanais resetadas com sucesso!');
 }
 
 function resetarTravaMensal() {
-  confirmarERemoverChaves('MENSAL_', 'Travas de fechamento mensal resetadas com sucesso!');
+  confirmarERemoverChaves(['MENSAL_'], 'Travas de fechamento mensal resetadas com sucesso!');
 }
 
 function resetarTodasTravasComConfirmacao() {
   const ui = SpreadsheetApp.getUi();
-  const resp = ui.alert('ATENÇÃO: Ação de Gestão', 
-    'Deseja limpar TODAS as memórias anti-duplicidade de todos os cockpits? Isso permitirá reprocessar relatórios já consolidados.', 
-    ui.ButtonSet.YES_NO);
-    
+  const resp = ui.alert(
+    'ATENÇÃO: Ação de Gestão',
+    'Deseja limpar TODAS as memórias anti-duplicidade de todos os cockpits? Isso permitirá reprocessar relatórios já consolidados.',
+    ui.ButtonSet.YES_NO
+  );
+
   if (resp === ui.Button.YES) {
     PropertiesService.getScriptProperties().deleteAllProperties();
-    SpreadsheetApp.getActiveSpreadsheet().toast('Todas as travas foram zeradas.', 'Segurança');
+    SpreadsheetApp.getActiveSpreadsheet().toast('Todas as travas foram zeradas com sucesso!', 'Segurança');
   }
 }
 
-function confirmarERemoverChaves(prefixo, msgSucesso) {
+function confirmarERemoverChaves(listaPrefixos, msgSucesso) {
   const ui = SpreadsheetApp.getUi();
-  const resp = ui.alert('Confirmação de Governança', 
-    `Deseja realmente liberar o reprocessamento para o grupo "${prefixo}"?`, 
-    ui.ButtonSet.YES_NO);
-    
+  const resp = ui.alert(
+    'Confirmação de Governança',
+    `Deseja realmente liberar o reprocessamento para o módulo selecionado?`,
+    ui.ButtonSet.YES_NO
+  );
+
   if (resp !== ui.Button.YES) return;
 
   const props = PropertiesService.getScriptProperties();
   const chaves = props.getKeys();
   chaves.forEach(chave => {
-    if (chave.startsWith(prefixo)) {
+    if (listaPrefixos.some(pref => chave.startsWith(pref))) {
       props.deleteProperty(chave);
     }
   });
