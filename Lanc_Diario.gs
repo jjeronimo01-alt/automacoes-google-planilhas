@@ -1,7 +1,8 @@
 /**
  * =========================================================================
- * DASHBOARD GESTÃO - JC FIVELAS E TIRAS
- * Módulo Diário : Leitura de Relatórios + Calendário Contínuo com Revisão
+ * DASHBOARD GESTÃO - MÓDULO DIÁRIO (Lanc_Diario.gs)
+ * Leitura de Relatórios + Calendário Contínuo com Revisão Retroativa
+ * Requer o arquivo Utils.gs no mesmo projeto Apps Script.
  * =========================================================================
  */
 const CONFIG = {
@@ -24,12 +25,10 @@ function executarRotinaOficial() {
   const sheet = ss.getSheetByName(CONFIG.SHEET_NAME);
   if (!sheet) throw new Error(`Aba "${CONFIG.SHEET_NAME}" não encontrada.`);
 
-  // 1. Mapeamento das datas e linhas físicas da planilha
   const { datasExistentes, mapaLinhasPorData, proximaLinhaLivre, ultimaDataPlanilha } = mapearDatasExistentes(sheet);
   Logger.log(`Datas já preenchidas na coluna A: ${datasExistentes.size}`);
   Logger.log(`Última data encontrada na planilha: ${ultimaDataPlanilha || 'Nenhuma'}`);
 
-  // 2. Processamento dos dados dos relatórios do Drive
   const taxaDisponibilidadeCurvaA = processarEstoque();
   const mapaDevolucoes = processarDevolucoes();
   const { mapaVendas, mapaEnviosPorDataMax } = processarVendas();
@@ -37,7 +36,6 @@ function executarRotinaOficial() {
   const hojeStr = Utilities.formatDate(new Date(), "GMT-0300", 'yyyy-MM-dd');
   let dataInicialIso = '';
 
-  // REVISÃO RETROATIVA: Retrocede 3 dias antes da última data (cobre 15, 16, 17 e 18)
   if (ultimaDataPlanilha) {
     const dUltima = parseDataIso(ultimaDataPlanilha);
     dUltima.setDate(dUltima.getDate() - 3);
@@ -61,7 +59,6 @@ function executarRotinaOficial() {
     }
   }
 
-  // 3. Monta a lista sequencial incondicional de dias civis
   const datasParaProcessar = [];
   let dLoop = parseDataIso(dataInicialIso);
   const dHoje = parseDataIso(hojeStr);
@@ -84,8 +81,11 @@ function executarRotinaOficial() {
       taxaEnvio = dadosEnvio.despachadosNoPrazo / dadosEnvio.totalParaDespachar;
     }
 
+    const [ano, mes, dia] = dataStr.split('-').map(Number);
+    const objetoDataReal = new Date(ano, mes - 1, dia);
+
     const linhaAE = [[
-      formatarDataBR(dataStr),
+      objetoDataReal,
       obterNomeDiaSemana(dataStr),
       v.faturamento,
       v.pedidosSet.size,
@@ -97,12 +97,6 @@ function executarRotinaOficial() {
       v.custosVariaveis
     ]];
 
-    const linhaJL = [[
-      taxaDisponibilidadeCurvaA,
-      taxaEnvio,
-      0
-    ]];
-
     // Se o dia já existe na planilha, ATUALIZA na linha correspondente
     if (mapaLinhasPorData[dataStr]) {
       const linExistente = mapaLinhasPorData[dataStr];
@@ -111,19 +105,34 @@ function executarRotinaOficial() {
       sheet.getRange(linExistente, 1, 1, 5).setValues(linhaAE);
       sheet.getRange(linExistente, 7, 1, 2).setValues(linhaGH);
 
+      // Preserva o In-Stock Curva A histórico de dias passados; atualiza apenas se for hoje ou se estiver vazio
+      const inStockExistente = sheet.getRange(linExistente, 10).getValue();
+      const inStockFinal = (dataStr === hojeStr || inStockExistente === '' || inStockExistente === null)
+        ? taxaDisponibilidadeCurvaA
+        : inStockExistente;
+
       const reclamacaoAtual = sheet.getRange(linExistente, 12).getValue();
-      linhaJL[0][2] = (typeof reclamacaoAtual === 'number' && reclamacaoAtual > 0) ? reclamacaoAtual : 0;
-      sheet.getRange(linExistente, 10, 1, 3).setValues(linhaJL);
+      const reclamacaoFinal = (typeof reclamacaoAtual === 'number' && reclamacaoAtual > 0) ? reclamacaoAtual : 0;
+
+      sheet.getRange(linExistente, 10, 1, 3).setValues([[
+        inStockFinal,
+        taxaEnvio,
+        reclamacaoFinal
+      ]]);
 
       aplicarFormatacaoLinha(sheet, linExistente);
-    } 
+    }
     // Se for data nova no calendário, insere no fim da base
     else {
       Logger.log(`➕ Inserindo novo dia civil contínuo: ${dataStr} na linha ${linhaCursor}...`);
 
       sheet.getRange(linhaCursor, 1, 1, 5).setValues(linhaAE);
       sheet.getRange(linhaCursor, 7, 1, 2).setValues(linhaGH);
-      sheet.getRange(linhaCursor, 10, 1, 3).setValues(linhaJL);
+      sheet.getRange(linhaCursor, 10, 1, 3).setValues([[
+        taxaDisponibilidadeCurvaA,
+        taxaEnvio,
+        0
+      ]]);
       sheet.getRange(linhaCursor, 14, 1, 1).setValue('');
 
       aplicarFormatacaoLinha(sheet, linhaCursor);
@@ -132,8 +141,7 @@ function executarRotinaOficial() {
     }
   });
 
-  // 4. Varredura ampla e atualização retroativa da Coluna K (Envios < 24h)
-  let enviosAtualizados = 0;
+  // Varredura retroativa da Coluna K (Envios < 24h)
   for (const dataPassadaIso in mapaLinhasPorData) {
     if (datasParaProcessar.includes(dataPassadaIso)) continue;
 
@@ -144,7 +152,6 @@ function executarRotinaOficial() {
         const lin = mapaLinhasPorData[dataPassadaIso];
         sheet.getRange(lin, 11).setValue(novaTaxa);
         sheet.getRange(lin, 11).setNumberFormat('0.0%').setHorizontalAlignment('center');
-        enviosAtualizados++;
       }
     }
   }
@@ -153,19 +160,17 @@ function executarRotinaOficial() {
   SpreadsheetApp.getActiveSpreadsheet()?.toast(`Cockpit Diário atualizado com sucesso!`, "Concluído");
 }
 
-/**
- * Mapeia rigorosamente as datas da coluna A (a partir da linha 4)
- */
 function mapearDatasExistentes(sheet) {
   const maxRows = Math.max(sheet.getLastRow(), 30);
-  const valoresA = sheet.getRange(1, 1, maxRows, 1).getValues();
+  const valoresDisplayA = sheet.getRange(1, 1, maxRows, 1).getDisplayValues();
+  const valoresRawA = sheet.getRange(1, 1, maxRows, 1).getValues();
   const datasExistentes = new Set();
   const mapaLinhasPorData = {};
   let ultimaLinhaComData = 3;
   let maiorDataEncontrada = '';
 
-  for (let r = 3; r < valoresA.length; r++) {
-    const val = normalizarDataChave(valoresA[r][0]);
+  for (let r = 3; r < valoresRawA.length; r++) {
+    const val = normalizarDataChave(valoresDisplayA[r][0] || valoresRawA[r][0]);
     if (val) {
       datasExistentes.add(val);
       mapaLinhasPorData[val] = r + 1;
@@ -186,9 +191,6 @@ function mapearDatasExistentes(sheet) {
   };
 }
 
-/**
- * Formatação visual e alinhamento por linha
- */
 function aplicarFormatacaoLinha(sheet, linha) {
   sheet.getRange(linha, 1, 1, 14).setVerticalAlignment('middle');
   sheet.getRange(linha, 1, 1, 1).setHorizontalAlignment('center').setNumberFormat('dd/mm/yyyy');
@@ -207,59 +209,29 @@ function aplicarFormatacaoLinha(sheet, linha) {
   sheet.getRange(linha, 14, 1, 1).setHorizontalAlignment('left');
 }
 
-/**
- * Processa dados de TODOS os Relatórios de Vendas (RL_V01) da pasta
- * Consolida arquivos parciais/diários com o consolidado do mês.
- * TRAVA ANTI-DUPLICIDADE RIGOROSA:
- * - Faturamento, Custos e CMV: computados por item e pedido sem repetição entre arquivos.
- * - Envios: consolida o SLA considerando a data de despacho mais recente do pedido.
- */
 function processarVendas() {
   const pastaVendas = DriveApp.getFolderById(CONFIG.FOLDER_VENDAS_ID);
-  
-  // 1. Coleta todos os arquivos de vendas da pasta
-  const arquivos = [];
-  function listar(f) {
-    const files = f.getFiles();
-    while (files.hasNext()) {
-      const a = files.next();
-      const n = a.getName().toLowerCase();
-      if (!n.startsWith('~') && !n.startsWith('.') && (n.endsWith('.xlsx') || n.endsWith('.xls') || n.endsWith('.csv'))) {
-        arquivos.push(a);
-      }
-    }
-    const subs = f.getFolders();
-    while (subs.hasNext()) listar(subs.next());
-  }
-  listar(pastaVendas);
+  const arquivos = obterTodosArquivosRecursivo(pastaVendas).filter(a => {
+    const n = a.getName().toLowerCase();
+    return n.endsWith('.xlsx') || n.endsWith('.xls') || n.endsWith('.csv');
+  });
 
   if (arquivos.length === 0) {
     Logger.log("⚠️ Nenhum arquivo de vendas encontrado na pasta.");
     return { mapaVendas: {}, mapaEnviosPorDataMax: {} };
   }
 
-  // Ordena do mais antigo para o mais recente (para que as informações mais novas atualizem os status de envio)
   arquivos.sort((a, b) => a.getLastUpdated().getTime() - b.getLastUpdated().getTime());
 
-  Logger.log(`Consolidando ${arquivos.length} arquivo(s) de vendas: [${arquivos.map(a => a.getName()).join(', ')}]`);
-
   const mapaVendas = {};
-  const pedidosAgregadosFinanceiro = new Set(); // Evita somar o mesmo item/pedido vindo de relatórios diferentes
-  const mapaStatusPedidosEnvio = {};            // Guarda { idPedido: { dMax, despachadoNoPrazo } }
+  const pedidosAgregadosFinanceiro = new Set();
+  const mapaStatusPedidosEnvio = {};
 
   arquivos.forEach(arq => {
-    const matriz = lerDadosArquivo(arq);
+    const matriz = lerDadosArquivoUnificado(arq);
     if (!matriz || matriz.length <= 1) return;
 
-    let idxCabecalho = 0;
-    for (let r = 0; r < Math.min(matriz.length, 15); r++) {
-      const linhaStr = matriz[r].map(c => String(c).trim().toLowerCase()).join(' ');
-      if (linhaStr.includes('venda') || linhaStr.includes('pedido')) {
-        idxCabecalho = r;
-        break;
-      }
-    }
-
+    const idxCabecalho = localizarIndiceCabecalho(matriz, ['venda', 'pedido']);
     const cabecalho = matriz[idxCabecalho].map(c => String(c).trim().toLowerCase());
     let idxPedido = cabecalho.findIndex(c => c.includes('pedido') || c.includes('código') || c.includes('codigo') || c.includes('venda'));
     if (idxPedido === -1) idxPedido = 0;
@@ -278,16 +250,20 @@ function processarVendas() {
     const idxQtd = cabecalho.findIndex(c => c.includes('quantidade') || c === 'qtd');
     const idxSku = cabecalho.findIndex(c => c === 'código (sku)' || c.includes('sku') || c.includes('produto'));
 
+    // Contador de ocorrência do item dentro do mesmo pedido no arquivo atual (substitui o índice de linha 'i')
+    const contadorItensPorPedidoArquivo = {};
+
     for (let i = idxCabecalho + 1; i < matriz.length; i++) {
       const linha = matriz[i];
       const dataVendaStr = normalizarDataChave(linha[idxDataVenda]);
       const rawPedido = (linha[idxPedido] && String(linha[idxPedido]).trim() !== '') ? String(linha[idxPedido]).trim() : '';
       if (!rawPedido) continue;
 
-      const skuItem = idxSku !== -1 ? String(linha[idxSku]).trim() : '';
-      const chaveItemUnico = `${rawPedido}_${skuItem}_${i}`;
+      const skuItem = idxSku !== -1 ? String(linha[idxSku]).trim().toUpperCase() : 'ITEM';
+      const chaveBasePedidoSku = `${rawPedido}_${skuItem}`;
+      contadorItensPorPedidoArquivo[chaveBasePedidoSku] = (contadorItensPorPedidoArquivo[chaveBasePedidoSku] || 0) + 1;
+      const chaveItemUnico = `${chaveBasePedidoSku}_${contadorItensPorPedidoArquivo[chaveBasePedidoSku]}`;
 
-      // A) AGREGAÇÃO FINANCEIRA COM ANTI-DUPLICIDADE
       if (dataVendaStr) {
         if (!mapaVendas[dataVendaStr]) {
           mapaVendas[dataVendaStr] = {
@@ -300,7 +276,6 @@ function processarVendas() {
 
         const diaVenda = mapaVendas[dataVendaStr];
 
-        // Se o pedido ainda não teve frete/comissão somados neste dia de venda
         if (!diaVenda.pedidosSet.has(rawPedido)) {
           diaVenda.pedidosSet.add(rawPedido);
 
@@ -313,7 +288,6 @@ function processarVendas() {
           diaVenda.custosVariaveis += (freteFinal + comissao);
         }
 
-        // Soma itens de produto sem duplicar entre arquivos
         if (!pedidosAgregadosFinanceiro.has(chaveItemUnico)) {
           pedidosAgregadosFinanceiro.add(chaveItemUnico);
 
@@ -330,14 +304,11 @@ function processarVendas() {
         }
       }
 
-      // B) MAPEAMENTO DE ENVIOS (Único por número de pedido)
-      // Como os arquivos são lidos em ordem cronológica, se um arquivo mais recente
-      // trouxer a confirmação de envio (dEnvio <= dMax), ela atualiza o status do pedido
       const dMax = normalizarDataChave(idxDataMax !== -1 ? linha[idxDataMax] : '');
       const dEnvio = normalizarDataChave(idxDataEnvio !== -1 ? linha[idxDataEnvio] : '');
 
       if (dMax) {
-        const noPrazo = (dEnvio && dEnvio <= dMax);
+        const noPrazo = Boolean(dEnvio && dEnvio <= dMax);
         if (!mapaStatusPedidosEnvio[rawPedido] || (!mapaStatusPedidosEnvio[rawPedido].noPrazo && noPrazo)) {
           mapaStatusPedidosEnvio[rawPedido] = {
             dMax: dMax,
@@ -348,7 +319,6 @@ function processarVendas() {
     }
   });
 
-  // Consolida o mapa final de envios por Data Máxima de Despacho (dMax)
   const mapaEnviosPorDataMax = {};
   for (const ped in mapaStatusPedidosEnvio) {
     const info = mapaStatusPedidosEnvio[ped];
@@ -361,13 +331,9 @@ function processarVendas() {
     }
   }
 
-  Logger.log(`Resumo consolidado: ${Object.keys(mapaVendas).length} dias com vendas | ${Object.keys(mapaEnviosPorDataMax).length} datas com despachos apurados.`);
   return { mapaVendas, mapaEnviosPorDataMax };
 }
 
-/**
- * Processa dados dos Relatórios de Estoque (RL_ES01) de todos os depósitos
- */
 function processarEstoque() {
   const pastasEstoque = [
     { nome: 'Principal', id: CONFIG.FOLDER_ESTOQUE_PRINCIPAL_ID },
@@ -385,7 +351,7 @@ function processarEstoque() {
       const arq = obterArquivoMaisRecenteRecursivo(pasta);
       if (!arq) return;
 
-      const matriz = lerDadosArquivo(arq);
+      const matriz = lerDadosArquivoUnificado(arq);
       if (!matriz || matriz.length <= 1) return;
 
       const cabecalho = matriz[0].map(c => String(c).trim().toLowerCase());
@@ -399,19 +365,17 @@ function processarEstoque() {
         const sku = colSku !== -1 ? String(linha[colSku]).trim() : `linha_${i}`;
         const tags = colTags !== -1 ? String(linha[colTags]).toUpperCase() : '';
 
-        const isCurvaA = tags.includes('CURVA A') || 
-                         tags.includes('CURVA_A') || 
-                         tags.includes('GIRO NORMAL') || 
+        const isCurvaA = tags.includes('CURVA A') ||
+                         tags.includes('CURVA_A') ||
+                         tags.includes('GIRO NORMAL') ||
                          tags === 'A';
 
         if (isCurvaA) {
           skusAvaliados.add(sku);
-
           const disponivel = colDisp !== -1 ? limparNumero(linha[colDisp]) : 0;
           const minimo = colMin !== -1 ? limparNumero(linha[colMin]) : 0;
 
           estoqueDisponivelPorSku[sku] = (estoqueDisponivelPorSku[sku] || 0) + disponivel;
-          
           if (minimo > 0) {
             estoqueMinimoPorSku[sku] = Math.max(estoqueMinimoPorSku[sku] || 0, minimo);
           }
@@ -429,7 +393,6 @@ function processarEstoque() {
   skusAvaliados.forEach(sku => {
     const disponivel = estoqueDisponivelPorSku[sku] || 0;
     const minimo = estoqueMinimoPorSku[sku] || 0;
-
     if (minimo > 0) {
       if (disponivel < minimo) skusOfensores.add(sku);
     } else {
@@ -438,24 +401,15 @@ function processarEstoque() {
   });
 
   const totalConformes = totalA - skusOfensores.size;
-  const taxaDisponibilidade = totalConformes / totalA;
-
-  Logger.log(`Estoque Consolidado Curva A: ${totalConformes}/${totalA} SKUs conformes (${(taxaDisponibilidade * 100).toFixed(1)}%).`);
-  return taxaDisponibilidade;
+  return totalConformes / totalA;
 }
 
-/**
- * Processa dados do Relatório de Devoluções
- */
 function processarDevolucoes() {
   const pastaDevolucoes = DriveApp.getFolderById(CONFIG.FOLDER_DEVOLUCOES_ID);
   const arq = obterArquivoMaisRecenteRecursivo(pastaDevolucoes);
-  if (!arq) {
-    Logger.log("⚠️ Nenhum arquivo de devoluções encontrado na pasta.");
-    return {};
-  }
+  if (!arq) return {};
 
-  const matriz = lerDadosArquivo(arq);
+  const matriz = lerDadosArquivoUnificado(arq);
   if (!matriz || matriz.length <= 1) return {};
 
   const mapaDevolucoes = {};
@@ -466,11 +420,7 @@ function processarDevolucoes() {
     if (!linha || linha.length === 0) continue;
 
     const linhaStr = linha.map(c => String(c).trim().toLowerCase()).join(' ');
-
-    if (linhaStr.includes('valor icms') || 
-        linhaStr.includes('percentual') || 
-        linhaStr.startsWith('total') || 
-        linhaStr.includes('valor total')) {
+    if (linhaStr.includes('valor icms') || linhaStr.includes('percentual') || linhaStr.startsWith('total') || linhaStr.includes('valor total')) {
       continue;
     }
 
@@ -482,7 +432,6 @@ function processarDevolucoes() {
         break;
       }
     }
-
     if (!dataIsoLinha) continue;
 
     let numNfEncontrado = '';
@@ -491,7 +440,6 @@ function processarDevolucoes() {
     if (linha.length >= 4) {
       const celulaC = String(linha[2]).trim();
       const valD = limparNumero(linha[3]);
-
       if (/^\d+$/.test(celulaC) && valD > 0) {
         numNfEncontrado = celulaC;
         valorNotaEncontrado = valD;
@@ -502,7 +450,6 @@ function processarDevolucoes() {
       for (let c = 0; c < linha.length - 1; c++) {
         const celulaStr = String(linha[c]).trim();
         const valorProximaCelula = limparNumero(linha[c + 1]);
-
         if (/^\d{1,9}$/.test(celulaStr) && valorProximaCelula > 0 && celulaStr !== '0') {
           numNfEncontrado = celulaStr;
           valorNotaEncontrado = valorProximaCelula;
@@ -511,158 +458,11 @@ function processarDevolucoes() {
       }
     }
 
-    if (numNfEncontrado && valorNotaEncontrado > 0) {
-      if (!nfsProcessadas.has(numNfEncontrado)) {
-        nfsProcessadas.add(numNfEncontrado);
-
-        if (!mapaDevolucoes[dataIsoLinha]) {
-          mapaDevolucoes[dataIsoLinha] = 0;
-        }
-
-        mapaDevolucoes[dataIsoLinha] += valorNotaEncontrado;
-        Logger.log(`  -> Devolução NF ${numNfEncontrado}: Data ${dataIsoLinha} | Valor R$ ${valorNotaEncontrado.toFixed(2)}`);
-      } else {
-        Logger.log(`  -> NF ${numNfEncontrado} já computada (duplicidade evitada).`);
-      }
+    if (numNfEncontrado && valorNotaEncontrado > 0 && !nfsProcessadas.has(numNfEncontrado)) {
+      nfsProcessadas.add(numNfEncontrado);
+      mapaDevolucoes[dataIsoLinha] = (mapaDevolucoes[dataIsoLinha] || 0) + valorNotaEncontrado;
     }
   }
 
-  Logger.log(`Mapa de Devoluções extraído: ${JSON.stringify(mapaDevolucoes)} (${nfsProcessadas.size} notas computadas)`);
   return mapaDevolucoes;
-}
-
-/**
- * Utilitários gerais
- */
-function parseDataIso(strIso) {
-  const [y, m, d] = strIso.split('-').map(Number);
-  return new Date(y, m - 1, d);
-}
-
-function normalizarDataChave(valor) {
-  if (!valor) return null;
-  if (valor instanceof Date) {
-    return Utilities.formatDate(valor, "GMT-0300", 'yyyy-MM-dd');
-  }
-  let str = String(valor).trim().split(' ')[0].split('T')[0];
-  if (/^\d{1,2}\/\d{1,2}\/\d{4}$/.test(str)) {
-    const [d, m, y] = str.split('/');
-    return `${y}-${m.padStart(2, '0')}-${d.padStart(2, '0')}`;
-  }
-  if (/^\d{4}-\d{1,2}-\d{1,2}$/.test(str)) {
-    const [y, m, d] = str.split('-');
-    return `${y}-${m.padStart(2, '0')}-${d.padStart(2, '0')}`;
-  }
-  return null;
-}
-
-function limparNumero(val) {
-  if (val === null || val === undefined || val === '') return 0;
-  if (typeof val === 'number') return val;
-  let str = String(val).replace('R$', '').replace(/\s/g, '').trim();
-  if (str.includes(',') && str.includes('.')) str = str.replace(/\./g, '').replace(',', '.');
-  else if (str.includes(',')) str = str.replace(',', '.');
-  const num = parseFloat(str);
-  return isNaN(num) ? 0 : num;
-}
-
-function obterNomeDiaSemana(dataStr) {
-  const [y, m, d] = dataStr.split('-').map(Number);
-  const data = new Date(y, m - 1, d);
-  const dias = ['Domingo', 'Segunda-feira', 'Terça-feira', 'Quarta-feira', 'Quinta-feira', 'Sexta-feira', 'Sábado'];
-  return dias[data.getDay()];
-}
-
-function formatarDataBR(dataChave) {
-  if (!dataChave) return '';
-  const [y, m, d] = dataChave.split('-');
-  return `${d}/${m}/${y}`;
-}
-
-function lerDadosArquivo(arquivo) {
-  if (!arquivo) return null;
-  const mimeType = arquivo.getMimeType();
-  const nome = arquivo.getName().toLowerCase();
-
-  Logger.log(`Lendo arquivo: "${arquivo.getName()}" (${mimeType})`);
-
-  if (mimeType === MimeType.GOOGLE_SHEETS) {
-    return SpreadsheetApp.openById(arquivo.getId()).getSheets()[0].getDataRange().getValues();
-  }
-
-  if (nome.endsWith('.xlsx') || nome.endsWith('.xls') || mimeType.includes('spreadsheetml') || mimeType.includes('ms-excel')) {
-    let tempFileId = null;
-    try {
-      const blob = arquivo.getBlob();
-      const recurso = {
-        title: "temp_convert_" + new Date().getTime(),
-        mimeType: MimeType.GOOGLE_SHEETS
-      };
-      const fileInserido = Drive.Files.insert(recurso, blob, { convert: true });
-      tempFileId = fileInserido.id;
-
-      const ssConvertida = SpreadsheetApp.openById(tempFileId);
-      return ssConvertida.getSheets()[0].getDataRange().getValues();
-    } catch (e) {
-      Logger.log("Erro na conversão automática do XLSX: " + e.message);
-    } finally {
-      if (tempFileId) {
-        try { Drive.Files.remove(tempFileId); } catch (ex) {}
-      }
-    }
-  }
-
-  let texto = '';
-  try {
-    texto = arquivo.getBlob().getDataAsString('ISO-8859-1');
-  } catch (e) {
-    texto = arquivo.getBlob().getDataAsString('UTF-8');
-  }
-
-  const linhas = texto.split(/\r?\n/).filter(l => l.trim().length > 0);
-  if (linhas.length === 0) return [];
-
-  const delim = (linhas[0].match(/;/g) || []).length >= (linhas[0].match(/,/g) || []).length ? ';' : ',';
-
-  return linhas.map(linha => {
-    const valores = [];
-    let dentroAspas = false;
-    let atual = '';
-    for (let i = 0; i < linha.length; i++) {
-      const c = linha[i];
-      if (c === '"') dentroAspas = !dentroAspas;
-      else if (c === delim && !dentroAspas) {
-        valores.push(atual.trim());
-        atual = '';
-      } else {
-        atual += c;
-      }
-    }
-    valores.push(atual.trim());
-    return valores;
-  });
-}
-
-function obterArquivoMaisRecenteRecursivo(pasta) {
-  let maisRecente = null;
-  let maiorTime = 0;
-
-  function vasculhar(f) {
-    const files = f.getFiles();
-    while (files.hasNext()) {
-      const arq = files.next();
-      const nome = arq.getName();
-      if (nome.startsWith('~') || nome.startsWith('.')) continue;
-      const t = arq.getLastUpdated().getTime();
-      if (t > maiorTime) {
-        maiorTime = t;
-        maisRecente = arq;
-      }
-    }
-    const sub = f.getFolders();
-    while (sub.hasNext()) vasculhar(sub.next());
-  }
-
-  vasculhar(pasta);
-  return maisRecente;
 }

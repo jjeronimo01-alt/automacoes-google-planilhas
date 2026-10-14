@@ -1,8 +1,15 @@
 /**
  * =========================================================================
- * DASHBOARD GESTÃO - JC FIVELAS E TIRAS
- * Módulo Mensal: Automação em Lote (Append-Only / Upsert Período Corrente)
- * Com Gravação Fatiada para Preservação de Fórmulas Dinâmicas
+ * DASHBOARD GESTÃO - MÓDULO MENSAL (Lanc_Mensal.gs)
+ * Automação em Lote com Preservação das Fórmulas Dinâmicas
+ * Colunas Escritas pelo Script: A, E..J, L, N..P, S..U
+ * Colunas Preservadas para Fórmulas (MAP/ARRAYFORMULA): B, C, D, K, M, Q, R, V
+ * Requer o arquivo Utils.gs no mesmo projeto Apps Script.
+ * -------------------------------------------------------------------------
+ * REGISTRO DE TRANSIÇÃO TRIBUTÁRIA (ROADMAP DE GESTÃO):
+ * - Janela Planejada de Desenquadramento MEI -> ME: Maio/2027 a Junho/2027.
+ * - Até lá, mantém provisão fixa do MEI (R$ 82,05). Na virada de Maio/Junho de 2027,
+ *   alterar a flag isRegimeMei para calcular via Alíquota Efetiva do Simples (Coluna U).
  * =========================================================================
  */
 const CONFIG_MENSAL = {
@@ -10,7 +17,6 @@ const CONFIG_MENSAL = {
   SHEET_DIARIO: 'Lanc_Diario',
   SHEET_MENSAL: 'Lanc_Mensal',
 
-  // Novas Pastas Multi-Depósito (Conectadas aos armazéns)
   FOLDER_ESTOQUE_PRINCIPAL_ID: '1ReghJfwz3oS4fEtC6vUCl1sWQpAqIgtw',
   FOLDER_ESTOQUE_FULL_ML_ID: '1PQbqgL-ZxoSdtUam0m4O8y86qKFhscLy',
   FOLDER_ESTOQUE_FULL_AMAZON_ID: '1Br1znG56j1eeOWoQ16rAv_F3kNsF6MXc',
@@ -19,7 +25,7 @@ const CONFIG_MENSAL = {
   FOLDER_CONTAS_RECEBER_ID: '1xvN-nrVrjBSogvVzqHg87AVNHrVLLG9u',
   FOLDER_CATEGORIAS_ID: '1flEEX7RJQqgxbaQ5BMLLInuEWQMxZr01',
   FOLDER_NOTAS_ENTRADA_ID: '103Kmu7cK9mEPQlLj6LR45iYzw8oNiZ_B',
-  FOLDER_ADS_ID_AMZ: '1xBS1AMFHwVenIYpHKtUad9-uP3e232hY', 
+  FOLDER_ADS_ID_AMZ: '1xBS1AMFHwVenIYpHKtUad9-uP3e232hY',
   FOLDER_ADS_ID_ML: '1sp0YrEJe6qh9Z6gqfayEZuu12uD2YgAq',
   FOLDER_FINANCEIRO_AMAZON_ID: '1ZLZeoCqCKP1vfKMl3v_p0BBalbiFzV8H',
   FOLDER_ML_VENDAS_ID: '1eek1wEcGgqV6wYO_E2QVVJfaZM_mySoY',
@@ -27,21 +33,21 @@ const CONFIG_MENSAL = {
 };
 
 /**
- * Rotina normal de processamento mensal (Upsert)
+ * Rotina normal (Processa janela recente de 2 meses: mês anterior + mês atual)
  */
 function executarRotinaMensal() {
   executarMotorLancamentoMensal(false);
 }
 
 /**
- * Reprocessa todo o histórico mensal desde o início
+ * Reprocessa todo o histórico mensal desde Setembro/2026
  */
 function reprocessarTodoHistoricoMensal() {
   executarMotorLancamentoMensal(true);
 }
 
 function executarMotorLancamentoMensal(reprocessarTudo) {
-  Logger.log(`=== INICIANDO ROTINA DE LANÇAMENTO MENSAL (${reprocessarTudo ? 'HISTÓRICO COMPLETO' : 'UPSERT REGULAR'}) ===`);
+  Logger.log(`=== INICIANDO ROTINA MENSAL (${reprocessarTudo ? 'HISTÓRICO COMPLETO' : 'JANELA 2 MESES'}) ===`);
 
   const ss = SpreadsheetApp.openById(CONFIG_MENSAL.SPREADSHEET_ID);
   const sheetMensal = ss.getSheetByName(CONFIG_MENSAL.SHEET_MENSAL);
@@ -51,34 +57,38 @@ function executarMotorLancamentoMensal(reprocessarTudo) {
   if (!sheetDiario) throw new Error(`Aba "${CONFIG_MENSAL.SHEET_DIARIO}" não encontrada.`);
 
   let { mapaMesesExistentes, proximaLinhaLivre } = mapearMesesExistentes(sheetMensal);
-  Logger.log(`Meses já registrados na planilha: ${Object.keys(mapaMesesExistentes).join(', ') || 'Nenhum'}`);
+  const resumoDiario = consolidarMetricasDiario(sheetDiario);
 
   const hoje = new Date();
   const mesAtualIso = Utilities.formatDate(hoje, "GMT-0300", 'yyyy-MM');
+  const mesInicioHistorico = '2026-09';
 
-  const mesesParaProcessar = [];
-  const mesInicio = '2026-09';
+  let dLoop = parseMesIso(mesInicioHistorico);
+  if (!reprocessarTudo) {
+    const dMesAnterior = parseMesIso(mesAtualIso);
+    dMesAnterior.setMonth(dMesAnterior.getMonth() - 1);
+    if (dMesAnterior > dLoop) {
+      dLoop = dMesAnterior;
+    }
+  }
 
-  let dLoop = parseMesIso(mesInicio);
   const dFim = parseMesIso(mesAtualIso);
+  const mesesParaProcessar = [];
 
   while (dLoop <= dFim) {
     mesesParaProcessar.push(Utilities.formatDate(dLoop, "GMT-0300", 'yyyy-MM'));
     dLoop.setMonth(dLoop.getMonth() + 1);
   }
 
-  Logger.log(`Meses elegíveis: ${mesesParaProcessar.join(' | ')}`);
-
-  const resumoDiario = consolidarMetricasDiario(sheetDiario);
+  Logger.log(`Meses no escopo: ${mesesParaProcessar.join(' | ')}`);
 
   mesesParaProcessar.forEach(mesIso => {
     const isMesCorrente = (mesIso === mesAtualIso);
-    Logger.log(`---> Processando Mês: ${mesIso} ${isMesCorrente ? '[MÊS CORRENTE]' : '[FECHAMENTO]'} <---`);
+    const [anoNum, mesNum] = mesIso.split('-').map(Number);
+    const dataPrimeiroDiaMes = new Date(anoNum, mesNum - 1, 1);
+    const diasNoMes = new Date(anoNum, mesNum, 0).getDate();
 
-    const rotuloMes = formatarMesRotulo(mesIso);
-    const diasNoMes = new Date(Number(mesIso.split('-')[0]), Number(mesIso.split('-')[1]), 0).getDate();
-
-    const dadosDia = resumoDiario[mesIso] || { faturamento: 0, margemContrib: 0, cmv: 0, custosVariaveis: 0 };
+    const dadosDia = resumoDiario[mesIso] || { faturamento: 0, devolucoes: 0, margemContrib: 0, cmv: 0, custosVariaveis: 0 };
     const { totalCompras: totalComprasNfe, setNfs: setNfValidasMes } = processarComprasNfeEntrada(mesIso);
     const mapaCategorias = processarCategoriasERP(mesIso);
     const { despFixas, custOperacionais, custPessoal, custFinanceiros, impostos, duplicatasCompras } = processarContasPagar(mesIso, mapaCategorias, setNfValidasMes);
@@ -89,7 +99,7 @@ function executarMotorLancamentoMensal(reprocessarTudo) {
     });
     const pmpDias = totalComprasNfe > 0 ? Math.round(somaPonderadaPrazo / totalComprasNfe) : 0;
 
-    // Despesas Variáveis: Diário + Ads Consolidado (Amazon + Mercado Livre)
+    // Despesas Variáveis (Coluna F): Custos Variáveis do Lanc_Diario + Ads do Mês
     const adsTotalMes = processarAdsMensal(mesIso);
     const totalDespesasVariaveis = dadosDia.custosVariaveis + adsTotalMes;
 
@@ -101,32 +111,32 @@ function executarMotorLancamentoMensal(reprocessarTudo) {
     const rbt12 = calcularRbt12(resumoDiario, mesIso);
     const aliquotaSimples = calcularAliquotaEfetivaSimples(rbt12);
 
+    // Provisão de Impostos por Competência (Sem duplicar guia DAS MEI)
     let impostosCompetencia = 0;
     const isRegimeMei = (rbt12 <= 81000);
-    if (isRegimeMei) {
-      impostosCompetencia = 82.05;
-    } else {
-      impostosCompetencia = dadosDia.faturamento * aliquotaSimples;
+    if (dadosDia.faturamento > 0 || !isMesCorrente) {
+      if (isRegimeMei) {
+        impostosCompetencia = 82.05;
+      } else {
+        impostosCompetencia = dadosDia.faturamento * aliquotaSimples;
+      }
     }
 
     let linhaDestino = mapaMesesExistentes[mesIso];
-    let isAtualizacao = true;
-
     if (!linhaDestino) {
       linhaDestino = proximaLinhaLivre;
       mapaMesesExistentes[mesIso] = linhaDestino;
       proximaLinhaLivre++;
-      isAtualizacao = false;
     }
 
-    Logger.log(`${isAtualizacao ? '♻️ Atualizando' : '➕ Inserindo'} mês ${mesIso} na Linha ${linhaDestino}...`);
+    // Bloco 1A: Coluna A (1) -> Data de 1º do mês (compatível com as fórmulas MAP de B, C e D)
+    sheetMensal.getRange(linhaDestino, 1, 1, 1).setValue(dataPrimeiroDiaMes);
 
-    // Bloco 1: Colunas A até J (1 a 10)
-    sheetMensal.getRange(linhaDestino, 1, 1, 10).setValues([[
-      rotuloMes,
-      dadosDia.faturamento,
-      dadosDia.margemContrib,
-      dadosDia.cmv,
+    // ATENÇÃO: Colunas B (2), C (3) e D (4) NÃO SÃO TOCADAS PELO SCRIPT!
+    // Elas são preenchidas automaticamente pelas fórmulas MAP da Linha 4.
+
+    // Bloco 1B: Colunas E até J (5 a 10) -> [Desp. Fixas, Desp. Variáveis, Custos Operac., Pessoal, Financeiro, Impostos]
+    sheetMensal.getRange(linhaDestino, 5, 1, 6).setValues([[
       despFixas,
       totalDespesasVariaveis,
       custOperacionais,
@@ -148,11 +158,13 @@ function executarMotorLancamentoMensal(reprocessarTudo) {
       aliquotaSimples
     ]]);
 
+    // Formatação limpa e preservação de tipos numéricos puros
     sheetMensal.getRange(linhaDestino, 1, 1, 22).setVerticalAlignment('middle');
-    sheetMensal.getRange(linhaDestino, 1, 1, 1).setHorizontalAlignment('center');
+    sheetMensal.getRange(linhaDestino, 1, 1, 1).setHorizontalAlignment('center').setNumberFormat('mmm./yyyy');
     sheetMensal.getRange(linhaDestino, 2, 1, 12).setHorizontalAlignment('right').setNumberFormat('R$ #,##0.00');
+    sheetMensal.getRange(linhaDestino, 14, 1, 4).setHorizontalAlignment('center').setNumberFormat('0');
+    sheetMensal.getRange(linhaDestino, 18, 1, 1).setHorizontalAlignment('center');
     sheetMensal.getRange(linhaDestino, 19, 1, 2).setHorizontalAlignment('right').setNumberFormat('R$ #,##0.00');
-    sheetMensal.getRange(linhaDestino, 14, 1, 5).setHorizontalAlignment('center').setNumberFormat('#,##0');
     sheetMensal.getRange(linhaDestino, 21, 1, 1).setHorizontalAlignment('center').setNumberFormat('0.00%');
     sheetMensal.getRange(linhaDestino, 22, 1, 1).setHorizontalAlignment('center');
   });
@@ -165,24 +177,26 @@ function consolidarMetricasDiario(sheetDiario) {
   const maxRows = sheetDiario.getLastRow();
   if (maxRows < 4) return {};
 
-  const dados = sheetDiario.getRange(4, 1, maxRows - 3, 9).getValues();
+  const datasDisplay = sheetDiario.getRange(4, 1, maxRows - 3, 1).getDisplayValues();
+  const dadosNumericos = sheetDiario.getRange(4, 1, maxRows - 3, 9).getValues();
   const resumo = {};
 
-  dados.forEach(linha => {
-    const rawData = linha[0];
+  for (let i = 0; i < dadosNumericos.length; i++) {
+    const rawData = datasDisplay[i][0] || dadosNumericos[i][0];
     const dataIso = normalizarDataChave(rawData);
-    if (!dataIso) return;
+    if (!dataIso) continue;
 
     const anoMes = dataIso.substring(0, 7);
     if (!resumo[anoMes]) {
-      resumo[anoMes] = { faturamento: 0, margemContrib: 0, cmv: 0, custosVariaveis: 0 };
+      resumo[anoMes] = { faturamento: 0, devolucoes: 0, margemContrib: 0, cmv: 0, custosVariaveis: 0 };
     }
 
-    resumo[anoMes].faturamento += limparNumero(linha[2]);
-    resumo[anoMes].cmv += limparNumero(linha[6]);
-    resumo[anoMes].custosVariaveis += limparNumero(linha[7]);
-    resumo[anoMes].margemContrib += limparNumero(linha[8]);
-  });
+    resumo[anoMes].faturamento += limparNumero(dadosNumericos[i][2]);
+    resumo[anoMes].devolucoes += limparNumero(dadosNumericos[i][4]);
+    resumo[anoMes].cmv += limparNumero(dadosNumericos[i][6]);
+    resumo[anoMes].custosVariaveis += limparNumero(dadosNumericos[i][7]);
+    resumo[anoMes].margemContrib += limparNumero(dadosNumericos[i][8]);
+  };
 
   return resumo;
 }
@@ -193,21 +207,18 @@ function processarCategoriasERP(mesIso) {
   const mapa = {};
   if (!arq) return mapa;
 
-  const matriz = lerDadosArquivoMensal(arq);
+  const matriz = lerDadosArquivoUnificado(arq);
   if (!matriz || matriz.length <= 1) return mapa;
 
   const idxCab = localizarIndiceCabecalho(matriz, ['descrição', 'descricao', 'grupo']);
   const cabecalho = matriz[idxCab].map(c => String(c).trim().toLowerCase());
-
   const idxDesc = cabecalho.findIndex(c => c.includes('descri'));
   const idxGrupo = cabecalho.findIndex(c => c.includes('grupo'));
 
   for (let i = idxCab + 1; i < matriz.length; i++) {
     const desc = idxDesc !== -1 ? String(matriz[i][idxDesc]).trim().toLowerCase() : '';
     const grupo = idxGrupo !== -1 ? String(matriz[i][idxGrupo]).trim().toLowerCase() : '';
-    if (desc) {
-      mapa[desc] = grupo;
-    }
+    if (desc) mapa[desc] = grupo;
   }
 
   return mapa;
@@ -222,7 +233,7 @@ function processarContasPagar(mesIso, mapaCategorias, setNfValidasMes) {
 
   if (!arq) return { despFixas, custOperacionais, custPessoal, custFinanceiros, impostos, duplicatasCompras };
 
-  const matriz = lerDadosArquivoMensal(arq);
+  const matriz = lerDadosArquivoUnificado(arq);
   if (!matriz || matriz.length <= 1) return { despFixas, custOperacionais, custPessoal, custFinanceiros, impostos, duplicatasCompras };
 
   const idxCab = localizarIndiceCabecalho(matriz, ['categoria', 'vencimento', 'valor', 'pago', 'documento']);
@@ -249,7 +260,7 @@ function processarContasPagar(mesIso, mapaCategorias, setNfValidasMes) {
   for (let i = idxCab + 1; i < matriz.length; i++) {
     const linha = matriz[i];
     const catOriginal = idxCat !== -1 ? String(linha[idxCat]).trim().toLowerCase() : '';
-    
+
     const valorNominal = idxValor !== -1 ? limparNumero(linha[idxValor]) : 0;
     const valorPago = idxPago !== -1 ? limparNumero(linha[idxPago]) : valorNominal;
     if (valorNominal <= 0 && valorPago <= 0) continue;
@@ -282,10 +293,10 @@ function processarContasPagar(mesIso, mapaCategorias, setNfValidasMes) {
       continue;
     }
 
-    const isCompraMercadoria = catOriginal.includes('compra de mercadoria') || 
-                               catOriginal.includes('fornecedor') || 
-                               grupo.includes('custo de mercadoria') || 
-                               grupo.includes('compra') || 
+    const isCompraMercadoria = catOriginal.includes('compra de mercadoria') ||
+                               catOriginal.includes('fornecedor') ||
+                               grupo.includes('custo de mercadoria') ||
+                               grupo.includes('compra') ||
                                grupo.includes('estoque') ||
                                textoCompletoLinha.includes('novapelli');
     if (isCompraMercadoria) continue;
@@ -354,7 +365,7 @@ function processarContasReceber(mesIso) {
   const arq = obterArquivoMaisRecenteOuConsolidado(pasta);
   if (!arq) return 0;
 
-  const matriz = lerDadosArquivoMensal(arq);
+  const matriz = lerDadosArquivoUnificado(arq);
   if (!matriz || matriz.length <= 1) return 0;
 
   let idxCab = -1;
@@ -365,14 +376,12 @@ function processarContasReceber(mesIso) {
       break;
     }
   }
-
   if (idxCab === -1) idxCab = 0;
-  const cabecalho = matriz[idxCab].map(c => String(c).trim().toLowerCase());
 
+  const cabecalho = matriz[idxCab].map(c => String(c).trim().toLowerCase());
   const idxCliente = cabecalho.findIndex(c => c.includes('cliente'));
   const idxHist = cabecalho.findIndex(c => c.includes('histórico') || c.includes('historico'));
   const idxDoc = cabecalho.findIndex(c => c.includes('documento') || c.includes('doc'));
-  
   let idxRecebido = cabecalho.findIndex(c => c === 'recebido' || c.includes('recebido'));
   if (idxRecebido === -1) idxRecebido = 9;
 
@@ -383,18 +392,15 @@ function processarContasReceber(mesIso) {
   for (let i = idxCab + 1; i < matriz.length; i++) {
     const linha = matriz[i];
     const linhaStr = linha.join(' ').toLowerCase();
-
     if (linhaStr.includes('total') || linhaStr.includes('subtotal')) continue;
 
     const hist = idxHist !== -1 ? String(linha[idxHist]).trim() : '';
     const cliente = idxCliente !== -1 ? String(linha[idxCliente]).trim().toUpperCase() : '';
     const doc = idxDoc !== -1 ? String(linha[idxDoc]).trim() : '';
     const valorRecebido = idxRecebido !== -1 ? limparNumero(linha[idxRecebido]) : 0;
-
     if (valorRecebido <= 0) continue;
 
     const matchOc = hist.match(/OC\s*n[ºo°]?\s*([A-Za-z0-9\-_]+)/i);
-
     if (matchOc && matchOc[1]) {
       const numOc = matchOc[1].trim();
       if (!ocsProcessadas.has(numOc)) {
@@ -413,21 +419,17 @@ function processarContasReceber(mesIso) {
   return totalRecebido;
 }
 
-/**
- * Processa Investimento de Ads Mensal Consolidado (Amazon Ads + Mercado Livre Ads)
- */
 function processarAdsMensal(mesIso) {
   let adsAmazon = 0;
   let adsML = 0;
 
-  // 1. Ads Amazon
   try {
     const pastaAmz = obterSubpastaDoMes(CONFIG_MENSAL.FOLDER_ADS_ID_AMZ, mesIso);
     const arqAmz = obterArquivoMaisRecenteOuConsolidado(pastaAmz);
     if (arqAmz) {
-      const matriz = lerDadosArquivoMensal(arqAmz);
+      const matriz = lerDadosArquivoUnificado(arqAmz);
       if (matriz && matriz.length > 1) {
-        let idxCab = localizarIndiceCabecalho(matriz, ['custo total', 'spend', 'investimento', 'gasto']);
+        const idxCab = localizarIndiceCabecalho(matriz, ['custo total', 'spend', 'investimento', 'gasto']);
         const cabecalho = matriz[idxCab].map(c => String(c).trim().toLowerCase());
         const idxCusto = cabecalho.findIndex(c => c.includes('custo total') || c === 'custo' || c.includes('spend'));
 
@@ -440,14 +442,13 @@ function processarAdsMensal(mesIso) {
     Logger.log(`Aviso ao ler Ads Amazon Mensal: ${e.message}`);
   }
 
-  // 2. Ads Mercado Livre (Aba 'Relatório de campanha')
   try {
     const pastaML = obterSubpastaDoMes(CONFIG_MENSAL.FOLDER_ADS_ID_ML, mesIso);
     const arqML = obterArquivoMaisRecenteOuConsolidado(pastaML);
     if (arqML) {
-      const matrizML = lerDadosArquivoMensal(arqML, 'Relatório de campanha');
+      const matrizML = lerDadosArquivoUnificado(arqML, 'Relatório de campanha');
       if (matrizML && matrizML.length > 1) {
-        let idxCab = 1;
+        const idxCab = 1;
         const cab = matrizML[idxCab].map(c => String(c).trim().toLowerCase());
         const idxStatus = cab.findIndex(c => c === 'status');
         const idxInvest = cab.findIndex(c => c.includes('investimento') && !c.includes('acos') && !c.includes('roas'));
@@ -464,9 +465,7 @@ function processarAdsMensal(mesIso) {
     Logger.log(`Aviso ao ler Ads ML Mensal: ${e.message}`);
   }
 
-  const totalAds = adsAmazon + adsML;
-  Logger.log(`Investimento Ads Mês (${mesIso}): Amazon=R$ ${adsAmazon.toFixed(2)} | ML=R$ ${adsML.toFixed(2)} | Total=R$ ${totalAds.toFixed(2)}`);
-  return totalAds;
+  return adsAmazon + adsML;
 }
 
 function calcularEstoqueMedioMensal(mesIso) {
@@ -476,8 +475,8 @@ function calcularEstoqueMedioMensal(mesIso) {
     { nome: 'Full Amazon', id: CONFIG_MENSAL.FOLDER_ESTOQUE_FULL_AMAZON_ID }
   ];
 
-  let somaEstoqueInicioTodosDepositos = 0;
-  let somaEstoqueFimTodosDepositos = 0;
+  let somaEstoqueInicio = 0;
+  let somaEstoqueFim = 0;
 
   function extrairDiaDoNome(nome) {
     const match = nome.match(/(?:estoque[_\s]*)?(\d{1,2})[-_.]\d{1,2}/i);
@@ -491,48 +490,26 @@ function calcularEstoqueMedioMensal(mesIso) {
       const pasta = obterSubpastaDoMes(dep.id, mesIso);
       if (!pasta) return;
 
-      const arquivos = [];
-      function coletarArquivos(f) {
-        const files = f.getFiles();
-        while (files.hasNext()) {
-          const arq = files.next();
-          const nome = arq.getName();
-          if (!nome.startsWith('~') && !nome.startsWith('.')) arquivos.push(arq);
-        }
-        const subs = f.getFolders();
-        while (subs.hasNext()) coletarArquivos(subs.next());
-      }
-      coletarArquivos(pasta);
-
+      const arquivos = obterTodosArquivosRecursivo(pasta);
       if (arquivos.length === 0) return;
 
       arquivos.sort((a, b) => extrairDiaDoNome(a.getName()) - extrairDiaDoNome(b.getName()));
 
-      const arqInicio = arquivos[0];
-      const arqFim = arquivos[arquivos.length - 1];
-
-      const custoInicio = calcularCustoEstoqueArquivo(arqInicio);
-      const custoFim = calcularCustoEstoqueArquivo(arqFim);
-
-      somaEstoqueInicioTodosDepositos += custoInicio;
-      somaEstoqueFimTodosDepositos += custoFim;
+      somaEstoqueInicio += calcularCustoEstoqueArquivo(arquivos[0]);
+      somaEstoqueFim += calcularCustoEstoqueArquivo(arquivos[arquivos.length - 1]);
     } catch (e) {
       Logger.log(`Aviso ao calcular estoque de ${dep.nome}: ${e.message}`);
     }
   });
 
-  let estoqueMedio = 0;
-  if (somaEstoqueInicioTodosDepositos > 0 && somaEstoqueFimTodosDepositos > 0) {
-    estoqueMedio = (somaEstoqueInicioTodosDepositos + somaEstoqueFimTodosDepositos) / 2;
-  } else {
-    estoqueMedio = Math.max(somaEstoqueInicioTodosDepositos, somaEstoqueFimTodosDepositos);
+  if (somaEstoqueInicio > 0 && somaEstoqueFim > 0) {
+    return (somaEstoqueInicio + somaEstoqueFim) / 2;
   }
-
-  return estoqueMedio;
+  return Math.max(somaEstoqueInicio, somaEstoqueFim);
 }
 
 function calcularCustoEstoqueArquivo(arquivo) {
-  const matriz = lerDadosArquivoMensal(arquivo);
+  const matriz = lerDadosArquivoUnificado(arquivo);
   if (!matriz || matriz.length <= 1) return 0;
 
   const cabecalho = matriz[0].map(c => String(c).trim().toLowerCase());
@@ -545,16 +522,13 @@ function calcularCustoEstoqueArquivo(arquivo) {
     somaQtdDisponivel += colDisp !== -1 ? limparNumero(matriz[i][colDisp]) : 0;
   }
 
-  const usarEstoqueFisico = (somaQtdDisponivel === 0 && colFisico !== -1);
-  const colQtdAlvo = usarEstoqueFisico ? colFisico : colDisp;
+  const colQtdAlvo = (somaQtdDisponivel === 0 && colFisico !== -1) ? colFisico : colDisp;
 
   let totalCusto = 0;
   for (let i = 1; i < matriz.length; i++) {
     const qtd = colQtdAlvo !== -1 ? limparNumero(matriz[i][colQtdAlvo]) : 0;
     const custo = colCusto !== -1 ? limparNumero(matriz[i][colCusto]) : 0;
-    if (qtd > 0 && custo > 0) {
-      totalCusto += (qtd * custo);
-    }
+    if (qtd > 0 && custo > 0) totalCusto += (qtd * custo);
   }
   return totalCusto;
 }
@@ -566,12 +540,7 @@ function calcularPmrGeral(mesIso) {
   const somaPonderadaGeral = dadosMl.somaPonderada + dadosAmz.somaPonderada;
   const faturamentoLiquidoGeral = dadosMl.fatLiquido + dadosAmz.fatLiquido;
 
-  let pmrFinal = 0;
-  if (faturamentoLiquidoGeral > 0) {
-    pmrFinal = Math.round(somaPonderadaGeral / faturamentoLiquidoGeral);
-  }
-
-  return pmrFinal;
+  return faturamentoLiquidoGeral > 0 ? Math.round(somaPonderadaGeral / faturamentoLiquidoGeral) : 0;
 }
 
 function calcularPmrMercadoLivre(mesIso) {
@@ -579,18 +548,10 @@ function calcularPmrMercadoLivre(mesIso) {
   const arq = obterArquivoMaisRecenteOuConsolidado(pasta);
   if (!arq) return { somaPonderada: 0, fatLiquido: 0 };
 
-  const matriz = lerDadosArquivoMensal(arq);
+  const matriz = lerDadosArquivoUnificado(arq);
   if (!matriz || matriz.length <= 1) return { somaPonderada: 0, fatLiquido: 0 };
 
-  let idxCab = 0;
-  for (let r = 0; r < Math.min(matriz.length, 15); r++) {
-    const linhaStr = matriz[r].map(c => String(c).trim().toLowerCase()).join(' ');
-    if (linhaStr.includes('order_id') || linhaStr.includes('date_created') || linhaStr.includes('número da venda')) {
-      idxCab = r;
-      break;
-    }
-  }
-
+  const idxCab = localizarIndiceCabecalho(matriz, ['order_id', 'date_created', 'número da venda']);
   const cabecalho = matriz[idxCab].map(c => String(c).trim().toLowerCase());
   const idxOrderId = cabecalho.findIndex(c => c.includes('order_id') || c.includes('número da venda'));
   const idxDataVenda = cabecalho.findIndex(c => c.includes('date_approved') || c.includes('data de creditação') || c.includes('date_created') || c.includes('data da compra'));
@@ -604,16 +565,13 @@ function calcularPmrMercadoLivre(mesIso) {
   for (let i = idxCab + 1; i < matriz.length; i++) {
     const linha = matriz[i];
     const status = idxStatus !== -1 ? String(linha[idxStatus]).toLowerCase().trim() : 'approved';
-    if (status.includes('cancel') || status.includes('refund') || status.includes('rejected')) continue;
+    if (status.includes('cancel') || status.includes('rejected')) continue;
 
     const orderId = idxOrderId !== -1 && linha[idxOrderId] ? String(linha[idxOrderId]).trim() : `item_${i}`;
     if (!orderId || orderId.toLowerCase().includes('total')) continue;
 
-    const rawDataVenda = idxDataVenda !== -1 ? linha[idxDataVenda] : null;
-    const rawDataLib = idxDataLib !== -1 ? linha[idxDataLib] : null;
-
-    const dVendaIso = normalizarDataChave(rawDataVenda);
-    const dLibIso = normalizarDataChave(rawDataLib);
+    const dVendaIso = normalizarDataChave(idxDataVenda !== -1 ? linha[idxDataVenda] : null);
+    const dLibIso = normalizarDataChave(idxDataLib !== -1 ? linha[idxDataLib] : null);
 
     const valorProd = idxValorProd !== -1 ? limparNumero(linha[idxValorProd]) : 0;
     let valorLiq = idxValorLiq !== -1 ? limparNumero(linha[idxValorLiq]) : valorProd;
@@ -656,7 +614,7 @@ function calcularPmrAmazon(mesIso) {
   const arq = obterArquivoMaisRecenteOuConsolidado(pasta);
   if (!arq) return { somaPonderada: 0, fatLiquido: 0 };
 
-  const matriz = lerDadosArquivoMensal(arq);
+  const matriz = lerDadosArquivoUnificado(arq);
   if (!matriz || matriz.length <= 1) return { somaPonderada: 0, fatLiquido: 0 };
 
   let idxCab = -1;
@@ -667,10 +625,9 @@ function calcularPmrAmazon(mesIso) {
       break;
     }
   }
-
   if (idxCab === -1) idxCab = 9;
-  const cabecalho = matriz[idxCab].map(c => String(c).trim().toLowerCase());
 
+  const cabecalho = matriz[idxCab].map(c => String(c).trim().toLowerCase());
   const idxTipo = cabecalho.findIndex(c => c === 'tipo');
   const idxIdPedido = cabecalho.findIndex(c => c.includes('id do pedido') || c.includes('order'));
   const idxDataVenda = cabecalho.findIndex(c => c.includes('data/hora') || c === 'data');
@@ -692,10 +649,8 @@ function calcularPmrAmazon(mesIso) {
     if (tipo !== 'pedido' && !tipo.includes('pagamento do pedido') && tipo !== 'order') continue;
 
     const idPedido = idxIdPedido !== -1 ? String(linha[idxIdPedido]).trim() : `linha_${i}`;
-    const rawDataVenda = idxDataVenda !== -1 ? linha[idxDataVenda] : null;
+    const dVenda = parseDataAmazonExtenso(idxDataVenda !== -1 ? linha[idxDataVenda] : null);
     const rawDataLib = idxDataLib !== -1 ? linha[idxDataLib] : null;
-
-    const dVenda = parseDataAmazonExtenso(rawDataVenda);
     const dLib = (rawDataLib && String(rawDataLib).trim() !== '') ? parseDataAmazonExtenso(rawDataLib) : null;
 
     const valorVenda = idxVendasProd !== -1 ? limparNumero(linha[idxVendasProd]) : 0;
@@ -703,11 +658,10 @@ function calcularPmrAmazon(mesIso) {
     const taxaFba = idxTaxaFba !== -1 ? Math.abs(limparNumero(linha[idxTaxaFba])) : 0;
     const frete = idxFreteOutras !== -1 ? Math.abs(limparNumero(linha[idxFreteOutras])) : 0;
 
-    const comissaoTotal = tarifaVenda + taxaFba;
-    const valorLiquidoItem = valorVenda - (frete + comissaoTotal);
+    const valorLiquidoItem = valorVenda - (frete + tarifaVenda + taxaFba);
 
     if (!pedidosAmazon[idPedido]) {
-      pedidosAmazon[idPedido] = { dVenda: dVenda, dLib: dLib, valorTotalVenda: valorVenda, valorLiquido: valorLiquidoItem };
+      pedidosAmazon[idPedido] = { dVenda, dLib, valorTotalVenda: valorVenda, valorLiquido: valorLiquidoItem };
     } else {
       pedidosAmazon[idPedido].valorTotalVenda += valorVenda;
       pedidosAmazon[idPedido].valorLiquido += valorLiquidoItem;
@@ -736,22 +690,13 @@ function processarComprasNfeEntrada(mesIso) {
   const arq = obterArquivoMaisRecenteOuConsolidado(pasta);
   if (!arq) return { totalCompras: 0, setNfs: new Set() };
 
-  const matriz = lerDadosArquivoMensal(arq);
+  const matriz = lerDadosArquivoUnificado(arq);
   if (!matriz || matriz.length <= 1) return { totalCompras: 0, setNfs: new Set() };
 
-  let idxCab = 0;
-  for (let r = 0; r < Math.min(matriz.length, 10); r++) {
-    const linhaStr = matriz[r].map(c => String(c).trim().toLowerCase()).join(' ');
-    if (linhaStr.includes('nf') || linhaStr.includes('número') || linhaStr.includes('valor')) {
-      idxCab = r;
-      break;
-    }
-  }
-
+  const idxCab = localizarIndiceCabecalho(matriz, ['nf', 'número', 'valor']);
   const cabecalho = matriz[idxCab].map(c => String(c).trim().toLowerCase());
   let idxNumNf = cabecalho.findIndex(c => c.includes('nº nf') || c.includes('no nf') || c.includes('número') || c.includes('numero'));
   if (idxNumNf === -1) idxNumNf = 2;
-
   let idxValorNota = cabecalho.findIndex(c => c.includes('valor da nota') || c.includes('valor nota'));
   if (idxValorNota === -1) idxValorNota = 3;
 
@@ -761,7 +706,6 @@ function processarComprasNfeEntrada(mesIso) {
   for (let i = idxCab + 1; i < matriz.length; i++) {
     const linha = matriz[i];
     const rawNumNf = linha[idxNumNf] ? String(linha[idxNumNf]).trim() : '';
-
     if (!rawNumNf || rawNumNf.toLowerCase().includes('total') || isNaN(limparNumero(rawNumNf))) continue;
     if (setNfs.has(rawNumNf)) continue;
 
@@ -780,12 +724,11 @@ function processarFluxoCaixa90d(mesIso) {
   const arq = obterArquivoMaisRecenteOuConsolidado(pasta);
   if (!arq) return 0;
 
-  const matriz = lerDadosArquivoMensal(arq);
+  const matriz = lerDadosArquivoUnificado(arq);
   if (!matriz || matriz.length <= 1) return 0;
 
   const idxCab = localizarIndiceCabecalho(matriz, ['tipo', 'grupo', 'categoria']);
   const cabecalho = matriz[idxCab].map(c => String(c).trim().toLowerCase());
-  
   const idxTipo = cabecalho.findIndex(c => c === 'tipo');
   const idxCat = cabecalho.findIndex(c => c === 'categoria');
   const ultimaColIdx = matriz[0].length - 1;
@@ -807,21 +750,6 @@ function processarFluxoCaixa90d(mesIso) {
   }
 
   return (totalReceitas - totalDespesas);
-}
-
-function limparNumeroComSinal(val) {
-  if (val === null || val === undefined || val === '') return 0;
-  if (typeof val === 'number') return val;
-  let str = String(val).replace('R$', '').replace(/\s/g, '').trim();
-  const isNegativo = str.includes('-') || (str.startsWith('(') && str.endsWith(')'));
-  str = str.replace(/[()\-]/g, '');
-
-  if (str.includes(',') && str.includes('.')) str = str.replace(/\./g, '').replace(',', '.');
-  else if (str.includes(',')) str = str.replace(',', '.');
-
-  const num = parseFloat(str);
-  if (isNaN(num)) return 0;
-  return isNegativo ? -num : num;
 }
 
 function calcularRbt12(resumoDiario, mesAtualIso) {
@@ -862,13 +790,14 @@ function calcularAliquotaEfetivaSimples(rbt12) {
 }
 
 function mapearMesesExistentes(sheet) {
-  const maxRows = sheet.getMaxRows();
-  const valoresA = sheet.getRange(1, 1, maxRows, 1).getValues();
+  const maxRows = Math.max(sheet.getLastRow(), 20);
+  const valoresDisplayA = sheet.getRange(1, 1, maxRows, 1).getDisplayValues();
+  const valoresRawA = sheet.getRange(1, 1, maxRows, 1).getValues();
   const mapa = {};
   let ultimaLinhaComDadoReal = 3;
 
-  for (let r = 3; r < valoresA.length; r++) {
-    const rawVal = valoresA[r][0];
+  for (let r = 3; r < valoresRawA.length; r++) {
+    const rawVal = valoresRawA[r][0] || valoresDisplayA[r][0];
     if (rawVal) {
       const mesIso = converterRotuloParaIso(rawVal);
       if (mesIso) {
@@ -880,245 +809,4 @@ function mapearMesesExistentes(sheet) {
 
   const proximaLinha = Math.max(ultimaLinhaComDadoReal + 1, 4);
   return { mapaMesesExistentes: mapa, proximaLinhaLivre: proximaLinha };
-}
-
-function obterSubpastaDoMes(idPastaRaiz, mesIso) {
-  const pastaRaiz = DriveApp.getFolderById(idPastaRaiz);
-  const [ano, mesNum] = mesIso.split('-');
-  const mesesNomes = ['janeiro', 'fevereiro', 'março', 'marco', 'abril', 'maio', 'junho', 'julho', 'agosto', 'setembro', 'outubro', 'novembro', 'dezembro'];
-  const nomeMesAlvo = mesesNomes[parseInt(mesNum, 10) - 1];
-
-  const subpastas = pastaRaiz.getFolders();
-  while (subpastas.hasNext()) {
-    const sub = subpastas.next();
-    const nomeSub = sub.getName().toLowerCase();
-    if (nomeSub.includes(mesIso) || (nomeSub.includes(nomeMesAlvo) && nomeSub.includes(ano)) || nomeSub.includes(`${mesNum}/${ano}`) || nomeSub.includes(`${mesNum}-${ano}`)) {
-      return sub;
-    }
-  }
-
-  return pastaRaiz;
-}
-
-function obterArquivoMaisRecenteOuConsolidado(pasta) {
-  let melhorArquivo = null;
-  let maiorTime = 0;
-
-  function vasculhar(f) {
-    const files = f.getFiles();
-    while (files.hasNext()) {
-      const arq = files.next();
-      const nome = arq.getName().toLowerCase();
-      if (nome.startsWith('~') || nome.startsWith('.')) continue;
-
-      if (nome.includes('consolidado') || nome.includes('mensal')) return arq;
-
-      const t = arq.getLastUpdated().getTime();
-      if (t > maiorTime) {
-        maiorTime = t;
-        melhorArquivo = arq;
-      }
-    }
-    const subs = f.getFolders();
-    while (subs.hasNext()) {
-      const arqConsol = vasculhar(subs.next());
-      if (arqConsol) return arqConsol;
-    }
-    return null;
-  }
-
-  const arquivoConsolidado = vasculhar(pasta);
-  return arquivoConsolidado || melhorArquivo;
-}
-
-function formatarMesRotulo(mesIso) {
-  const [y, m] = mesIso.split('-');
-  const mesesAbrev = ['jan.', 'fev.', 'mar.', 'abr.', 'mai.', 'jun.', 'jul.', 'ago.', 'set.', 'out.', 'nov.', 'dez.'];
-  return `${mesesAbrev[parseInt(m, 10) - 1]}/${y}`;
-}
-
-/**
- * Converte rótulo textual ('set./2026'), string ISO ('2026-09-01') ou objeto Date em chave 'YYYY-MM'
- */
-function converterRotuloParaIso(valor) {
-  if (!valor) return null;
-  if (valor instanceof Date) {
-    return Utilities.formatDate(valor, "GMT-0300", 'yyyy-MM');
-  }
-  let str = String(valor).trim();
-  if (/^\d{4}-\d{2}/.test(str)) {
-    return str.substring(0, 7);
-  }
-  const mesesMap = { 'jan': '01', 'fev': '02', 'mar': '03', 'abr': '04', 'mai': '05', 'jun': '06', 'jul': '07', 'ago': '08', 'set': '09', 'out': '10', 'nov': '11', 'dez': '12' };
-  const limpo = str.replace('.', '').replace('/', ' ').trim();
-  const partes = limpo.split(' ');
-  if (partes.length === 2) {
-    const mStr = partes[0].substring(0, 3).toLowerCase();
-    const yStr = partes[1];
-    if (mesesMap[mStr]) return `${yStr}-${mesesMap[mStr]}`;
-  }
-  return null;
-}
-
-function parseMesIso(mesIso) {
-  const [y, m] = mesIso.split('-').map(Number);
-  return new Date(y, m - 1, 1);
-}
-
-function parseDataIso(strIso) {
-  const [y, m, d] = strIso.split('-').map(Number);
-  return new Date(y, m - 1, d);
-}
-
-function normalizarDataChave(valor) {
-  if (!valor) return null;
-  if (valor instanceof Date) {
-    return Utilities.formatDate(valor, "GMT-0300", 'yyyy-MM-dd');
-  }
-  let str = String(valor).trim().split(' ')[0].split('T')[0];
-  if (/^\d{1,2}\/\d{1,2}\/\d{4}$/.test(str)) {
-    const [d, m, y] = str.split('/');
-    return `${y}-${m.padStart(2, '0')}-${d.padStart(2, '0')}`;
-  }
-  if (/^\d{1,2}\/\d{1,2}\/\d{2}$/.test(str)) {
-    const [d, m, y] = str.split('/');
-    return `20${y}-${m.padStart(2, '0')}-${d.padStart(2, '0')}`;
-  }
-  if (/^\d{4}-\d{1,2}-\d{1,2}$/.test(str)) {
-    const [y, m, d] = str.split('-');
-    return `${y}-${m.padStart(2, '0')}-${d.padStart(2, '0')}`;
-  }
-  return null;
-}
-
-function limparNumero(val) {
-  if (val === null || val === undefined || val === '') return 0;
-  if (typeof val === 'number') return val;
-  let str = String(val).replace('R$', '').replace(/\s/g, '').trim();
-  if (str.includes(',') && str.includes('.')) str = str.replace(/\./g, '').replace(',', '.');
-  else if (str.includes(',')) str = str.replace(',', '.');
-  const num = parseFloat(str);
-  return isNaN(num) ? 0 : num;
-}
-
-function localizarIndiceCabecalho(matriz, termosChave) {
-  for (let r = 0; r < Math.min(matriz.length, 25); r++) {
-    const linhaStr = matriz[r].map(c => String(c).trim().toLowerCase()).join(' ');
-    for (let t = 0; t < termosChave.length; t++) {
-      if (linhaStr.includes(termosChave[t])) return r;
-    }
-  }
-  return 0;
-}
-
-function lerDadosArquivoMensal(arquivo, nomeAba) {
-  if (!arquivo) return null;
-  const mimeType = arquivo.getMimeType();
-  const nome = arquivo.getName().toLowerCase();
-
-  if (mimeType === MimeType.GOOGLE_SHEETS) {
-    const ss = SpreadsheetApp.openById(arquivo.getId());
-    let sheet = null;
-    if (nomeAba) {
-      sheet = ss.getSheetByName(nomeAba) || ss.getSheets().find(s => s.getName().toLowerCase().includes(nomeAba.toLowerCase()));
-    }
-    if (!sheet) sheet = ss.getSheets()[0];
-    return sheet.getDataRange().getValues();
-  }
-
-  if (nome.endsWith('.xlsx') || nome.endsWith('.xls') || mimeType.includes('spreadsheetml') || mimeType.includes('ms-excel')) {
-    let tempFileId = null;
-    try {
-      const blob = arquivo.getBlob();
-      const recurso = {
-        title: "temp_convert_" + new Date().getTime(),
-        mimeType: MimeType.GOOGLE_SHEETS
-      };
-      const fileInserido = Drive.Files.insert(recurso, blob, { convert: true });
-      tempFileId = fileInserido.id;
-
-      const ssConvertida = SpreadsheetApp.openById(tempFileId);
-      const todasAbas = ssConvertida.getSheets();
-      let abaAlvo = null;
-
-      if (nomeAba) {
-        const nomeNorm = nomeAba.toLowerCase().normalize("NFD").replace(/[\u0300-\u036f]/g, "").trim();
-        abaAlvo = todasAbas.find(s => {
-          const sNorm = s.getName().toLowerCase().normalize("NFD").replace(/[\u0300-\u036f]/g, "").trim();
-          return sNorm.includes("campanha") || sNorm.includes("relat") || sNorm === nomeNorm;
-        });
-      }
-      if (!abaAlvo && todasAbas.length >= 3) abaAlvo = todasAbas[2];
-      if (!abaAlvo) abaAlvo = todasAbas[0];
-
-      return abaAlvo.getDataRange().getValues();
-    } catch (e) {
-      Logger.log("Erro na conversão automática do XLSX: " + e.message);
-    } finally {
-      if (tempFileId) {
-        try { Drive.Files.remove(tempFileId); } catch (ex) {}
-      }
-    }
-  }
-
-  let texto = '';
-  try {
-    texto = arquivo.getBlob().getDataAsString('UTF-8');
-  } catch (e) {
-    texto = arquivo.getBlob().getDataAsString('ISO-8859-1');
-  }
-
-  const linhas = texto.split(/\r?\n/).filter(l => l.trim().length > 0);
-  if (linhas.length === 0) return [];
-
-  let maxVirgula = 0, maxPontoVirgula = 0, maxTab = 0;
-  for (let r = 0; r < Math.min(linhas.length, 15); r++) {
-    maxVirgula = Math.max(maxVirgula, (linhas[r].match(/,/g) || []).length);
-    maxPontoVirgula = Math.max(maxPontoVirgula, (linhas[r].match(/;/g) || []).length);
-    maxTab = Math.max(maxTab, (linhas[r].match(/\t/g) || []).length);
-  }
-
-  let delim = ',';
-  if (maxTab > maxVirgula && maxTab > maxPontoVirgula) delim = '\t';
-  else if (maxPontoVirgula >= maxVirgula) delim = ';';
-
-  return linhas.map(linha => {
-    const valores = [];
-    let dentroAspas = false;
-    let atual = '';
-    for (let i = 0; i < linha.length; i++) {
-      const c = linha[i];
-      if (c === '"') dentroAspas = !dentroAspas;
-      else if (c === delim && !dentroAspas) {
-        valores.push(atual.trim());
-        atual = '';
-      } else {
-        atual += c;
-      }
-    }
-    valores.push(atual.trim());
-    return valores;
-  });
-}
-
-function parseDataAmazonExtenso(textoData) {
-  if (!textoData) return null;
-  if (textoData instanceof Date) return textoData;
-
-  const mesesMap = { 'jan': 0, 'fev': 1, 'mar': 2, 'abr': 3, 'mai': 4, 'jun': 5, 'jul': 6, 'ago': 7, 'set': 8, 'out': 9, 'nov': 10, 'dez': 11 };
-  const limpo = String(textoData).toLowerCase().replace(/de/g, ' ').replace(/\./g, ' ').trim();
-  const partes = limpo.split(/\s+/);
-
-  if (partes.length >= 3) {
-    const dia = parseInt(partes[0], 10);
-    const mesStr = partes[1].substring(0, 3);
-    const ano = parseInt(partes[2], 10);
-
-    if (!isNaN(dia) && mesesMap[mesStr] !== undefined && !isNaN(ano)) {
-      return new Date(ano, mesesMap[mesStr], dia);
-    }
-  }
-
-  const isoStr = normalizarDataChave(textoData);
-  return isoStr ? parseDataIso(isoStr) : null;
 }
