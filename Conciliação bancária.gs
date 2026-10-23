@@ -596,109 +596,131 @@ function baixarTitulosNoTiny(modoTeste) {
   var tinyToken = props.getProperty('TINY_API_TOKEN');
   if (!tinyToken) throw new Error('Token do Tiny não configurado no Cofre.');
 
-  // Recupera os IDs numéricos salvos
-  var idContaMp = parseInt(props.getProperty('ID_CONTA_MERCADO_PAGO'), 10);
-  var idContaAmz = parseInt(props.getProperty('ID_CONTA_AMAZON'), 10);
-
   var ss = SpreadsheetApp.getActiveSpreadsheet();
   var abaCentral = ss.getSheetByName('4_Central_Conciliacao_Tiny');
-  var abaParam = ss.getSheetByName('1_Parametros_Auditoria');
-
-  if (abaParam) {
-    var pDados = abaParam.getDataRange().getValues();
-    for (var p = 1; p < pDados.length; p++) {
-      if (pDados[p][0] === 'ID_CONTA_MERCADO_PAGO' && pDados[p][1]) idContaMp = parseInt(pDados[p][1], 10);
-      if (pDados[p][0] === 'ID_CONTA_AMAZON' && pDados[p][1]) idContaAmz = parseInt(pDados[p][1], 10);
-    }
-  }
 
   var dados = abaCentral.getDataRange().getValues();
   var displayDados = abaCentral.getDataRange().getDisplayValues();
   var limite = modoTeste ? 5 : 9999;
-  var baixados = 0;
+  var processados = 0;
 
   for (var i = 1; i < dados.length; i++) {
-    if (baixados >= limite) break;
+    if (processados >= limite) break;
     var statusConc = dados[i][12] ? dados[i][12].toString() : '';
     var statusProc = dados[i][13] ? dados[i][13].toString() : '';
 
-    if (statusConc.indexOf('🟢') === -1 || statusProc.indexOf('✅ BAIXADO') !== -1) continue;
+    // Ignora títulos bloqueados por reembolso (🔴) ou já finalizados nesta sessão
+    if (statusConc.indexOf('🔴') !== -1 || statusProc.indexOf('✅') !== -1) continue;
 
     var idTitulo = dados[i][0].toString().trim();
     var canal = dados[i][1].toString().trim();
-    
-    var dataBaixaBruta = displayDados[i][6] || dados[i][6];
-    var dataBaixa = formatarDataParaTinyBR(dataBaixaBruta);
-    if (!dataBaixa || dataBaixa.length < 10) {
-      dataBaixa = Utilities.formatDate(new Date(), Session.getScriptTimeZone(), 'dd/MM/yyyy');
+    if (!idTitulo) continue;
+
+    var dataRepasseBruta = displayDados[i][6] || dados[i][6];
+    var dataRepasse = formatarDataParaTinyBR(dataRepasseBruta);
+    if (!dataRepasse || dataRepasse.length < 10) {
+      dataRepasse = Utilities.formatDate(new Date(), Session.getScriptTimeZone(), 'dd/MM/yyyy');
     }
 
     var valorDoc = parseFloat(dados[i][7]) || 0;
-    var taxaDescontada = parseFloat(dados[i][10]) || 0;
-    var liquidoRecebido = valorDoc - taxaDescontada;
+    var taxaDescontada = Math.round((parseFloat(dados[i][10]) || 0) * 100) / 100;
+    var liquidoRecebido = Math.round((valorDoc - taxaDescontada) * 100) / 100;
 
     var isAmazon = (canal.toUpperCase().indexOf('AMAZON') !== -1);
-    var idBancoDestino = isAmazon ? idContaAmz : idContaMp;
-    var nomeBancoDestino = isAmazon ? 'AMAZON' : 'MERCADO PAGO';
+    // Nome exato da conta destino conforme cadastrado no Tiny ERP
+    var nomeContaDestino = isAmazon ? 'AMAZON' : 'MERCADO PAGO';
 
-    // ESTRUTURA CORRIGIDA:
-    // - 'valor': valor total a liquidar do título
-    // - 'desconto': taxa de frete + comissão que o Tiny subtrai para gerar o líquido no banco
-    // - 'id_conta_corrente': número inteiro que força a gravação no banco correto
-    var dadosConta = {
-      id: idTitulo,
-      data: dataBaixa,
-      valor: valorDoc.toFixed(2),
-      desconto: taxaDescontada.toFixed(2),
-      taxa: taxaDescontada.toFixed(2),
-      juros: "0.00",
-      id_conta_corrente: idBancoDestino,
-      conta_corrente: nomeBancoDestino
-    };
-
-    var payload = {
-      token: tinyToken,
-      formato: 'json',
-      conta: JSON.stringify({ conta: dadosConta })
-    };
-
-    var resp = UrlFetchApp.fetch('https://api.tiny.com.br/api2/conta.receber.baixar.php', {
-      method: 'post',
-      payload: payload,
-      muteHttpExceptions: true
-    });
-
-    var resJson = JSON.parse(resp.getContentText());
-    var respostaStr = JSON.stringify(resJson).toLowerCase();
-
-    // AUTO-ESTORNO: se o título constar como baixado no Nubank anteriormente, estorna e repete a baixa corrigida
-    if (respostaStr.indexOf('baixada') !== -1 || respostaStr.indexOf('liquidada') !== -1 || respostaStr.indexOf('ja se encontra') !== -1) {
+    // =========================================================================
+    // ETAPA A: Se a conta já estiver baixada no Tiny (do teste anterior no Nubank),
+    // faz o estorno primeiro para que ela volte a ficar "Em aberto"
+    // =========================================================================
+    if (statusConc.indexOf('🟢') !== -1) {
       UrlFetchApp.fetch('https://api.tiny.com.br/api2/conta.receber.estornar.php', {
         method: 'post',
         payload: { token: tinyToken, id: idTitulo, formato: 'json' },
         muteHttpExceptions: true
       });
-      Utilities.sleep(1000);
-
-      resp = UrlFetchApp.fetch('https://api.tiny.com.br/api2/conta.receber.baixar.php', {
-        method: 'post',
-        payload: payload,
-        muteHttpExceptions: true
-      });
-      resJson = JSON.parse(resp.getContentText());
+      Utilities.sleep(600);
     }
+
+    // =========================================================================
+    // ETAPA B: Atualiza Vencimento e Taxa no cadastro do título (conta.receber.alterar.php)
+    // Documentação oficial Tiny: campos 'id', 'vencimento' e 'taxa'
+    // =========================================================================
+    var payloadAlterar = {
+      token: tinyToken,
+      formato: 'json',
+      conta: JSON.stringify({
+        conta: {
+          id: Number(idTitulo),
+          vencimento: dataRepasse,
+          taxa: Number(taxaDescontada.toFixed(2))
+        }
+      })
+    };
+
+    var respAlt = UrlFetchApp.fetch('https://api.tiny.com.br/api2/conta.receber.alterar.php', {
+      method: 'post',
+      payload: payloadAlterar,
+      muteHttpExceptions: true
+    });
+    var jsonAlt = JSON.parse(respAlt.getContentText());
+    Utilities.sleep(600);
+
+    // Se o pedido ainda NÃO foi repassado (🟡 DIFERIDO), para aqui após atualizar vencimento e taxa!
+    if (statusConc.indexOf('🟡') !== -1) {
+      if (jsonAlt.retorno && jsonAlt.retorno.status === 'OK') {
+        abaCentral.getRange(i + 1, 14).setValue('✅ VENCIMENTO E TAXA ATUALIZADOS (' + dataRepasse + ')');
+        processados++;
+      } else {
+        var erroAlt = (jsonAlt.retorno && jsonAlt.retorno.erros) ? JSON.stringify(jsonAlt.retorno.erros) : 'Erro ao alterar';
+        abaCentral.getRange(i + 1, 14).setValue('⚠️ ' + erroAlt);
+      }
+      continue;
+    }
+
+    // =========================================================================
+    // ETAPA C: Baixa a conta (APENAS se 🟢 LIBERADO) usando o layout oficial camelCase
+    // Documentação oficial Tiny (api2-contas-receber-baixar):
+    // 'id', 'contaDestino', 'data', 'valorTaxas', 'valorJuros', 'valorDesconto', 'valorPago'
+    // =========================================================================
+    var payloadBaixar = {
+      token: tinyToken,
+      formato: 'json',
+      conta: JSON.stringify({
+        conta: {
+          id: Number(idTitulo),
+          contaDestino: nomeContaDestino,
+          data: dataRepasse,
+          valorTaxas: Number(taxaDescontada.toFixed(2)),
+          valorJuros: 0,
+          valorDesconto: 0,
+          valorPago: Number(liquidoRecebido.toFixed(2))
+        }
+      })
+    };
+
+    var respBaixa = UrlFetchApp.fetch('https://api.tiny.com.br/api2/conta.receber.baixar.php', {
+      method: 'post',
+      payload: payloadBaixar,
+      muteHttpExceptions: true
+    });
+
+    var resJson = JSON.parse(respBaixa.getContentText());
 
     if (resJson.retorno && resJson.retorno.status === 'OK') {
-      abaCentral.getRange(i + 1, 14).setValue('✅ BAIXADO EM ' + nomeBancoDestino + ' (Líq: R$ ' + liquidoRecebido.toFixed(2) + ' | Taxa: R$ ' + taxaDescontada.toFixed(2) + ')');
-      baixados++;
+      abaCentral.getRange(i + 1, 14).setValue(
+        '✅ BAIXADO EM ' + nomeContaDestino + ' (Líq: R$ ' + liquidoRecebido.toFixed(2) + ' | Taxa: R$ ' + taxaDescontada.toFixed(2) + ')'
+      );
+      processados++;
     } else {
-      var msgErro = resJson.retorno && resJson.retorno.erros ? JSON.stringify(resJson.retorno.erros) : 'Erro na baixa';
+      var msgErro = (resJson.retorno && resJson.retorno.erros) ? JSON.stringify(resJson.retorno.erros) : 'Erro na baixa';
       abaCentral.getRange(i + 1, 14).setValue('⚠️ ' + msgErro);
     }
-    Utilities.sleep(1200);
+    Utilities.sleep(1000);
   }
 
-  SpreadsheetApp.getUi().alert('Processamento concluído! ' + baixados + ' títulos foram baixados no Tiny.');
+  SpreadsheetApp.getUi().alert('Processamento concluído! ' + processados + ' títulos foram atualizados/baixados no Tiny.');
 }
 
 // =========================================================================
