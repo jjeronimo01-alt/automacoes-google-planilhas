@@ -264,7 +264,7 @@ function fazerUpsertNaAba(aba, colChaveZeroBased, mapaNovos, colunasTextoOneBase
   return listaFinal.length;
 }
 
-// 6. UPSERT NA CENTRAL DO TINY (PRESERVA BAIXADOS E ATUALIZA DIFERIDOS QUE VIRARAM LIBERADOS)
+// 6. UPSERT NA CENTRAL DO TINY (PRESERVA BAIXADOS E REATIVA ATUALIZAÇÃO SE A DATA DE REPASSE MUDAR)
 function fazerUpsertCentralTinyPreservandoBaixados(abaCentral, mapaNovos) {
   var dadosAtuais = abaCentral.getLastRow() > 1 ? abaCentral.getRange(2, 1, abaCentral.getLastRow() - 1, 14).getDisplayValues() : [];
   var mapaConsolidado = {};
@@ -281,13 +281,21 @@ function fazerUpsertCentralTinyPreservandoBaixados(abaCentral, mapaNovos) {
     var novo = mapaNovos[idTit];
     if (mapaConsolidado[idTit]) {
       var statusAntigo = mapaConsolidado[idTit][13] ? mapaConsolidado[idTit][13].toString() : '';
-      var vencAntigo = formatarDataParaTinyBR(mapaConsolidado[idTit][6]);
-      var vencNovo = formatarDataParaTinyBR(novo[6]);
+      var vencNovo = formatarDataParaTinyBR(novo[6]); // Coluna DATA REPASSE (NOVO VENC.)
 
+      // 1. Se já foi definitivamente baixado (✅ BAIXADO) e não virou reembolso, preserva o status baixado
       if (statusAntigo.indexOf('✅ BAIXADO') !== -1 && novo[12].indexOf('🔴') === -1) {
         novo[13] = statusAntigo;
-      } else if (novo[12].indexOf('🟡') !== -1 && statusAntigo.indexOf('📅') !== -1 && vencAntigo === vencNovo) {
-        novo[13] = statusAntigo;
+      }
+      // 2. Se ainda é Diferido (🟡): só mantém o status '📅 VENC. ATUALIZADO NO TINY (dd/MM/yyyy)'
+      // se a data gravada no status for EXATAMENTE igual à nova data de repasse!
+      // Se a data de repasse mudou na planilha de vendas, volta para 'PENDENTE (NOVA DATA DE REPASSE)' para atualizar o Tiny!
+      else if (novo[12].indexOf('🟡') !== -1) {
+        if (statusAntigo.indexOf('📅 VENC. ATUALIZADO NO TINY (' + vencNovo + ')') !== -1) {
+          novo[13] = statusAntigo;
+        } else {
+          novo[13] = 'PENDENTE (ATUALIZAR VENC. TINY)';
+        }
       }
     }
     mapaConsolidado[idTit] = novo;

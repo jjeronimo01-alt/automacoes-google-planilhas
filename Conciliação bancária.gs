@@ -709,7 +709,7 @@ function importarAmazonSubpastaMensal() {
 }
 
 // =========================================================================
-// 5. PASSO B: CONCILIAÇÃO COMPLETA (PAREAMENTO 1-PARA-1 DE CARRINHOS/PACK ID E PARCELAS)
+// 5. PASSO B: CONCILIAÇÃO COMPLETA (CORREÇÃO PACK ID SEM DATA_EMISSAO NA API E FIM DO "OUTROS")
 // =========================================================================
 function conciliarComTinyAPI() {
   var props = PropertiesService.getScriptProperties();
@@ -729,7 +729,7 @@ function conciliarComTinyAPI() {
   var mapaMkt = {};
   var listaMpDisponiveis = [];
 
-  // 1. Carrega Base Mercado Pago (compatível com layout de 11 ou 12 colunas)
+  // 1. Carrega Base Mercado Pago (dataRepasse = coluna DATA REPASSE LÍQUIDO)
   for (var i = 1; i < dadosMp.length; i++) {
     var idMp = limparIdCientifico(dadosMp[i][0]);
     if (!idMp) continue;
@@ -757,7 +757,7 @@ function conciliarComTinyAPI() {
     listaMpDisponiveis.push(objMp);
   }
 
-  // 2. Carrega Base Amazon
+  // 2. Carrega Base Amazon (dataRepasse = coluna DATA REPASSE LÍQUIDO / Est. Data de lançamento)
   for (var j = 1; j < dadosAmz.length; j++) {
     var idAmz = dadosAmz[j][0].toString().trim();
     if (!idAmz) continue;
@@ -811,22 +811,27 @@ function conciliarComTinyAPI() {
     }
   });
 
-  // 5. Concilia título a título (Nível 1: ID Direto | Nível 2: Item de Carrinho 1-para-1 | Nível 3: Soma de Parcelas de Pack)
+  // 5. Concilia título a título
   var mapaUpsertCentral = {};
 
   titulosTiny.forEach(function(t) {
     var idTit = t.id.toString().trim();
     var oc = extrairOcHistorico(t.historico) || 'SEM_OC';
     var valorTitulo = parseFloat(t.valor) || 0;
-    var dtEmissao = formatarDataParaTinyBR(t.data_emissao || t.vencimento || t.data_vencimento);
-    var tsEmissao = converterDataBRParaTimestamp(dtEmissao);
+    var dtVencOriginal = formatarDataParaTinyBR(t.vencimento || t.data_vencimento);
+    var tsVencOriginal = converterDataBRParaTimestamp(dtVencOriginal);
+    var dtEmissao = t.data_emissao ? formatarDataParaTinyBR(t.data_emissao) : '';
+    var tsEmissao = dtEmissao ? converterDataBRParaTimestamp(dtEmissao) : 0;
+    // Se a API de pesquisa do Tiny não enviou data_emissao, estima a data da venda (vencimento - 30 dias)
+    var tsVendaEstimadaPeloVenc = tsVencOriginal > 0 ? (tsVencOriginal - (30 * 24 * 60 * 60 * 1000)) : 0;
+
     var matchParcela = t.historico ? t.historico.match(/\(parcela\s+\d+\/\d+\)/i) : null;
     var labelParcela = matchParcela ? matchParcela[0] : 'Única';
 
-    // Identifica o Canal diretamente pelo formato do OC nº (pois a API de pesquisa não retorna t.categoria)
-    var canalInferido = 'Venda Direta / Outros';
+    // Identificação blindada do Canal (qualquer OC iniciado em 20000 é Mercado Livre)
+    var canalInferido = 'Venda Direta';
     if (/^\d{3}-\d{7}-\d{7}$/.test(oc)) canalInferido = 'Amazon';
-    else if (/^20000\d+$/.test(oc)) canalInferido = 'Mercado Livre';
+    else if (oc.indexOf('20000') === 0) canalInferido = 'Mercado Livre';
     else if (t.historico && t.historico.toLowerCase().indexOf('mercado') !== -1) canalInferido = 'Mercado Livre';
     else if (t.historico && t.historico.toLowerCase().indexOf('amazon') !== -1) canalInferido = 'Amazon';
 
@@ -839,7 +844,7 @@ function conciliarComTinyAPI() {
       var somaOc = somaTinyPorOc[oc] || valorTitulo;
       proporcao = somaOc > 0 ? (valorTitulo / somaOc) : 1;
     }
-    // NÍVEL 2: Casamento 1-para-1 de Carrinho / Pack ID (2000014... / 2000015...) pelo Valor do Título + Data (±3 dias)
+    // NÍVEL 2: Casamento 1-para-1 de Pack ID (ex: 2000015050185221) pelo Valor Exato + Data (Emissão OU Vencimento - 30 dias)
     else if (canalInferido === 'Mercado Livre') {
       var melhorCand = null;
       var menorDiffDias = 999;
@@ -847,31 +852,37 @@ function conciliarComTinyAPI() {
       for (var k = 0; k < listaMpDisponiveis.length; k++) {
         var cand = listaMpDisponiveis[k];
         if (cand.usadoNoPack) continue;
-        var tsCand = converterDataBRParaTimestamp(cand.dataVenda);
-        var diffDias = (tsEmissao > 0 && tsCand > 0) ? (Math.abs(tsEmissao - tsCand) / (1000 * 60 * 60 * 24)) : 999;
+        if (Math.abs(cand.bruto - valorTitulo) > 0.05) continue;
 
-        if (diffDias <= 3 && Math.abs(cand.bruto - valorTitulo) <= 0.05) {
-          if (diffDias < menorDiffDias) {
-            menorDiffDias = diffDias;
-            melhorCand = cand;
-          }
+        var tsCand = converterDataBRParaTimestamp(cand.dataVenda);
+        var tsRepCand = converterDataBRParaTimestamp(cand.dataRepasse);
+        var diffEmiss = (tsEmissao > 0 && tsCand > 0) ? (Math.abs(tsEmissao - tsCand) / (1000 * 60 * 60 * 24)) : 999;
+        var diffVenc30 = (tsVendaEstimadaPeloVenc > 0 && tsCand > 0) ? (Math.abs(tsVendaEstimadaPeloVenc - tsCand) / (1000 * 60 * 60 * 24)) : 999;
+        var diffJaAtualizado = (tsVencOriginal > 0 && tsRepCand > 0) ? (Math.abs(tsVencOriginal - tsRepCand) / (1000 * 60 * 60 * 24)) : 999;
+
+        var diffDias = Math.min(diffEmiss, diffVenc30, diffJaAtualizado);
+        if (diffDias <= 4 && diffDias < menorDiffDias) {
+          menorDiffDias = diffDias;
+          melhorCand = cand;
         }
       }
 
       if (melhorCand) {
         melhorCand.usadoNoPack = true;
         m = melhorCand;
-        proporcao = 1; // Casamento 1-para-1 exato do item do carrinho!
+        proporcao = 1;
       } else {
-        // NÍVEL 3: Caso um Pack ID tenha sido parcelado no cartão (soma das parcelas == valor do pagamento no MP)
+        // NÍVEL 3: Caso um Pack ID tenha sido dividido em parcelas cuja soma bate com a venda no MP
         var somaPack = somaTinyPorOc[oc] || valorTitulo;
         for (var k2 = 0; k2 < listaMpDisponiveis.length; k2++) {
           var cand2 = listaMpDisponiveis[k2];
+          if (Math.abs(cand2.bruto - somaPack) > 0.05) continue;
           var tsCand2 = converterDataBRParaTimestamp(cand2.dataVenda);
-          var diffDias2 = (tsEmissao > 0 && tsCand2 > 0) ? (Math.abs(tsEmissao - tsCand2) / (1000 * 60 * 60 * 24)) : 999;
-          if (diffDias2 <= 3 && Math.abs(cand2.bruto - somaPack) <= 0.05) {
+          var diffE2 = (tsEmissao > 0 && tsCand2 > 0) ? (Math.abs(tsEmissao - tsCand2) / (1000 * 60 * 60 * 24)) : 999;
+          var diffV2 = (tsVendaEstimadaPeloVenc > 0 && tsCand2 > 0) ? (Math.abs(tsVendaEstimadaPeloVenc - tsCand2) / (1000 * 60 * 60 * 24)) : 999;
+          if (Math.min(diffE2, diffV2) <= 4) {
             m = cand2;
-            mapaMkt[oc] = cand2; // Vincula para as demais parcelas do mesmo Pack ID
+            mapaMkt[oc] = cand2;
             proporcao = somaPack > 0 ? (valorTitulo / somaPack) : 1;
             break;
           }
@@ -895,16 +906,17 @@ function conciliarComTinyAPI() {
         statusConc = '🟢 PRONTO PARA BAIXA AUTOMÁTICA';
       }
 
+      // Coluna 7 (índice 6): DATA REPASSE (NOVO VENC.) recebe estritamente m.dataRepasse
       mapaUpsertCentral[idTit] = [
         idTit, m.canal, t.nome_cliente, oc, labelParcela,
-        formatarDataParaTinyBR(t.vencimento || t.data_vencimento), m.dataRepasse, valorTitulo,
+        dtVencOriginal, m.dataRepasse, valorTitulo,
         freteProp, comissaoProp, taxaEfetivaTiny, liquidoProp,
         statusConc, statusSincPadrao
       ];
     } else {
       mapaUpsertCentral[idTit] = [
         idTit, canalInferido, t.nome_cliente, oc, labelParcela,
-        formatarDataParaTinyBR(t.vencimento || t.data_vencimento), formatarDataParaTinyBR(t.vencimento || t.data_vencimento), valorTitulo,
+        dtVencOriginal, dtVencOriginal, valorTitulo,
         0, 0, 0, valorTitulo,
         '⚪ AGUARDANDO BASE MARKETPLACE', 'PENDENTE'
       ];
@@ -912,8 +924,9 @@ function conciliarComTinyAPI() {
   });
 
   var totalCentral = fazerUpsertCentralTinyPreservandoBaixados(abaCentral, mapaUpsertCentral);
-  SpreadsheetApp.getUi().alert('✅ Conciliação atualizada! Total de títulos monitorados na Central: ' + totalCentral);
+  SpreadsheetApp.getUi().alert('✅ Conciliação concluída! Total de títulos monitorados na Central: ' + totalCentral);
 }
+
 // =========================================================================
 // 6 & 7. RESET E ESTORNO
 // =========================================================================
