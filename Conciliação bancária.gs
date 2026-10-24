@@ -1,6 +1,6 @@
 /**
  * ARQUIVO 1: Código.gs
- * MOTOR PRINCIPAL DE CONCILIAÇÃO, AUDITORIA DE DESVIOS E INTEGRAÇÃO TINY ERP / MERCADO PAGO / AMAZON
+ * MOTOR PRINCIPAL DE CONCILIAÇÃO, AUDITORIA DE DESVIOS, ARQUIVAMENTO E INTEGRAÇÃO TINY ERP / MERCADO PAGO / AMAZON
  */
 
 function onOpen() {
@@ -10,7 +10,7 @@ function onOpen() {
     .addItem('2. 🔒 Salvar Tokens, Pasta e IDs das Contas no Cofre', 'abrirCofreCredenciais')
     .addSeparator()
     .addItem('3. Passo A1: Puxar Vendas Mercado Pago', 'sincronizarMercadoPagoSeguro')
-    .addItem('4. Passo A2: Ler Planilhas Amazon (Drive)', 'importarAmazonSubpastaMensal')
+    .addItem('4. Passo A2: Puxar Vendas Amazon (API Tiny Pedidos + Drive)', 'importarAmazonSubpastaMensal')
     .addItem('5. Passo B: Puxar Contas a Receber Tiny e Conciliar', 'conciliarComTinyAPI')
     .addSeparator()
     .addItem('6. 🔄 RESETAR Planilha (Voltar Títulos para PENDENTE)', 'resetarStatusPlanilhaParaPendente')
@@ -19,12 +19,29 @@ function onOpen() {
     .addItem('8. 🧪 Passo C (TESTE): Baixar/Corrigir 5 Pedidos no Tiny', 'testarBaixaPequenaEscala')
     .addItem('9. 🚀 Passo C (OFICIAL): Baixar/Corrigir TODOS os Liberados no Tiny', 'executarBaixaCompletaTiny')
     .addSeparator()
-    .addItem('10. ⏰ Ativar Robô Diário Automático (07h)', 'ativarAgendamentoDiario')
+    .addItem('10. 📦 Arquivar Auditados (CONFERIDO) e Vendas Antigas (> 60 dias)', 'executarArquivamentoGovernanca')
+    .addItem('11. ⏰ Ativar Robô Diário Automático (07h)', 'ativarAgendamentoDiario')
     .addToUi();
 }
 
+// Gatilho automático: ao marcar um desvio como CONFERIDO ou ALARME FALSO na aba 5, move para a aba 6_Auditoria_Concluida
+function onEdit(e) {
+  try {
+    if (!e || !e.range) return;
+    var aba = e.range.getSheet();
+    if (aba.getName() === '5_Auditoria_Desvios' && e.range.getColumn() === 11 && e.range.getRow() > 1) {
+      var novoValor = e.value ? e.value.toString().trim().toUpperCase() : '';
+      if (novoValor === 'CONFERIDO' || novoValor === 'ALARME FALSO/INVÁLIDO') {
+        arquivarDesviosConcluidos();
+      }
+    }
+  } catch (err) {
+    Logger.log('Aviso onEdit: ' + err.message);
+  }
+}
+
 // =========================================================================
-// 1. CONFIGURAÇÃO DE ABAS
+// 1. CONFIGURAÇÃO DE ABAS (INCLUINDO ABAS 6 E 7 DE ARQUIVO HISTÓRICO)
 // =========================================================================
 function configurarEstruturaSegura() {
   var ss = SpreadsheetApp.getActiveSpreadsheet();
@@ -41,8 +58,8 @@ function configurarEstruturaSegura() {
       linhas: [
         ['ID_CONTA_MERCADO_PAGO', '343048144', 'ID numérico da conta Mercado Pago no Tiny'],
         ['ID_CONTA_AMAZON', '373396665', 'ID numérico da conta Amazon no Tiny'],
-        ['DIAS_BUSCA_MP', '60', 'Dias retroativos para consulta na API do Mercado Pago'],
-        ['DIAS_BUSCA_TINY', '90', 'Dias retroativos para consulta de Contas a Receber na API do Tiny'],
+        ['DIAS_BUSCA_MP', '60', 'Dias retroativos para manter vendas ativas nas abas Base (após isso vão p/ Aba 7)'],
+        ['DIAS_BUSCA_TINY', '90', 'Dias retroativos para consulta de Contas a Receber e Pedidos na API do Tiny'],
         ['LIMITE_LOTE_TESTE', '5', 'Quantidade máxima de títulos processados no Modo Teste'],
         ['STATUS_COFRE_CREDENCIAIS', 'Verifique o Cofre no item 2', 'Tokens e IDs protegidos no PropertiesService']
       ]
@@ -79,6 +96,22 @@ function configurarEstruturaSegura() {
         'VALOR PEDIDO REAL (R$)', 'TAXA / RETENÇÃO (R$)', '% COMISSÃO REAL',
         'IMPACTO LÍQUIDO CAIXA (R$)', 'AÇÃO RECOMENDADA', 'STATUS AUDITORIA'
       ]
+    },
+    {
+      nome: '6_Auditoria_Concluida',
+      cabecalho: [
+        'CHAVE DESVIO', 'DATA DETECÇÃO', 'CANAL', 'ID PEDIDO (OC)', 'TIPO DE DESVIO / OCORRÊNCIA',
+        'VALOR PEDIDO REAL (R$)', 'TAXA / RETENÇÃO (R$)', '% COMISSÃO REAL',
+        'IMPACTO LÍQUIDO CAIXA (R$)', 'AÇÃO RECOMENDADA', 'STATUS AUDITORIA', 'DATA CONCLUSÃO'
+      ]
+    },
+    {
+      nome: '7_Historico_Vendas_Antigas',
+      cabecalho: [
+        'CANAL', 'ID PEDIDO (OC)', 'ID PAGAMENTO / ORIGEM', 'DATA VENDA', 'DATA REPASSE LÍQUIDO',
+        'STATUS FINAL', 'VALOR TOTAL REAL PEDIDO (R$)', 'FRETE PAGO POR NÓS (R$)',
+        'COMISSÃO PAGA POR NÓS (R$)', 'VALOR LÍQUIDO REPASSADO (R$)', 'OBS / FONTE', 'DATA ARQUIVAMENTO'
+      ]
     }
   ];
 
@@ -94,7 +127,7 @@ function configurarEstruturaSegura() {
   });
 
   configurarValidacaoStatusAuditoria();
-  SpreadsheetApp.getUi().alert('✅ Estrutura de governança configurada com sucesso!');
+  SpreadsheetApp.getUi().alert('✅ Estrutura completa (com abas 6_Auditoria_Concluida e 7_Historico_Vendas_Antigas) configurada!');
 }
 
 // =========================================================================
@@ -135,7 +168,7 @@ function abrirCofreCredenciais() {
 }
 
 // =========================================================================
-// 3. PASSO A1: MERCADO PAGO (MAPEAMENTO DE ORDER ID E PACK ID)
+// 3. PASSO A1: MERCADO PAGO (FILTRO ESTRITO DE VENDAS 20000... E VÍNCULO SHIPPING ID / PACK ID)
 // =========================================================================
 function sincronizarMercadoPagoSeguro() {
   var props = PropertiesService.getScriptProperties();
@@ -154,6 +187,12 @@ function sincronizarMercadoPagoSeguro() {
   var vendasNovasOuAtualizadas = {};
   var desviosNovosOuAtualizados = {};
 
+  // Dicionários para vincular SHIPPING ID (47.../48...) e PACK ID (2000015...) ao ORDER ID (2000018.../19...)
+  var creditosFretePorPedido = {};
+  var creditosFretePorShippingId = {};
+  var pedidoPorShippingId = {};
+
+  // 1. Leitura complementar da planilha oficial do MP no Drive (se existir na subpasta)
   if (rootFolderId) {
     try {
       var pastaMes = obterSubpastaMensalDrive(rootFolderId, hoje);
@@ -170,6 +209,7 @@ function sincronizarMercadoPagoSeguro() {
           var colExt = h.indexOf('EXTERNAL REFERENCE');
           var colOrder = h.indexOf('ORDER ID');
           var colPack = h.indexOf('PACK ID');
+          var colShipId = h.indexOf('SHIPPING ID');
           var colSource = h.indexOf('SOURCE ID');
           var colStatus = h.indexOf('TRANSACTION TYPE');
           var colBruto = h.indexOf('TRANSACTION AMOUNT');
@@ -178,18 +218,43 @@ function sincronizarMercadoPagoSeguro() {
           var colFin = h.indexOf('FINANCING FEE AMOUNT');
           var colReal = h.indexOf('REAL AMOUNT');
           var colMeta = h.indexOf('METADATA');
+          var colSaleDet = h.indexOf('SALE DETAIL');
           var colRel = h.indexOf('IS RELEASED');
           var colDataLib = h.indexOf('MONEY RELEASE DATE');
           var colDataOp = h.indexOf('ORIGIN DATE') !== -1 ? h.indexOf('ORIGIN DATE') : h.indexOf('DATE');
 
+          // 1ª Passada na planilha: captura todos os "Pagamento do frete" (IDs 47... / 48...) para abater do frete da venda pai
+          for (var p1 = 1; p1 < dadosMpPlan.length; p1++) {
+            var r1 = dadosMpPlan[p1];
+            var t1 = r1[colStatus] ? r1[colStatus].trim().toLowerCase() : '';
+            var ext1 = limparIdCientifico(colExt !== -1 ? r1[colExt] : '');
+            var ord1 = limparIdCientifico(colOrder !== -1 ? r1[colOrder] : '');
+            var shp1 = limparIdCientifico(colShipId !== -1 ? r1[colShipId] : '');
+            var val1 = converterMoedaBR(r1[colBruto]);
+
+            if (t1.indexOf('pagamento do frete') !== -1 && val1 > 0) {
+              var idEnvioChave = shp1 || ext1;
+              if (idEnvioChave) creditosFretePorShippingId[idEnvioChave] = (creditosFretePorShippingId[idEnvioChave] || 0) + val1;
+              if (ehIdPedidoVendaValidoML(ord1)) creditosFretePorPedido[ord1] = (creditosFretePorPedido[ord1] || 0) + val1;
+            }
+          }
+
+          // 2ª Passada na planilha: processa exclusivamente VENDAS REAIS (20000...) e seus reembolsos
           for (var r = 1; r < dadosMpPlan.length; r++) {
             var rowP = dadosMpPlan[r];
             var tipoTrans = rowP[colStatus] ? rowP[colStatus].trim() : '';
+            var saleDet = (colSaleDet !== -1 && rowP[colSaleDet]) ? rowP[colSaleDet].toString().toLowerCase() : '';
             var idExt = limparIdCientifico(colExt !== -1 ? rowP[colExt] : '');
             var idOrd = limparIdCientifico(colOrder !== -1 ? rowP[colOrder] : '');
             var idPack = limparIdCientifico(colPack !== -1 ? rowP[colPack] : '');
-            var idChave = idExt || idOrd;
-            if (!idChave || idChave.indexOf('[') !== -1) continue;
+            var idShp = limparIdCientifico(colShipId !== -1 ? rowP[colShipId] : '');
+
+            // Ignora faturas do ML, payouts, cashback e linhas avulsas de frete
+            if (saleDet.indexOf('faturas com tarifas') !== -1) continue;
+            var idChave = ehIdPedidoVendaValidoML(idExt) ? idExt : (ehIdPedidoVendaValidoML(idOrd) ? idOrd : '');
+            if (!idChave) continue;
+
+            if (idShp) pedidoPorShippingId[idShp] = idChave;
 
             var idPag = limparIdCientifico(colSource !== -1 ? rowP[colSource] : '');
             var transAmt = converterMoedaBR(rowP[colBruto]);
@@ -203,6 +268,13 @@ function sincronizarMercadoPagoSeguro() {
             var jaLiberado = (isRelStr === 'TRUE' || isRelStr === 'VERDADEIRO' || dataJaPassouOuHoje(dtLib, hoje));
             var feeDiscount = extrairFeeDiscountMetadata(colMeta !== -1 ? rowP[colMeta] : '');
 
+            // Se houve "Pagamento do frete" vinculado a esse Shipping ID ou Order ID, incorpora o crédito!
+            var credFrete = (idShp && creditosFretePorShippingId[idShp]) ? creditosFretePorShippingId[idShp] : (creditosFretePorPedido[idChave] || 0);
+            if (credFrete > 0 && vShipBruto > credFrete) {
+              vShipBruto = Math.round((vShipBruto - credFrete) * 100) / 100;
+              vLiq = Math.round((vLiq + credFrete) * 100) / 100;
+            }
+
             var tipoLower = tipoTrans.toLowerCase();
             if (tipoLower.indexOf('contesta') !== -1 || tipoLower.indexOf('media') !== -1 || tipoLower.indexOf('reembols') !== -1 || tipoLower.indexOf('devolu') !== -1 || transAmt < 0) {
               var linReemb = [
@@ -210,7 +282,11 @@ function sincronizarMercadoPagoSeguro() {
                 'NÃO', Math.abs(transAmt), vShipBruto, vMkpBruto, -Math.abs(vLiq), 'Planilha Oficial MP'
               ];
               vendasNovasOuAtualizadas[idChave] = linReemb;
-              if (idPack && idPack !== idChave) vendasNovasOuAtualizadas[idPack] = linReemb;
+              if (ehIdPedidoVendaValidoML(idPack) && idPack !== idChave) {
+                var linReembPack = linReemb.slice();
+                linReembPack[0] = idPack;
+                vendasNovasOuAtualizadas[idPack] = linReembPack;
+              }
 
               var chaveDesv = 'MP_REEMB_' + idChave;
               desviosNovosOuAtualizados[chaveDesv] = [
@@ -230,12 +306,11 @@ function sincronizarMercadoPagoSeguro() {
               ];
 
               vendasNovasOuAtualizadas[idChave] = linAprov;
-              // Mapeia também o PACK ID para cruzar com títulos de carrinho do Tiny
-              if (idPack && idPack !== idChave) {
+              if (ehIdPedidoVendaValidoML(idPack) && idPack !== idChave) {
                 vendasNovasOuAtualizadas[idPack] = [
                   idPack, idPag, dtVenda, dtLib, 'approved',
                   jaLiberado ? 'SIM' : 'NÃO', calc.valorPedidoReal, calc.freteRealNosso,
-                  calc.comissaoRealNossa, calc.valorLiquidoReal, 'Planilha Oficial MP (Pack ID)'
+                  calc.comissaoRealNossa, calc.valorLiquidoReal, 'Planilha Oficial MP (Pack ID: ' + idChave + ')'
                 ];
               }
 
@@ -258,6 +333,7 @@ function sincronizarMercadoPagoSeguro() {
     }
   }
 
+  // 2. Consulta API do Mercado Pago (Filtrando estritamente vendas reais 20000... e vinculando fretes/reembolsos)
   if (mpToken) {
     var dataInicio = new Date(hoje.getTime() - (diasBuscaMp * 24 * 60 * 60 * 1000));
     var isoInicio = Utilities.formatDate(dataInicio, "GMT-03:00", "yyyy-MM-dd'T'00:00:00.000-03:00");
@@ -265,6 +341,8 @@ function sincronizarMercadoPagoSeguro() {
 
     var offset = 0;
     var limit = 100;
+    var pagamentosApi = [];
+
     while (offset < 1000) {
       var url = 'https://api.mercadopago.com/v1/payments/search?sort=date_created&criteria=desc'
               + '&range=date_created&begin_date=' + encodeURIComponent(isoInicio)
@@ -277,200 +355,303 @@ function sincronizarMercadoPagoSeguro() {
       var resultados = json.results || [];
       if (resultados.length === 0) break;
 
-      for (var i = 0; i < resultados.length; i++) {
-        var p = resultados[i];
-        var idPedido = limparIdCientifico(p.external_reference) || limparIdCientifico(p.order && p.order.id ? p.order.id : '');
-        if (!idPedido || idPedido.indexOf('[') !== -1) continue;
-
-        var status = (p.status || '').toLowerCase();
-        var statusDetail = (p.status_detail || '').toLowerCase();
-        var temReembolso = (status === 'refunded' || status === 'charged_back' || status === 'in_mediation' || status === 'cancelled' ||
-                            statusDetail.indexOf('refund') !== -1 || statusDetail.indexOf('chargeback') !== -1 ||
-                            (p.refunds && p.refunds.length > 0) || (parseFloat(p.transaction_amount_refunded) > 0));
-
-        if (vendasNovasOuAtualizadas[idPedido] && !temReembolso) continue;
-
-        var vBrutoAPI = parseFloat(p.transaction_amount) || 0;
-        var dataVenda = p.date_created ? Utilities.formatDate(new Date(p.date_created), Session.getScriptTimeZone(), 'dd/MM/yyyy') : '';
-        var dataLibObj = p.money_release_date ? new Date(p.money_release_date) : null;
-        var dataRepasse = dataLibObj ? Utilities.formatDate(dataLibObj, Session.getScriptTimeZone(), 'dd/MM/yyyy') : dataVenda;
-        var jaLiberado = (p.money_release_status === 'released') || (dataLibObj && dataLibObj <= hoje);
-
-        var vLiqAPI = (p.transaction_details && p.transaction_details.net_received_amount !== undefined)
-                      ? parseFloat(p.transaction_details.net_received_amount) : vBrutoAPI;
-
-        var retencaoTotal = Math.round((vBrutoAPI - vLiqAPI) * 100) / 100;
-        var freteExtraido = 0;
-        var comissaoExtraida = 0;
-        var finExtraido = 0;
-
-        if (p.fee_details && p.fee_details.length > 0) {
-          p.fee_details.forEach(function(fd) {
-            if (fd.fee_payer === 'payer') return;
-            var valF = Math.abs(parseFloat(fd.amount) || 0);
-            var tF = (fd.type || '').toLowerCase();
-            if (tF.indexOf('shipping') !== -1) freteExtraido += valF;
-            else if (tF.indexOf('financing') !== -1) finExtraido += valF;
-            else comissaoExtraida += valF;
-          });
-        }
-        if (p.charges_details && p.charges_details.length > 0) {
-          p.charges_details.forEach(function(cd) {
-            var nC = (cd.name || cd.type || '').toLowerCase();
-            var valC = (cd.amounts && cd.amounts.original) ? Math.abs(parseFloat(cd.amounts.original) || 0) : 0;
-            if (nC.indexOf('shipping') !== -1 && freteExtraido === 0) freteExtraido += valC;
-          });
-        }
-
-        var feeDiscApi = (p.metadata && p.metadata.fee_discount) ? (parseFloat(p.metadata.fee_discount) || 0) : 0;
-
-        if (temReembolso) {
-          vendasNovasOuAtualizadas[idPedido] = [
-            idPedido, p.id.toString(), dataVenda, dataRepasse, 'Reembolsado (' + status + ')',
-            'NÃO', vBrutoAPI, freteExtraido, comissaoExtraida, -Math.abs(vLiqAPI), 'API Mercado Pago'
-          ];
-          var chaveDesvApi = 'MP_REEMB_' + idPedido;
-          desviosNovosOuAtualizados[chaveDesvApi] = [
-            chaveDesvApi, dataHojeBR, 'Mercado Livre', idPedido, 'Reembolso / Mediação (' + status + ')',
-            vBrutoAPI, retencaoTotal, 0, -Math.abs(vLiqAPI),
-            'Cancelar/Bloquear título no Tiny, emitir NF-e de devolução e conferir estoque', 'PENDENTE'
-          ];
-        } else if (status === 'approved') {
-          var calcApi = calcularValoresReaisVendedorML(idPedido, vBrutoAPI, freteExtraido, comissaoExtraida, finExtraido, vLiqAPI, feeDiscApi, mapaValoresTiny);
-
-          vendasNovasOuAtualizadas[idPedido] = [
-            idPedido, p.id.toString(), dataVenda, dataRepasse, 'approved',
-            jaLiberado ? 'SIM' : 'NÃO', calcApi.valorPedidoReal, calcApi.freteRealNosso,
-            calcApi.comissaoRealNossa, calcApi.valorLiquidoReal, 'API Mercado Pago'
-          ];
-
-          if (calcApi.foraDaRegraComissao) {
-            var chaveComApi = 'MP_COMISS_' + idPedido;
-            desviosNovosOuAtualizados[chaveComApi] = [
-              chaveComApi, dataHojeBR, 'Mercado Livre', idPedido,
-              'Desvio de Comissão ML (' + calcApi.aliquotaEfetivaPct.toFixed(2) + '% - fora de 14% ou 19%)',
-              calcApi.valorPedidoReal, calcApi.comissaoRealNossa, (calcApi.aliquotaEfetivaPct / 100),
-              -calcApi.diferencaComissaoReais,
-              'Auditar taxa cobrada pelo Mercado Livre no pedido (Esperado 14% ou 19%)', 'PENDENTE'
-            ];
-          }
-        }
+      for (var k = 0; k < resultados.length; k++) {
+        pagamentosApi.push(resultados[k]);
       }
-
       offset += limit;
       if (!json.paging || offset >= json.paging.total) break;
+    }
+
+    // 1ª Passada API: Identifica transações de "Pagamento do frete" (onde external_reference é um Shipping ID 47.../48...) e vincula ao order.id
+    for (var a1 = 0; a1 < pagamentosApi.length; a1++) {
+      var pa = pagamentosApi[a1];
+      var extA = limparIdCientifico(pa.external_reference);
+      var ordA = limparIdCientifico(pa.order && pa.order.id ? pa.order.id : '');
+      var descA = (pa.description || '').toLowerCase();
+      var valA = parseFloat(pa.transaction_amount) || 0;
+
+      if (/^4[789]\d{8,10}$/.test(extA) && valA > 0 && (pa.status === 'approved')) {
+        creditosFretePorShippingId[extA] = (creditosFretePorShippingId[extA] || 0) + valA;
+        if (ehIdPedidoVendaValidoML(ordA)) {
+          creditosFretePorPedido[ordA] = (creditosFretePorPedido[ordA] || 0) + valA;
+        }
+      }
+    }
+
+    // 2ª Passada API: Processa apenas vendas reais com ID 20000... (excluindo MELIPAYMENTS-COLLECTIONATTEMPT, cashback, faturas e 47.../48... avulsos)
+    for (var i = 0; i < pagamentosApi.length; i++) {
+      var p = pagamentosApi[i];
+      var extRef = limparIdCientifico(p.external_reference);
+      var ordRef = limparIdCientifico(p.order && p.order.id ? p.order.id : '');
+      var packRef = limparIdCientifico(p.metadata && p.metadata.pack_id ? p.metadata.pack_id : '');
+      var shpRef = limparIdCientifico(p.shipping_id || (p.metadata && p.metadata.shipping_id ? p.metadata.shipping_id : ''));
+
+      // Se o external_reference for um Shipping ID (47.../48...), é apenas a linha acessória de frete (já vinculada na 1ª passada) -> pula!
+      if (/^4[789]\d{8,10}$/.test(extRef)) continue;
+
+      // Só aceita se tiver um ID de Pedido de Venda válido do Mercado Livre (20000...)
+      var idPedido = ehIdPedidoVendaValidoML(extRef) ? extRef : (ehIdPedidoVendaValidoML(ordRef) ? ordRef : '');
+      if (!idPedido) continue;
+
+      var status = (p.status || '').toLowerCase();
+      var statusDetail = (p.status_detail || '').toLowerCase();
+      var temReembolso = (status === 'refunded' || status === 'charged_back' || status === 'in_mediation' || status === 'cancelled' ||
+                          statusDetail.indexOf('refund') !== -1 || statusDetail.indexOf('chargeback') !== -1 ||
+                          (p.refunds && p.refunds.length > 0) || (parseFloat(p.transaction_amount_refunded) > 0));
+
+      if (vendasNovasOuAtualizadas[idPedido] && !temReembolso) continue;
+
+      var vBrutoAPI = parseFloat(p.transaction_amount) || 0;
+      var dataVenda = p.date_created ? Utilities.formatDate(new Date(p.date_created), Session.getScriptTimeZone(), 'dd/MM/yyyy') : '';
+      var dataLibObj = p.money_release_date ? new Date(p.money_release_date) : null;
+      var dataRepasse = dataLibObj ? Utilities.formatDate(dataLibObj, Session.getScriptTimeZone(), 'dd/MM/yyyy') : dataVenda;
+      var jaLiberado = (p.money_release_status === 'released') || (dataLibObj && dataLibObj <= hoje);
+
+      var vLiqAPI = (p.transaction_details && p.transaction_details.net_received_amount !== undefined)
+                    ? parseFloat(p.transaction_details.net_received_amount) : vBrutoAPI;
+
+      var freteExtraido = 0;
+      var comissaoExtraida = 0;
+      var finExtraido = 0;
+
+      if (p.fee_details && p.fee_details.length > 0) {
+        p.fee_details.forEach(function(fd) {
+          if (fd.fee_payer === 'payer') return;
+          var valF = Math.abs(parseFloat(fd.amount) || 0);
+          var tF = (fd.type || '').toLowerCase();
+          if (tF.indexOf('shipping') !== -1) freteExtraido += valF;
+          else if (tF.indexOf('financing') !== -1) finExtraido += valF;
+          else comissaoExtraida += valF;
+        });
+      }
+      if (p.charges_details && p.charges_details.length > 0) {
+        p.charges_details.forEach(function(cd) {
+          var nC = (cd.name || cd.type || '').toLowerCase();
+          var valC = (cd.amounts && cd.amounts.original) ? Math.abs(parseFloat(cd.amounts.original) || 0) : 0;
+          if (nC.indexOf('shipping') !== -1 && freteExtraido === 0) freteExtraido += valC;
+        });
+      }
+
+      // Incorpora crédito de frete vinculado (caso o comprador tenha pago frete em transação 47.../48... separada)
+      var credFreteApi = (shpRef && creditosFretePorShippingId[shpRef]) ? creditosFretePorShippingId[shpRef] : (creditosFretePorPedido[idPedido] || 0);
+      if (credFreteApi > 0) {
+        if (freteExtraido > credFreteApi) freteExtraido = Math.round((freteExtraido - credFreteApi) * 100) / 100;
+        vLiqAPI = Math.round((vLiqAPI + credFreteApi) * 100) / 100;
+      }
+
+      var retencaoTotal = Math.round((vBrutoAPI - vLiqAPI) * 100) / 100;
+      var feeDiscApi = (p.metadata && p.metadata.fee_discount) ? (parseFloat(p.metadata.fee_discount) || 0) : 0;
+
+      if (temReembolso) {
+        var linReembApi = [
+          idPedido, p.id.toString(), dataVenda, dataRepasse, 'Reembolsado (' + status + ')',
+          'NÃO', vBrutoAPI, freteExtraido, comissaoExtraida, -Math.abs(vLiqAPI), 'API Mercado Pago'
+        ];
+        vendasNovasOuAtualizadas[idPedido] = linReembApi;
+        if (ehIdPedidoVendaValidoML(packRef) && packRef !== idPedido) {
+          var linPackR = linReembApi.slice();
+          linPackR[0] = packRef;
+          vendasNovasOuAtualizadas[packRef] = linPackR;
+        }
+
+        var chaveDesvApi = 'MP_REEMB_' + idPedido;
+        desviosNovosOuAtualizados[chaveDesvApi] = [
+          chaveDesvApi, dataHojeBR, 'Mercado Livre', idPedido, 'Reembolso / Mediação (' + status + ')',
+          vBrutoAPI, retencaoTotal, 0, -Math.abs(vLiqAPI),
+          'Cancelar/Bloquear título no Tiny, emitir NF-e de devolução e conferir estoque', 'PENDENTE'
+        ];
+      } else if (status === 'approved') {
+        var calcApi = calcularValoresReaisVendedorML(idPedido, vBrutoAPI, freteExtraido, comissaoExtraida, finExtraido, vLiqAPI, feeDiscApi, mapaValoresTiny);
+
+        vendasNovasOuAtualizadas[idPedido] = [
+          idPedido, p.id.toString(), dataVenda, dataRepasse, 'approved',
+          jaLiberado ? 'SIM' : 'NÃO', calcApi.valorPedidoReal, calcApi.freteRealNosso,
+          calcApi.comissaoRealNossa, calcApi.valorLiquidoReal, 'API Mercado Pago'
+        ];
+
+        if (ehIdPedidoVendaValidoML(packRef) && packRef !== idPedido) {
+          vendasNovasOuAtualizadas[packRef] = [
+            packRef, p.id.toString(), dataVenda, dataRepasse, 'approved',
+            jaLiberado ? 'SIM' : 'NÃO', calcApi.valorPedidoReal, calcApi.freteRealNosso,
+            calcApi.comissaoRealNossa, calcApi.valorLiquidoReal, 'API Mercado Pago (Pack ID)'
+          ];
+        }
+
+        if (calcApi.foraDaRegraComissao) {
+          var chaveComApi = 'MP_COMISS_' + idPedido;
+          desviosNovosOuAtualizados[chaveComApi] = [
+            chaveComApi, dataHojeBR, 'Mercado Livre', idPedido,
+            'Desvio de Comissão ML (' + calcApi.aliquotaEfetivaPct.toFixed(2) + '% - fora de 14% ou 19%)',
+            calcApi.valorPedidoReal, calcApi.comissaoRealNossa, (calcApi.aliquotaEfetivaPct / 100),
+            -calcApi.diferencaComissaoReais,
+            'Auditar taxa cobrada pelo Mercado Livre no pedido (Esperado 14% ou 19%)', 'PENDENTE'
+          ];
+        }
+      }
     }
   }
 
   var totalMp = fazerUpsertNaAba(abaMp, 0, vendasNovasOuAtualizadas, [1, 2], 2, 'DESC');
   fazerUpsertDesviosPreservandoStatus(abaDesvios, desviosNovosOuAtualizados);
-  SpreadsheetApp.getUi().alert('✅ Mercado Pago sincronizado! Total na base: ' + totalMp + ' vendas.');
+  arquivarVendasAntigasUnificadas(diasBuscaMp);
+  SpreadsheetApp.getUi().alert('✅ Mercado Pago sincronizado (sem transações inválidas)! Total ativo nos últimos ' + diasBuscaMp + ' dias: ' + totalMp + ' vendas.');
 }
 
 // =========================================================================
-// 4. PASSO A2: AMAZON VIA Utilities.parseCsv
+// 4. PASSO A2: AMAZON (API DE PEDIDOS DO TINY ERP + PLANILHAS DRIVE COM EST. DATA DE LANÇAMENTO)
 // =========================================================================
 function importarAmazonSubpastaMensal() {
   var props = PropertiesService.getScriptProperties();
+  var tinyToken = props.getProperty('TINY_API_TOKEN');
   var rootFolderId = props.getProperty('AMAZON_ROOT_FOLDER_ID');
-  if (!rootFolderId) throw new Error('ID da pasta raiz da Amazon não configurado no Cofre.');
+  var params = lerParametrosNegocio();
+  var diasBuscaMp = parseInt(params['DIAS_BUSCA_MP'], 10) || 60;
 
   var hoje = new Date();
   var dataHojeBR = Utilities.formatDate(hoje, Session.getScriptTimeZone(), 'dd/MM/yyyy');
-  var pastaMes = obterSubpastaMensalDrive(rootFolderId, hoje);
-  if (!pastaMes) throw new Error('Subpasta do mês atual não encontrada no Google Drive.');
-
-  var nomeSubpastaAlvo = pastaMes.getName();
-  var arqUnified = pastaMes.searchFiles("title contains 'UnifiedTransaction' and trashed = false");
-  var arqTrans = pastaMes.searchFiles("(title contains 'Transa' or title contains 'Transacoes') and trashed = false");
-
-  if (!arqUnified.hasNext()) throw new Error('CustomUnifiedTransaction não encontrado na subpasta ' + nomeSubpastaAlvo);
-
-  var regProcessados = JSON.parse(props.getProperty('ARQUIVOS_AMAZON_PROCESSADOS') || '{}');
-  var dictPrevisto = {};
-
-  while (arqTrans.hasNext()) {
-    var fileTrans = arqTrans.next();
-    var textoTrans = fileTrans.getBlob().getDataAsString('utf-8');
-    var linhasTrans = Utilities.parseCsv(textoTrans);
-    for (var t = 1; t < linhasTrans.length; t++) {
-      var idPedT = linhasTrans[t][5] ? linhasTrans[t][5].trim() : '';
-      var dataEst = linhasTrans[t][1] ? formatarDataParaTinyBR(linhasTrans[t][1].trim()) : '';
-      if (idPedT && dataEst) dictPrevisto[idPedT] = dataEst;
-    }
-  }
-
   var pedidosAmz = {};
   var desviosAmz = {};
-  var arquivosLidosNestaRodada = 0;
+  var dictPrevisto = {};
+  var nomeSubpastaAlvo = 'API_TINY_PEDIDOS';
 
-  while (arqUnified.hasNext()) {
-    var fileCut = arqUnified.next();
-    var assinaturaArq = fileCut.getId() + '_' + fileCut.getLastUpdated().getTime();
-
-    var textoCut = fileCut.getBlob().getDataAsString('utf-8');
-    var linhasCut = Utilities.parseCsv(textoCut);
-
-    var headerIdx = 0;
-    for (var r = 0; r < Math.min(20, linhasCut.length); r++) {
-      var linhaStr = linhasCut[r].join(' ').toLowerCase();
-      if (linhaStr.indexOf('id do pedido') !== -1 && linhaStr.indexOf('tarifas de venda') !== -1) {
-        headerIdx = r;
-        break;
-      }
-    }
-
-    for (var i = headerIdx + 1; i < linhasCut.length; i++) {
-      var row = linhasCut[i];
-      if (!row || row.length < 24) continue;
-
-      var tipo = row[2] ? row[2].trim() : '';
-      var idPedido = row[3] ? row[3].trim() : '';
-      var descricao = row[5] ? row[5].trim() : '';
-      if (!idPedido) continue;
-
-      var vendasProd = converterMoedaBR(row[13]);
-      var tarifaVenda = converterMoedaBR(row[18]);
-      var taxaFba = converterMoedaBR(row[19]);
-      var outrasTaxas = converterMoedaBR(row[20]);
-      var totalLinha = converterMoedaBR(row[22]);
-      var statusTrans = row[23] ? row[23].trim() : '';
-      var dataLib = row[24] ? formatarDataParaTinyBR(row[24]) : '';
-
-      if (!pedidosAmz[idPedido]) {
-        pedidosAmz[idPedido] = {
-          dataVenda: formatarDataParaTinyBR(row[0]),
-          dataRepasse: '',
-          status: 'Diferido',
-          bruto: 0,
-          frete: 0,
-          comissao: 0,
-          reembolsado: false,
-          valorReembolsoLiq: 0
-        };
-      }
-
-      var tipoLow = tipo.toLowerCase();
-      if (tipo === 'Pedido') {
-        pedidosAmz[idPedido].bruto += vendasProd;
-        pedidosAmz[idPedido].comissao += Math.abs(tarifaVenda);
-        pedidosAmz[idPedido].status = statusTrans || 'Diferido';
-        if (dataLib) pedidosAmz[idPedido].dataRepasse = dataLib;
-      } else if (tipo === 'Serviços de Envio' || tipo === 'Tarifas da Amazon') {
-        if (descricao.toLowerCase().indexOf('estorno do frete pago pelo comprador') === -1) {
-          pedidosAmz[idPedido].frete += (Math.abs(tarifaVenda) + Math.abs(taxaFba) + Math.abs(outrasTaxas));
-        }
-      } else if (tipoLow.indexOf('reembolso') !== -1 || tipoLow.indexOf('refund') !== -1 || tipoLow.indexOf('garantia') !== -1 || tipoLow.indexOf('chargeback') !== -1) {
-        pedidosAmz[idPedido].reembolsado = true;
-        pedidosAmz[idPedido].valorReembolsoLiq += totalLinha;
-      }
-    }
-
-    regProcessados[fileCut.getId()] = assinaturaArq;
-    arquivosLidosNestaRodada++;
+  // -------------------------------------------------------------------------
+  // FONTE 1 (AUTOMÁTICA): CONSULTA PEDIDOS DE VENDA DA AMAZON DIRETO NO TINY ERP
+  // -------------------------------------------------------------------------
+  if (tinyToken) {
+    var pedidosTinyAmz = buscarPedidosVendaAmazonNoTiny(tinyToken, diasBuscaMp);
+    Object.keys(pedidosTinyAmz).forEach(function(idAmz) {
+      pedidosAmz[idAmz] = pedidosTinyAmz[idAmz];
+    });
   }
 
-  props.setProperty('ARQUIVOS_AMAZON_PROCESSADOS', JSON.stringify(regProcessados));
+  // -------------------------------------------------------------------------
+  // FONTE 2 (COMPLEMENTO FINO): PLANILHAS DA PASTA NO DRIVE (Transações + CustomUnified)
+  // -------------------------------------------------------------------------
+  if (rootFolderId) {
+    var pastaMes = obterSubpastaMensalDrive(rootFolderId, hoje);
+    if (pastaMes) {
+      nomeSubpastaAlvo = pastaMes.getName();
+      var arqTrans = pastaMes.searchFiles("(title contains 'Transa' or title contains 'Transacoes') and trashed = false");
+      var arqUnified = pastaMes.searchFiles("title contains 'UnifiedTransaction' and trashed = false");
+
+      // 2A. Lê "Transações.csv" localizando dinamicamente a coluna "Est. Data de lançamento da transação"
+      while (arqTrans.hasNext()) {
+        var fileTrans = arqTrans.next();
+        var textoTrans = fileTrans.getBlob().getDataAsString('utf-8');
+        var linhasTrans = Utilities.parseCsv(textoTrans);
+        if (linhasTrans.length > 1) {
+          var hTrans = linhasTrans[0].map(function(c) { return c.toString().replace(/["\ufeff]/g, '').trim().toLowerCase(); });
+          var colDataVendaT = 0;
+          var colEstLanc = hTrans.findIndex(function(c) { return c.indexOf('est. data de lan') !== -1 || c.indexOf('data de lan') !== -1; });
+          var colIdPedT = hTrans.findIndex(function(c) { return c.indexOf('id do pedido') !== -1; });
+          var colProdT = hTrans.findIndex(function(c) { return c.indexOf('custo total do produto') !== -1; });
+          var colTarifaT = hTrans.findIndex(function(c) { return c.indexOf('tarifas da amazon') !== -1; });
+
+          if (colEstLanc === -1) colEstLanc = 1;
+          if (colIdPedT === -1) colIdPedT = 5;
+
+          for (var t = 1; t < linhasTrans.length; t++) {
+            var rT = linhasTrans[t];
+            if (!rT || rT.length <= colIdPedT) continue;
+            var idPedT = rT[colIdPedT] ? rT[colIdPedT].trim() : '';
+            var dataEst = rT[colEstLanc] ? formatarDataParaTinyBR(rT[colEstLanc].trim()) : '';
+            if (!idPedT) continue;
+
+            if (dataEst) dictPrevisto[idPedT] = dataEst;
+
+            // Se o pedido com pagamento adiado só estiver em Transações.csv, já cria/atualiza na estrutura
+            if (!pedidosAmz[idPedT]) {
+              var vProdT = colProdT !== -1 ? Math.abs(converterMoedaBR(rT[colProdT])) : 0;
+              var vComissT = colTarifaT !== -1 ? Math.abs(converterMoedaBR(rT[colTarifaT])) : 0;
+              var vFreteEst = estimarFreteDbaAmazon(vProdT, 1);
+              pedidosAmz[idPedT] = {
+                origem: nomeSubpastaAlvo,
+                dataVenda: formatarDataParaTinyBR(rT[colDataVendaT]),
+                dataRepasse: dataEst,
+                status: 'Diferido',
+                bruto: vProdT,
+                frete: vFreteEst,
+                comissao: vComissT,
+                reembolsado: false,
+                valorReembolsoLiq: 0
+              };
+            } else {
+              pedidosAmz[idPedT].dataRepasse = dataEst;
+            }
+          }
+        }
+      }
+
+      // 2B. Lê "CustomUnifiedTransaction.csv" sobrescrevendo taxas exatas, liberações e reembolsos
+      while (arqUnified.hasNext()) {
+        var fileCut = arqUnified.next();
+        var textoCut = fileCut.getBlob().getDataAsString('utf-8');
+        var linhasCut = Utilities.parseCsv(textoCut);
+
+        var headerIdx = 0;
+        for (var r = 0; r < Math.min(20, linhasCut.length); r++) {
+          var linhaStr = linhasCut[r].join(' ').toLowerCase();
+          if (linhaStr.indexOf('id do pedido') !== -1 && linhaStr.indexOf('tarifas de venda') !== -1) {
+            headerIdx = r;
+            break;
+          }
+        }
+
+        // Acumulador local do CSV para substituir estimativas da API pelos números liquidados reais do CSV
+        var acumCut = {};
+        for (var i = headerIdx + 1; i < linhasCut.length; i++) {
+          var row = linhasCut[i];
+          if (!row || row.length < 24) continue;
+
+          var tipo = row[2] ? row[2].trim() : '';
+          var idPedido = row[3] ? row[3].trim() : '';
+          var descricao = row[5] ? row[5].trim() : '';
+          if (!idPedido) continue;
+
+          var vendasProd = converterMoedaBR(row[13]);
+          var tarifaVenda = converterMoedaBR(row[18]);
+          var taxaFba = converterMoedaBR(row[19]);
+          var outrasTaxas = converterMoedaBR(row[20]);
+          var totalLinha = converterMoedaBR(row[22]);
+          var statusTrans = row[23] ? row[23].trim() : '';
+          var dataLib = row[24] ? formatarDataParaTinyBR(row[24]) : '';
+
+          if (!acumCut[idPedido]) {
+            acumCut[idPedido] = {
+              origem: nomeSubpastaAlvo,
+              dataVenda: formatarDataParaTinyBR(row[0]),
+              dataRepasse: '',
+              status: 'Diferido',
+              bruto: 0,
+              frete: 0,
+              comissao: 0,
+              reembolsado: false,
+              valorReembolsoLiq: 0
+            };
+          }
+
+          var tipoLow = tipo.toLowerCase();
+          if (tipo === 'Pedido') {
+            acumCut[idPedido].bruto += vendasProd;
+            acumCut[idPedido].comissao += Math.abs(tarifaVenda);
+            acumCut[idPedido].status = statusTrans || 'Diferido';
+            if (dataLib && statusTrans === 'Liberado') acumCut[idPedido].dataRepasse = dataLib;
+          } else if (tipo === 'Serviços de Envio' || tipo === 'Tarifas da Amazon') {
+            if (descricao.toLowerCase().indexOf('estorno do frete pago pelo comprador') === -1) {
+              acumCut[idPedido].frete += (Math.abs(tarifaVenda) + Math.abs(taxaFba) + Math.abs(outrasTaxas));
+            }
+          } else if (tipoLow.indexOf('reembolso') !== -1 || tipoLow.indexOf('refund') !== -1 || tipoLow.indexOf('garantia') !== -1 || tipoLow.indexOf('chargeback') !== -1) {
+            acumCut[idPedido].reembolsado = true;
+            acumCut[idPedido].valorReembolsoLiq += totalLinha;
+          }
+        }
+
+        Object.keys(acumCut).forEach(function(idC) {
+          pedidosAmz[idC] = acumCut[idC];
+        });
+      }
+    }
+  }
 
   var ss = SpreadsheetApp.getActiveSpreadsheet();
   var abaAmz = ss.getSheetByName('3_Base_Amazon');
@@ -479,9 +660,18 @@ function importarAmazonSubpastaMensal() {
 
   Object.keys(pedidosAmz).forEach(function(id) {
     var p = pedidosAmz[id];
-    var dtFinal = p.dataRepasse || dictPrevisto[id] || p.dataVenda;
-    var liquido = Math.round((p.bruto - p.frete - p.comissao) * 100) / 100;
     var statusFinal = p.reembolsado ? 'Reembolsado' : p.status;
+
+    // REGRA ESTRITA DO AJUSTE 1: Se o pedido está com pagamento adiado (Diferido),
+    // a data de repasse/vencimento é OBRIGATORIAMENTE a coluna "Est. Data de lançamento da transação" (dictPrevisto[id])!
+    var dtFinal = '';
+    if (statusFinal === 'Diferido' && dictPrevisto[id]) {
+      dtFinal = dictPrevisto[id];
+    } else {
+      dtFinal = p.dataRepasse || dictPrevisto[id] || p.dataVenda;
+    }
+
+    var liquido = Math.round((p.bruto - p.frete - p.comissao) * 100) / 100;
     var obs = 'OK';
     var aliqAmz = p.bruto > 0 ? (p.comissao / p.bruto) : 0;
 
@@ -506,7 +696,7 @@ function importarAmazonSubpastaMensal() {
     }
 
     mapaUpsertAmz[id] = [
-      id, nomeSubpastaAlvo, p.dataVenda, dtFinal, statusFinal,
+      id, (p.origem || nomeSubpastaAlvo), p.dataVenda, dtFinal, statusFinal,
       Math.round(p.bruto * 100) / 100, Math.round(p.frete * 100) / 100,
       Math.round(p.comissao * 100) / 100, liquido, obs
     ];
@@ -514,11 +704,12 @@ function importarAmazonSubpastaMensal() {
 
   var totalAmz = fazerUpsertNaAba(abaAmz, 0, mapaUpsertAmz, [1], 2, 'DESC');
   fazerUpsertDesviosPreservandoStatus(abaDesvios, desviosAmz);
-  SpreadsheetApp.getUi().alert('✅ Amazon sincronizada com Upsert! ' + totalAmz + ' pedidos consolidados na base.');
+  arquivarVendasAntigasUnificadas(diasBuscaMp);
+  SpreadsheetApp.getUi().alert('✅ Amazon sincronizada (API Tiny Pedidos + Drive)! ' + totalAmz + ' pedidos ativos na base.');
 }
 
 // =========================================================================
-// 5. PASSO B: CONCILIAÇÃO COMPLETA (SEM DESCARTAR NENHUM TÍTULO DO TINY)
+// 5. PASSO B: CONCILIAÇÃO COMPLETA (PAREAMENTO 1-PARA-1 DE CARRINHOS/PACK ID E PARCELAS)
 // =========================================================================
 function conciliarComTinyAPI() {
   var props = PropertiesService.getScriptProperties();
@@ -536,39 +727,57 @@ function conciliarComTinyAPI() {
   var abaCentral = ss.getSheetByName('4_Central_Conciliacao_Tiny');
 
   var mapaMkt = {};
+  var listaMpDisponiveis = [];
+
+  // 1. Carrega Base Mercado Pago (compatível com layout de 11 ou 12 colunas)
   for (var i = 1; i < dadosMp.length; i++) {
     var idMp = limparIdCientifico(dadosMp[i][0]);
     if (!idMp) continue;
     var stMp = dadosMp[i][4] ? dadosMp[i][4].toString() : '';
-    mapaMkt[idMp] = {
+    var colLiquidoIdx = (dadosMp[0].length >= 12) ? 10 : 9;
+
+    var objMp = {
+      idx: i,
+      idOriginal: idMp,
       canal: 'Mercado Livre',
+      dataVenda: formatarDataParaTinyBR(dadosMp[i][2]),
       dataRepasse: formatarDataParaTinyBR(dadosMp[i][3]),
       status: stMp,
       reembolsado: stMp.toLowerCase().indexOf('reembols') !== -1 || stMp.toLowerCase().indexOf('cancel') !== -1,
       jaLiberado: dadosMp[i][5] === 'SIM',
-      bruto: parseFloat(dadosMp[i][6]) || 0,
-      frete: parseFloat(dadosMp[i][7]) || 0,
-      comissao: parseFloat(dadosMp[i][8]) || 0,
-      liquido: parseFloat(dadosMp[i][9]) || 0
+      bruto: converterMoedaBR(dadosMp[i][6]),
+      frete: converterMoedaBR(dadosMp[i][7]),
+      comissao: converterMoedaBR(dadosMp[i][8]),
+      liquido: converterMoedaBR(dadosMp[i][colLiquidoIdx]),
+      usadoNoPack: false
     };
+    if (idMp.indexOf('2,000') === -1 && idMp.indexOf('E+') === -1) {
+      mapaMkt[idMp] = objMp;
+    }
+    listaMpDisponiveis.push(objMp);
   }
+
+  // 2. Carrega Base Amazon
   for (var j = 1; j < dadosAmz.length; j++) {
     var idAmz = dadosAmz[j][0].toString().trim();
     if (!idAmz) continue;
     var stAmz = dadosAmz[j][4] ? dadosAmz[j][4].toString() : '';
     mapaMkt[idAmz] = {
+      idOriginal: idAmz,
       canal: 'Amazon',
+      dataVenda: formatarDataParaTinyBR(dadosAmz[j][2]),
       dataRepasse: formatarDataParaTinyBR(dadosAmz[j][3]),
       status: stAmz,
       reembolsado: stAmz.toLowerCase().indexOf('reembols') !== -1 || stAmz.toLowerCase().indexOf('cancel') !== -1,
       jaLiberado: stAmz === 'Liberado',
-      bruto: parseFloat(dadosAmz[j][5]) || 0,
-      frete: parseFloat(dadosAmz[j][6]) || 0,
-      comissao: parseFloat(dadosAmz[j][7]) || 0,
-      liquido: parseFloat(dadosAmz[j][8]) || 0
+      bruto: converterMoedaBR(dadosAmz[j][5]),
+      frete: converterMoedaBR(dadosAmz[j][6]),
+      comissao: converterMoedaBR(dadosAmz[j][7]),
+      liquido: converterMoedaBR(dadosAmz[j][8])
     };
   }
 
+  // 3. Consulta Contas a Receber em aberto na API do Tiny
   var pagina = 1;
   var totalPaginas = 1;
   var titulosTiny = [];
@@ -592,26 +801,85 @@ function conciliarComTinyAPI() {
     pagina++;
   }
 
+  // 4. Calcula soma por OC e reserva os matches diretos de Order ID para não serem usados como Pack ID
   var somaTinyPorOc = {};
   titulosTiny.forEach(function(t) {
     var oc = extrairOcHistorico(t.historico);
-    if (oc) somaTinyPorOc[oc] = (somaTinyPorOc[oc] || 0) + (parseFloat(t.valor) || 0);
+    if (oc) {
+      somaTinyPorOc[oc] = (somaTinyPorOc[oc] || 0) + (parseFloat(t.valor) || 0);
+      if (mapaMkt[oc]) mapaMkt[oc].usadoNoPack = true;
+    }
   });
 
+  // 5. Concilia título a título (Nível 1: ID Direto | Nível 2: Item de Carrinho 1-para-1 | Nível 3: Soma de Parcelas de Pack)
   var mapaUpsertCentral = {};
+
   titulosTiny.forEach(function(t) {
     var idTit = t.id.toString().trim();
     var oc = extrairOcHistorico(t.historico) || 'SEM_OC';
     var valorTitulo = parseFloat(t.valor) || 0;
+    var dtEmissao = formatarDataParaTinyBR(t.data_emissao || t.vencimento || t.data_vencimento);
+    var tsEmissao = converterDataBRParaTimestamp(dtEmissao);
     var matchParcela = t.historico ? t.historico.match(/\(parcela\s+\d+\/\d+\)/i) : null;
     var labelParcela = matchParcela ? matchParcela[0] : 'Única';
-    var canalTitulo = (t.categoria && t.categoria.toLowerCase().indexOf('amazon') !== -1) ? 'Amazon' : ((t.categoria && t.categoria.toLowerCase().indexOf('mercado') !== -1) ? 'Mercado Livre' : (t.categoria || 'Outros'));
 
+    // Identifica o Canal diretamente pelo formato do OC nº (pois a API de pesquisa não retorna t.categoria)
+    var canalInferido = 'Venda Direta / Outros';
+    if (/^\d{3}-\d{7}-\d{7}$/.test(oc)) canalInferido = 'Amazon';
+    else if (/^20000\d+$/.test(oc)) canalInferido = 'Mercado Livre';
+    else if (t.historico && t.historico.toLowerCase().indexOf('mercado') !== -1) canalInferido = 'Mercado Livre';
+    else if (t.historico && t.historico.toLowerCase().indexOf('amazon') !== -1) canalInferido = 'Amazon';
+
+    var m = null;
+    var proporcao = 1;
+
+    // NÍVEL 1: Casamento direto pelo OC nº (Order ID exato ou Amazon ID)
     if (oc !== 'SEM_OC' && mapaMkt[oc]) {
-      var m = mapaMkt[oc];
+      m = mapaMkt[oc];
       var somaOc = somaTinyPorOc[oc] || valorTitulo;
-      var proporcao = somaOc > 0 ? (valorTitulo / somaOc) : 1;
+      proporcao = somaOc > 0 ? (valorTitulo / somaOc) : 1;
+    }
+    // NÍVEL 2: Casamento 1-para-1 de Carrinho / Pack ID (2000014... / 2000015...) pelo Valor do Título + Data (±3 dias)
+    else if (canalInferido === 'Mercado Livre') {
+      var melhorCand = null;
+      var menorDiffDias = 999;
 
+      for (var k = 0; k < listaMpDisponiveis.length; k++) {
+        var cand = listaMpDisponiveis[k];
+        if (cand.usadoNoPack) continue;
+        var tsCand = converterDataBRParaTimestamp(cand.dataVenda);
+        var diffDias = (tsEmissao > 0 && tsCand > 0) ? (Math.abs(tsEmissao - tsCand) / (1000 * 60 * 60 * 24)) : 999;
+
+        if (diffDias <= 3 && Math.abs(cand.bruto - valorTitulo) <= 0.05) {
+          if (diffDias < menorDiffDias) {
+            menorDiffDias = diffDias;
+            melhorCand = cand;
+          }
+        }
+      }
+
+      if (melhorCand) {
+        melhorCand.usadoNoPack = true;
+        m = melhorCand;
+        proporcao = 1; // Casamento 1-para-1 exato do item do carrinho!
+      } else {
+        // NÍVEL 3: Caso um Pack ID tenha sido parcelado no cartão (soma das parcelas == valor do pagamento no MP)
+        var somaPack = somaTinyPorOc[oc] || valorTitulo;
+        for (var k2 = 0; k2 < listaMpDisponiveis.length; k2++) {
+          var cand2 = listaMpDisponiveis[k2];
+          var tsCand2 = converterDataBRParaTimestamp(cand2.dataVenda);
+          var diffDias2 = (tsEmissao > 0 && tsCand2 > 0) ? (Math.abs(tsEmissao - tsCand2) / (1000 * 60 * 60 * 24)) : 999;
+          if (diffDias2 <= 3 && Math.abs(cand2.bruto - somaPack) <= 0.05) {
+            m = cand2;
+            mapaMkt[oc] = cand2; // Vincula para as demais parcelas do mesmo Pack ID
+            proporcao = somaPack > 0 ? (valorTitulo / somaPack) : 1;
+            break;
+          }
+        }
+      }
+    }
+
+    if (m) {
       var freteProp = Math.round(m.frete * proporcao * 100) / 100;
       var comissaoProp = Math.round(m.comissao * proporcao * 100) / 100;
       var liquidoProp = Math.round(m.liquido * proporcao * 100) / 100;
@@ -634,9 +902,8 @@ function conciliarComTinyAPI() {
         statusConc, statusSincPadrao
       ];
     } else {
-      // INCLUSÃO DOS TÍTULOS PENDENTES DE VINCULAÇÃO (NUNCA MAIS PERDE NENHUM DOS 77 TÍTULOS!)
       mapaUpsertCentral[idTit] = [
-        idTit, canalTitulo, t.nome_cliente, oc, labelParcela,
+        idTit, canalInferido, t.nome_cliente, oc, labelParcela,
         formatarDataParaTinyBR(t.vencimento || t.data_vencimento), formatarDataParaTinyBR(t.vencimento || t.data_vencimento), valorTitulo,
         0, 0, 0, valorTitulo,
         '⚪ AGUARDANDO BASE MARKETPLACE', 'PENDENTE'
@@ -647,7 +914,6 @@ function conciliarComTinyAPI() {
   var totalCentral = fazerUpsertCentralTinyPreservandoBaixados(abaCentral, mapaUpsertCentral);
   SpreadsheetApp.getUi().alert('✅ Conciliação atualizada! Total de títulos monitorados na Central: ' + totalCentral);
 }
-
 // =========================================================================
 // 6 & 7. RESET E ESTORNO
 // =========================================================================
@@ -719,14 +985,13 @@ function baixarTitulosNoTiny(modoTeste) {
   var processados = 0;
 
   var startTime = new Date().getTime();
-  var tempoMaximoMs = 270000; // 4 minutos e meio (trava de segurança para nunca dar timeout no Google)
+  var tempoMaximoMs = 270000; // 4,5 minutos (trava de segurança contra timeout)
 
   for (var i = 1; i < dados.length; i++) {
     if (processados >= limite) break;
 
-    // Trava de segurança anti-timeout
     if (new Date().getTime() - startTime > tempoMaximoMs) {
-      SpreadsheetApp.getUi().alert('⏱️ Rodada encerrada por segurança (limite de tempo do Google atingido).\nForam processados ' + processados + ' títulos.\nClique novamente no Passo 9 para continuar os restantes!');
+      SpreadsheetApp.getUi().alert('⏱️ Rodada pausada por segurança anti-timeout.\nForam processados ' + processados + ' títulos.\nClique novamente no Passo 9 para continuar os restantes!');
       ordenarCentralTiny(abaCentral);
       return;
     }
@@ -741,9 +1006,10 @@ function baixarTitulosNoTiny(modoTeste) {
       continue;
     }
 
-    // Pula títulos que não estejam prontos ou que já foram baixados/processados com sucesso
     if (statusConc.indexOf('🟢') === -1 && statusConc.indexOf('🟡') === -1) continue;
     if (statusProc.indexOf('✅') !== -1) continue;
+    // Se já atualizou o vencimento de um diferido nesta data, não repete chamada à toa até ele virar Liberado (🟢)
+    if (statusConc.indexOf('🟡') !== -1 && statusProc.indexOf('📅') !== -1) continue;
 
     var idTitulo = dados[i][0].toString().trim();
     var canal = dados[i][1].toString().trim();
@@ -761,7 +1027,7 @@ function baixarTitulosNoTiny(modoTeste) {
     var isAmazon = (canal.toUpperCase().indexOf('AMAZON') !== -1);
     var nomeContaDestino = isAmazon ? 'AMAZON' : 'MERCADO PAGO';
 
-    // 1. Tratamento para Pedidos Diferidos (🟡): Atualiza data prevista e taxa
+    // 1. Pedidos Diferidos (🟡): Atualiza o vencimento no Tiny para a data "Est. Data de lançamento da transação"
     if (statusConc.indexOf('🟡') !== -1) {
       var resAlteracao = atualizarTituloDiferidoNoTiny(tinyToken, idTitulo, dataRepasse, taxaDescontada);
       abaCentral.getRange(i + 1, 14).setValue(resAlteracao.mensagem);
@@ -770,7 +1036,7 @@ function baixarTitulosNoTiny(modoTeste) {
       continue;
     }
 
-    // 2. Tratamento para Pedidos Liberados (🟢): Baixa financeira direta no Tiny
+    // 2. Pedidos Liberados (🟢): Baixa financeira direta no Tiny
     if (statusConc.indexOf('🟢') !== -1) {
       var payloadBaixar = {
         token: tinyToken,
@@ -796,7 +1062,6 @@ function baixarTitulosNoTiny(modoTeste) {
 
       var resJson = JSON.parse(respBaixa.getContentText());
 
-      // Auto-estorno inteligente: se o título estiver baixado de testes anteriores, estorna e repete
       if (resJson.retorno && resJson.retorno.erros) {
         var strErro = JSON.stringify(resJson.retorno.erros).toLowerCase();
         if (strErro.indexOf('baixada') !== -1 || strErro.indexOf('liquidada') !== -1 || strErro.indexOf('ja se encontra') !== -1) {
@@ -834,13 +1099,26 @@ function baixarTitulosNoTiny(modoTeste) {
 }
 
 // =========================================================================
-// 10. AGENDAMENTO DIÁRIO
+// 10 & 11. ARQUIVAMENTO DE GOVERNANÇA E AGENDAMENTO DIÁRIO
 // =========================================================================
+function executarArquivamentoGovernanca() {
+  var params = lerParametrosNegocio();
+  var diasAtivos = parseInt(params['DIAS_BUSCA_MP'], 10) || 60;
+  var qtdDesvios = arquivarDesviosConcluidos();
+  var qtdVendas = arquivarVendasAntigasUnificadas(diasAtivos);
+  SpreadsheetApp.getUi().alert(
+    '📦 Arquivamento concluído!\n' +
+    '• Desvios CONFERIDOS movidos para 6_Auditoria_Concluida: ' + qtdDesvios + '\n' +
+    '• Vendas antigas (> ' + diasAtivos + ' dias) movidas para 7_Historico_Vendas_Antigas: ' + qtdVendas
+  );
+}
+
 function rotinaDiariaAutomatica() {
   sincronizarMercadoPagoSeguro();
   importarAmazonSubpastaMensal();
   conciliarComTinyAPI();
   executarBaixaCompletaTiny();
+  arquivarDesviosConcluidos();
 }
 
 function ativarAgendamentoDiario() {

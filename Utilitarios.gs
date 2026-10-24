@@ -1,6 +1,6 @@
 /**
  * ARQUIVO 2: Utilitarios.gs
- * FUNÇÕES UTILITÁRIAS DE GOVERNANÇA, CÁLCULO MATEMÁTICO DE TAXAS, UPSERT E ORDENAÇÃO
+ * FUNÇÕES UTILITÁRIAS DE GOVERNANÇA, API DE PEDIDOS DO TINY (AMAZON), ARQUIVAMENTO E CÁLCULOS
  */
 
 function lerParametrosNegocio() {
@@ -15,7 +15,90 @@ function lerParametrosNegocio() {
   return mapa;
 }
 
-// CORREÇÃO: Envio do ID na raiz do POST e no corpo completo da conta (elimina o erro de ID no Tiny)
+// 1. VALIDA SE O ID É UM PEDIDO DE VENDA REAL DO MERCADO LIVRE (16 DÍGITOS INICIADOS EM 20000...)
+function ehIdPedidoVendaValidoML(idStr) {
+  if (!idStr) return false;
+  var s = limparIdCientifico(idStr);
+  // Exclui explicitamente MELIPAYMENTS, cashback, arrays [...] e Shipping IDs de 11 dígitos (47.../48...)
+  if (s.indexOf('MELIPAYMENTS') !== -1 || s.indexOf('cashback') !== -1 || s.indexOf('[') !== -1) return false;
+  return /^20000\d{10,12}$/.test(s);
+}
+
+// 2. BUSCA OS PEDIDOS DE VENDA DA AMAZON DIRETO PELA API DO TINY ERP (pedidos.pesquisa.php + pedido.obter.php)
+function buscarPedidosVendaAmazonNoTiny(tinyToken, diasRetroativos) {
+  var hoje = new Date();
+  var dataIni = Utilities.formatDate(new Date(hoje.getTime() - (diasRetroativos * 24 * 60 * 60 * 1000)), Session.getScriptTimeZone(), 'dd/MM/yyyy');
+  var dataFim = Utilities.formatDate(hoje, Session.getScriptTimeZone(), 'dd/MM/yyyy');
+
+  var pagina = 1;
+  var totalPaginas = 1;
+  var pedidosResumo = [];
+
+  while (pagina <= totalPaginas && pagina <= 10) {
+    var resp = UrlFetchApp.fetch('https://api.tiny.com.br/api2/pedidos.pesquisa.php', {
+      method: 'post',
+      payload: {
+        token: tinyToken,
+        dataInicial: dataIni,
+        dataFinal: dataFim,
+        formato: 'json',
+        pagina: pagina
+      },
+      muteHttpExceptions: true
+    });
+    var json = JSON.parse(resp.getContentText());
+    if (!json.retorno || json.retorno.status !== 'OK') break;
+    totalPaginas = parseInt(json.retorno.numero_paginas, 10) || 1;
+    (json.retorno.pedidos || []).forEach(function(p) {
+      var ped = p.pedido;
+      var numEcom = ped.numero_ecommerce ? ped.numero_ecommerce.toString().trim() : '';
+      // Filtra exclusivamente pedidos cujo código de e-commerce segue o padrão Amazon (000-0000000-0000000)
+      if (/^\d{3}-\d{7}-\d{7}$/.test(numEcom)) {
+        pedidosResumo.push(ped);
+      }
+    });
+    pagina++;
+  }
+
+  var mapaPedidosAmz = {};
+  for (var i = 0; i < pedidosResumo.length; i++) {
+    var pr = pedidosResumo[i];
+    var idAmz = pr.numero_ecommerce.toString().trim();
+    var dtVenda = formatarDataParaTinyBR(pr.data_pedido);
+    var dtPrev = pr.data_prevista ? formatarDataParaTinyBR(pr.data_prevista) : dtVenda;
+    var valBruto = parseFloat(pr.valor) || parseFloat(pr.total_pedido) || 0;
+    var sit = (pr.situacao || '').toLowerCase();
+    var isCancelado = (sit.indexOf('cancelado') !== -1 || sit.indexOf('devolvido') !== -1);
+
+    // Calcula Frete DBA (pacotes <= 200g) e comissão esperada da categoria (Moda > Cintos/Carteiras)
+    var freteDba = estimarFreteDbaAmazon(valBruto, 1);
+    var comissaoEsp = Math.round(valBruto * 0.155 * 100) / 100;
+
+    mapaPedidosAmz[idAmz] = {
+      origem: 'API Tiny Pedidos',
+      dataVenda: dtVenda,
+      dataRepasse: dtPrev,
+      status: isCancelado ? 'Reembolsado' : 'Diferido',
+      bruto: valBruto,
+      frete: freteDba,
+      comissao: comissaoEsp,
+      reembolsado: isCancelado,
+      valorReembolsoLiq: isCancelado ? -(valBruto - comissaoEsp) : 0
+    };
+  }
+  return mapaPedidosAmz;
+}
+
+function estimarFreteDbaAmazon(valorUnitario, qtd) {
+  var q = qtd || 1;
+  var vUnit = q > 0 ? (valorUnitario / q) : valorUnitario;
+  if (vUnit >= 79.00) return Math.round(11.95 * q * 100) / 100;
+  if (vUnit >= 50.00) return Math.round(6.75 * q * 100) / 100;
+  if (vUnit >= 30.00) return Math.round(6.50 * q * 100) / 100;
+  return Math.round(6.50 * q * 100) / 100;
+}
+
+// 3. ATUALIZA O VENCIMENTO DOS TÍTULOS DIFERIDOS (🟡) NO TINY ERP
 function atualizarTituloDiferidoNoTiny(tinyToken, idTitulo, novaDataVencimento, novaTaxa) {
   try {
     var respObter = UrlFetchApp.fetch('https://api.tiny.com.br/api2/conta.receber.obter.php', {
@@ -45,15 +128,16 @@ function atualizarTituloDiferidoNoTiny(tinyToken, idTitulo, novaDataVencimento, 
       });
       var jsonAlt = JSON.parse(respAlt.getContentText());
       if (jsonAlt.retorno && jsonAlt.retorno.status === 'OK') {
-        return { sucesso: true, mensagem: '✅ VENCIMENTO ATUALIZADO (' + novaDataVencimento + ')' };
+        return { sucesso: true, mensagem: '📅 VENC. ATUALIZADO NO TINY (' + novaDataVencimento + ')' };
       }
     }
-    return { sucesso: true, mensagem: '📅 MONITORADO P/ BAIXA EM ' + novaDataVencimento };
+    return { sucesso: true, mensagem: '📅 VENC. PREVISTO P/ ' + novaDataVencimento + ' (AGUARDANDO LIBERAÇÃO)' };
   } catch (e) {
-    return { sucesso: false, mensagem: '📅 MONITORADO P/ BAIXA EM ' + novaDataVencimento };
+    return { sucesso: false, mensagem: '📅 VENC. PREVISTO P/ ' + novaDataVencimento };
   }
 }
 
+// 4. FÓRMULA MATEMÁTICA ESTRITA DO MERCADO LIVRE (14% CLÁSSICO / 19% PREMIUM)
 function calcularValoresReaisVendedorML(idPedido, transAmt, freteBrutoMP, mkpFeeBruto, finFeeBruto, liquidoRealMP, feeDiscountML, mapaValoresTiny) {
   var valorTiny = mapaValoresTiny[idPedido] || 0;
   var valorPedidoReal = transAmt;
@@ -120,40 +204,40 @@ function limparIdCientifico(val) {
   return s;
 }
 
+// 5. UPSERT NAS ABAS BASE (FILTRA TRANSAÇÕES INVÁLIDAS E PADRONIZA COLUNAS)
 function fazerUpsertNaAba(aba, colChaveZeroBased, mapaNovos, colunasTextoOneBased, colDataOrdenacaoZeroBased, direcao) {
-  var chavesNovas = Object.keys(mapaNovos);
-  var numColsAlvo = chavesNovas.length > 0 ? mapaNovos[chavesNovas[0]].length : aba.getLastColumn();
+  var numColsAlvo = aba.getRange(1, 1, 1, aba.getLastColumn()).getValues()[0].filter(String).length;
+  if (!numColsAlvo || numColsAlvo === 0) numColsAlvo = 11;
 
   var dadosAtuais = aba.getLastRow() > 1 ? aba.getRange(2, 1, aba.getLastRow() - 1, aba.getLastColumn()).getDisplayValues() : [];
   var mapaConsolidado = {};
 
   for (var i = 0; i < dadosAtuais.length; i++) {
-    var linhaAntiga = dadosAtuais[i];
-    var ch = limparIdCientifico(linhaAntiga[colChaveZeroBased]);
-    if (ch && ch.indexOf('2,000') === -1 && ch.indexOf('E+') === -1) {
-      linhaAntiga[colChaveZeroBased] = ch;
+    var linha = dadosAtuais[i];
+    var ch = limparIdCientifico(linha[colChaveZeroBased]);
+    if (!ch || ch.indexOf('2,000') !== -1 || ch.indexOf('E+') !== -1) continue;
 
-      if (aba.getName() === '2_Base_MercadoPago' && linhaAntiga.length === 12 && numColsAlvo === 11) {
-        linhaAntiga.splice(9, 1);
-      }
+    // Na aba do Mercado Pago, limpa automaticamente registros antigos que não sejam vendas reais (20000...)
+    if (aba.getName() === '2_Base_MercadoPago' && !ehIdPedidoVendaValidoML(ch)) continue;
 
-      if (linhaAntiga.length > numColsAlvo) {
-        linhaAntiga = linhaAntiga.slice(0, numColsAlvo);
-      } else {
-        while (linhaAntiga.length < numColsAlvo) linhaAntiga.push('');
-      }
-
-      mapaConsolidado[ch] = linhaAntiga;
+    linha[colChaveZeroBased] = ch;
+    if (aba.getName() === '2_Base_MercadoPago' && linha.length >= 12 && numColsAlvo === 11) {
+      linha.splice(9, 1);
     }
+
+    if (linha.length > numColsAlvo) linha = linha.slice(0, numColsAlvo);
+    else while (linha.length < numColsAlvo) linha.push('');
+
+    mapaConsolidado[ch] = linha;
   }
 
-  chavesNovas.forEach(function(k) {
+  Object.keys(mapaNovos).forEach(function(k) {
     var linhaNova = mapaNovos[k];
-    if (linhaNova.length > numColsAlvo) {
-      linhaNova = linhaNova.slice(0, numColsAlvo);
-    } else {
-      while (linhaNova.length < numColsAlvo) linhaNova.push('');
+    if (aba.getName() === '2_Base_MercadoPago' && linhaNova.length >= 12 && numColsAlvo === 11) {
+      linhaNova.splice(9, 1);
     }
+    if (linhaNova.length > numColsAlvo) linhaNova = linhaNova.slice(0, numColsAlvo);
+    else while (linhaNova.length < numColsAlvo) linhaNova.push('');
     mapaConsolidado[k] = linhaNova;
   });
 
@@ -166,16 +250,13 @@ function fazerUpsertNaAba(aba, colChaveZeroBased, mapaNovos, colunasTextoOneBase
   });
 
   if (aba.getFilter()) aba.getFilter().remove();
-  if (aba.getLastRow() >= 1) {
-    aba.getRange(1, numColsAlvo + 1, aba.getMaxRows(), Math.max(1, aba.getLastColumn() - numColsAlvo + 1)).clearContent().clearFormat();
-  }
   if (aba.getLastRow() > 1) {
-    aba.getRange(2, 1, aba.getLastRow() - 1, numColsAlvo).clearContent();
+    aba.getRange(2, 1, aba.getLastRow() - 1, aba.getLastColumn()).clearContent();
   }
 
   if (listaFinal.length > 0) {
     colunasTextoOneBased.forEach(function(cIdx) {
-      aba.getRange(2, cIdx, listaFinal.length, 1).setNumberFormat('@');
+      if (cIdx <= numColsAlvo) aba.getRange(2, cIdx, listaFinal.length, 1).setNumberFormat('@');
     });
     aba.getRange(2, 1, listaFinal.length, numColsAlvo).setValues(listaFinal);
     aplicarFiltroNativoSeNaoExistir(aba, numColsAlvo);
@@ -183,6 +264,7 @@ function fazerUpsertNaAba(aba, colChaveZeroBased, mapaNovos, colunasTextoOneBase
   return listaFinal.length;
 }
 
+// 6. UPSERT NA CENTRAL DO TINY (PRESERVA BAIXADOS E ATUALIZA DIFERIDOS QUE VIRARAM LIBERADOS)
 function fazerUpsertCentralTinyPreservandoBaixados(abaCentral, mapaNovos) {
   var dadosAtuais = abaCentral.getLastRow() > 1 ? abaCentral.getRange(2, 1, abaCentral.getLastRow() - 1, 14).getDisplayValues() : [];
   var mapaConsolidado = {};
@@ -199,7 +281,12 @@ function fazerUpsertCentralTinyPreservandoBaixados(abaCentral, mapaNovos) {
     var novo = mapaNovos[idTit];
     if (mapaConsolidado[idTit]) {
       var statusAntigo = mapaConsolidado[idTit][13] ? mapaConsolidado[idTit][13].toString() : '';
+      var vencAntigo = formatarDataParaTinyBR(mapaConsolidado[idTit][6]);
+      var vencNovo = formatarDataParaTinyBR(novo[6]);
+
       if (statusAntigo.indexOf('✅ BAIXADO') !== -1 && novo[12].indexOf('🔴') === -1) {
+        novo[13] = statusAntigo;
+      } else if (novo[12].indexOf('🟡') !== -1 && statusAntigo.indexOf('📅') !== -1 && vencAntigo === vencNovo) {
         novo[13] = statusAntigo;
       }
     }
@@ -207,6 +294,7 @@ function fazerUpsertCentralTinyPreservandoBaixados(abaCentral, mapaNovos) {
   });
 
   var lista = Object.keys(mapaConsolidado).map(function(k) { return mapaConsolidado[k]; });
+  if (abaCentral.getFilter()) abaCentral.getFilter().remove();
   if (abaCentral.getLastRow() > 1) abaCentral.getRange(2, 1, abaCentral.getLastRow() - 1, 14).clearContent();
 
   if (lista.length > 0) {
@@ -235,81 +323,229 @@ function ordenarCentralTiny(abaCentral) {
   abaCentral.getRange(2, 1, dados.length, 14).setValues(dados);
 }
 
-// 5. UPSERT NAS ABAS BASE (PADRONIZAÇÃO ESTRITA DE COLUNAS CONTRA ERRO DE INTERVALO)
-function fazerUpsertNaAba(aba, colChaveZeroBased, mapaNovos, colunasTextoOneBased, colDataOrdenacaoZeroBased, direcao) {
-  // A largura do intervalo é SEMPRE a quantidade real de colunas do cabeçalho da aba (Linha 1)
-  var numColsAlvo = aba.getRange(1, 1, 1, aba.getLastColumn()).getValues()[0].filter(String).length;
-  if (!numColsAlvo || numColsAlvo === 0) numColsAlvo = 11;
+// 7. UPSERT NA ABA 5_Auditoria_Desvios (IGNORA OS JÁ ARQUIVADOS EM 6_Auditoria_Concluida)
+function fazerUpsertDesviosPreservandoStatus(abaDesvios, mapaNovosDesvios) {
+  if (!abaDesvios) return;
+  var ss = SpreadsheetApp.getActiveSpreadsheet();
+  var abaConcluidos = ss.getSheetByName('6_Auditoria_Concluida');
 
-  var dadosAtuais = aba.getLastRow() > 1 ? aba.getRange(2, 1, aba.getLastRow() - 1, aba.getLastColumn()).getDisplayValues() : [];
+  // Mapa de chaves já conferidas/arquivadas na Aba 6 para nunca recriá-las na Aba 5
+  var chavesJaAuditadas = {};
+  if (abaConcluidos && abaConcluidos.getLastRow() > 1) {
+    var dadosConcl = abaConcluidos.getRange(2, 1, abaConcluidos.getLastRow() - 1, 1).getDisplayValues();
+    for (var c = 0; c < dadosConcl.length; c++) {
+      var chC = dadosConcl[c][0] ? dadosConcl[c][0].toString().trim() : '';
+      if (chC) chavesJaAuditadas[chC] = true;
+    }
+  }
+
+  var dadosAtuais = abaDesvios.getLastRow() > 1 ? abaDesvios.getRange(2, 1, abaDesvios.getLastRow() - 1, abaDesvios.getLastColumn()).getDisplayValues() : [];
   var mapaConsolidado = {};
 
-  // 1. Processa dados já existentes na planilha garantindo a largura exata
   for (var i = 0; i < dadosAtuais.length; i++) {
-    var linha = dadosAtuais[i];
-    var ch = limparIdCientifico(linha[colChaveZeroBased]);
-    if (ch && ch.indexOf('2,000') === -1 && ch.indexOf('E+') === -1) {
-      linha[colChaveZeroBased] = ch;
-
-      // Se a linha antiga tinha 12 colunas e o alvo é 11 (remoção da antiga coluna Juros no índice 9)
-      if (aba.getName() === '2_Base_MercadoPago' && linha.length >= 12 && numColsAlvo === 11) {
-        linha.splice(9, 1);
-      }
-
-      if (linha.length > numColsAlvo) {
-        linha = linha.slice(0, numColsAlvo);
-      } else {
-        while (linha.length < numColsAlvo) linha.push('');
-      }
-
-      mapaConsolidado[ch] = linha;
-    }
-  }
-
-  // 2. Processa os novos dados forçando exatamente o tamanho numColsAlvo
-  var chavesNovas = Object.keys(mapaNovos);
-  chavesNovas.forEach(function(k) {
-    var linhaNova = mapaNovos[k];
-    
-    // Se o array novo veio com 12 colunas e o alvo da aba é 11, ajusta
-    if (aba.getName() === '2_Base_MercadoPago' && linhaNova.length >= 12 && numColsAlvo === 11) {
-      linhaNova.splice(9, 1);
-    }
-
-    if (linhaNova.length > numColsAlvo) {
-      linhaNova = linhaNova.slice(0, numColsAlvo);
+    var row = dadosAtuais[i];
+    if (row.length < 11 || (row[0] && row[0].indexOf('2026') !== -1)) {
+      var idOcAnt = limparIdCientifico(row[2]);
+      if (!idOcAnt || idOcAnt.indexOf('2,000') !== -1) continue;
+      var chAnt = (row[1] === 'Amazon' ? 'AMZ_REEMB_' : 'MP_REEMB_') + idOcAnt;
+      if (chavesJaAuditadas[chAnt]) continue;
+      mapaConsolidado[chAnt] = [
+        chAnt, formatarDataParaTinyBR(row[0]), row[1], idOcAnt, row[3],
+        converterMoedaBR(row[4]), converterMoedaBR(row[5]), 0, converterMoedaBR(row[6]), row[7], 'PENDENTE'
+      ];
     } else {
-      while (linhaNova.length < numColsAlvo) linhaNova.push('');
+      var ch = row[0].toString().trim();
+      if (ch && !chavesJaAuditadas[ch]) mapaConsolidado[ch] = row.slice(0, 11);
     }
-    mapaConsolidado[k] = linhaNova;
-  });
-
-  var listaFinal = Object.keys(mapaConsolidado).map(function(k) { return mapaConsolidado[k]; });
-
-  // Ordena pelas vendas mais recentes no topo
-  listaFinal.sort(function(a, b) {
-    var tA = converterDataBRParaTimestamp(a[colDataOrdenacaoZeroBased]);
-    var tB = converterDataBRParaTimestamp(b[colDataOrdenacaoZeroBased]);
-    return direcao === 'DESC' ? (tB - tA) : (tA - tB);
-  });
-
-  // Limpa o conteúdo de dados anterior
-  if (aba.getFilter()) aba.getFilter().remove();
-  if (aba.getLastRow() > 1) {
-    aba.getRange(2, 1, aba.getLastRow() - 1, aba.getLastColumn()).clearContent();
   }
 
-  // Grava com a garantia matemática de que todas as linhas possuem exatamente numColsAlvo
-  if (listaFinal.length > 0) {
-    colunasTextoOneBased.forEach(function(cIdx) {
-      if (cIdx <= numColsAlvo) {
-        aba.getRange(2, cIdx, listaFinal.length, 1).setNumberFormat('@');
+  Object.keys(mapaNovosDesvios).forEach(function(ch) {
+    if (chavesJaAuditadas[ch]) return; // Já conferido e arquivado na Aba 6!
+    var novo = mapaNovosDesvios[ch];
+    if (mapaConsolidado[ch]) {
+      var statusUsuario = mapaConsolidado[ch][10] ? mapaConsolidado[ch][10].toString().trim() : 'PENDENTE';
+      if (statusUsuario === 'CONFERIDO' || statusUsuario === 'ALARME FALSO/INVÁLIDO') {
+        novo[10] = statusUsuario;
       }
-    });
-    aba.getRange(2, 1, listaFinal.length, numColsAlvo).setValues(listaFinal);
-    aplicarFiltroNativoSeNaoExistir(aba, numColsAlvo);
+    }
+    mapaConsolidado[ch] = novo;
+  });
+
+  var lista = Object.keys(mapaConsolidado).map(function(k) { return mapaConsolidado[k]; });
+  lista.sort(function(a, b) {
+    var pA = (a[10] === 'PENDENTE' ? 0 : 1);
+    var pB = (b[10] === 'PENDENTE' ? 0 : 1);
+    if (pA !== pB) return pA - pB;
+    return converterDataBRParaTimestamp(b[1]) - converterDataBRParaTimestamp(a[1]);
+  });
+
+  if (abaDesvios.getFilter()) abaDesvios.getFilter().remove();
+  if (abaDesvios.getLastRow() > 1) abaDesvios.getRange(2, 1, abaDesvios.getLastRow() - 1, abaDesvios.getLastColumn()).clearContent();
+  if (lista.length > 0) {
+    abaDesvios.getRange(2, 4, lista.length, 1).setNumberFormat('@');
+    abaDesvios.getRange(2, 8, lista.length, 1).setNumberFormat('0.00%');
+    abaDesvios.getRange(2, 1, lista.length, 11).setValues(lista);
+    configurarValidacaoStatusAuditoria();
+    aplicarFiltroNativoSeNaoExistir(abaDesvios, 11);
   }
-  return listaFinal.length;
+
+  // Move imediatamente qualquer item marcado como CONFERIDO para a Aba 6
+  arquivarDesviosConcluidos();
+}
+
+// 8. MOVE DESVIOS MARCADOS COMO "CONFERIDO" OU "ALARME FALSO" PARA A ABA 6_Auditoria_Concluida
+function arquivarDesviosConcluidos() {
+  var ss = SpreadsheetApp.getActiveSpreadsheet();
+  var abaDesvios = ss.getSheetByName('5_Auditoria_Desvios');
+  var abaConcl = ss.getSheetByName('6_Auditoria_Concluida');
+  if (!abaDesvios || !abaConcl || abaDesvios.getLastRow() <= 1) return 0;
+
+  var dados = abaDesvios.getRange(2, 1, abaDesvios.getLastRow() - 1, 11).getDisplayValues();
+  var manterNaAba5 = [];
+  var moverParaAba6 = [];
+  var dataHoraConclusao = Utilities.formatDate(new Date(), Session.getScriptTimeZone(), 'dd/MM/yyyy HH:mm');
+
+  for (var i = 0; i < dados.length; i++) {
+    var st = dados[i][10] ? dados[i][10].toString().trim().toUpperCase() : 'PENDENTE';
+    if (st === 'CONFERIDO' || st === 'ALARME FALSO/INVÁLIDO') {
+      var linhaConcl = dados[i].slice(0, 11);
+      linhaConcl.push(dataHoraConclusao);
+      moverParaAba6.push(linhaConcl);
+    } else if (dados[i][0]) {
+      manterNaAba5.push(dados[i].slice(0, 11));
+    }
+  }
+
+  if (moverParaAba6.length === 0) return 0;
+
+  // Grava na aba 6_Auditoria_Concluida
+  var mapaConcl = {};
+  if (abaConcl.getLastRow() > 1) {
+    var atuais6 = abaConcl.getRange(2, 1, abaConcl.getLastRow() - 1, 12).getDisplayValues();
+    for (var j = 0; j < atuais6.length; j++) {
+      if (atuais6[j][0]) mapaConcl[atuais6[j][0]] = atuais6[j];
+    }
+  }
+  moverParaAba6.forEach(function(item) { mapaConcl[item[0]] = item; });
+  var lista6 = Object.keys(mapaConcl).map(function(k) { return mapaConcl[k]; });
+
+  if (abaConcl.getFilter()) abaConcl.getFilter().remove();
+  if (abaConcl.getLastRow() > 1) abaConcl.getRange(2, 1, abaConcl.getLastRow() - 1, 12).clearContent();
+  if (lista6.length > 0) {
+    abaConcl.getRange(2, 4, lista6.length, 1).setNumberFormat('@');
+    abaConcl.getRange(2, 1, lista6.length, 12).setValues(lista6);
+    aplicarFiltroNativoSeNaoExistir(abaConcl, 12);
+  }
+
+  // Atualiza a aba 5_Auditoria_Desvios apenas com os PENDENTES
+  if (abaDesvios.getFilter()) abaDesvios.getFilter().remove();
+  abaDesvios.getRange(2, 1, abaDesvios.getLastRow() - 1, 11).clearContent();
+  if (manterNaAba5.length > 0) {
+    abaDesvios.getRange(2, 4, manterNaAba5.length, 1).setNumberFormat('@');
+    abaDesvios.getRange(2, 8, manterNaAba5.length, 1).setNumberFormat('0.00%');
+    abaDesvios.getRange(2, 1, manterNaAba5.length, 11).setValues(manterNaAba5);
+    configurarValidacaoStatusAuditoria();
+    aplicarFiltroNativoSeNaoExistir(abaDesvios, 11);
+  }
+  return moverParaAba6.length;
+}
+
+// 9. MOVE VENDAS CONCLUÍDAS COM MAIS DE 60 DIAS (MP E AMAZON) PARA A ABA UNIFICADA 7_Historico_Vendas_Antigas
+function arquivarVendasAntigasUnificadas(diasJanelaAtiva) {
+  var ss = SpreadsheetApp.getActiveSpreadsheet();
+  var abaMp = ss.getSheetByName('2_Base_MercadoPago');
+  var abaAmz = ss.getSheetByName('3_Base_Amazon');
+  var abaHist = ss.getSheetByName('7_Historico_Vendas_Antigas');
+  if (!abaHist) return 0;
+
+  var diasCorte = diasJanelaAtiva || 60;
+  var hoje = new Date();
+  var tsLimite = hoje.getTime() - (diasCorte * 24 * 60 * 60 * 1000);
+  var dataArq = Utilities.formatDate(hoje, Session.getScriptTimeZone(), 'dd/MM/yyyy');
+  var movidos = [];
+
+  // 1. Verifica 2_Base_MercadoPago
+  if (abaMp && abaMp.getLastRow() > 1) {
+    var dadosMp = abaMp.getRange(2, 1, abaMp.getLastRow() - 1, 11).getDisplayValues();
+    var manterMp = [];
+    for (var i = 0; i < dadosMp.length; i++) {
+      var rMp = dadosMp[i];
+      var tsVendaMp = converterDataBRParaTimestamp(rMp[2]);
+      var jaLibMp = (rMp[5] === 'SIM' || rMp[4].toLowerCase().indexOf('reembols') !== -1);
+      if (tsVendaMp > 0 && tsVendaMp < tsLimite && jaLibMp) {
+        movidos.push([
+          'Mercado Livre', limparIdCientifico(rMp[0]), limparIdCientifico(rMp[1]),
+          formatarDataParaTinyBR(rMp[2]), formatarDataParaTinyBR(rMp[3]), rMp[4],
+          converterMoedaBR(rMp[6]), converterMoedaBR(rMp[7]), converterMoedaBR(rMp[8]),
+          converterMoedaBR(rMp[9]), rMp[10], dataArq
+        ]);
+      } else {
+        manterMp.push(rMp);
+      }
+    }
+    if (manterMp.length < dadosMp.length) {
+      if (abaMp.getFilter()) abaMp.getFilter().remove();
+      abaMp.getRange(2, 1, abaMp.getLastRow() - 1, 11).clearContent();
+      if (manterMp.length > 0) {
+        abaMp.getRange(2, 1, manterMp.length, 2).setNumberFormat('@');
+        abaMp.getRange(2, 1, manterMp.length, 11).setValues(manterMp);
+        aplicarFiltroNativoSeNaoExistir(abaMp, 11);
+      }
+    }
+  }
+
+  // 2. Verifica 3_Base_Amazon
+  if (abaAmz && abaAmz.getLastRow() > 1) {
+    var dadosAmz = abaAmz.getRange(2, 1, abaAmz.getLastRow() - 1, 10).getDisplayValues();
+    var manterAmz = [];
+    for (var j = 0; j < dadosAmz.length; j++) {
+      var rAmz = dadosAmz[j];
+      var tsVendaAmz = converterDataBRParaTimestamp(rAmz[2]);
+      var jaConclAmz = (rAmz[4] === 'Liberado' || rAmz[4] === 'Reembolsado');
+      if (tsVendaAmz > 0 && tsVendaAmz < tsLimite && jaConclAmz) {
+        movidos.push([
+          'Amazon', rAmz[0], rAmz[1], formatarDataParaTinyBR(rAmz[2]), formatarDataParaTinyBR(rAmz[3]),
+          rAmz[4], converterMoedaBR(rAmz[5]), converterMoedaBR(rAmz[6]), converterMoedaBR(rAmz[7]),
+          converterMoedaBR(rAmz[8]), rAmz[9], dataArq
+        ]);
+      } else {
+        manterAmz.push(rAmz);
+      }
+    }
+    if (manterAmz.length < dadosAmz.length) {
+      if (abaAmz.getFilter()) abaAmz.getFilter().remove();
+      abaAmz.getRange(2, 1, abaAmz.getLastRow() - 1, 10).clearContent();
+      if (manterAmz.length > 0) {
+        abaAmz.getRange(2, 1, manterAmz.length, 1).setNumberFormat('@');
+        abaAmz.getRange(2, 1, manterAmz.length, 10).setValues(manterAmz);
+        aplicarFiltroNativoSeNaoExistir(abaAmz, 10);
+      }
+    }
+  }
+
+  if (movidos.length === 0) return 0;
+
+  var mapaHist = {};
+  if (abaHist.getLastRow() > 1) {
+    var atuaisH = abaHist.getRange(2, 1, abaHist.getLastRow() - 1, 12).getDisplayValues();
+    for (var h = 0; h < atuaisH.length; h++) {
+      if (atuaisH[h][1]) mapaHist[atuaisH[h][1]] = atuaisH[h];
+    }
+  }
+  movidos.forEach(function(m) { mapaHist[m[1]] = m; });
+  var listaH = Object.keys(mapaHist).map(function(k) { return mapaHist[k]; });
+  listaH.sort(function(a, b) {
+    return converterDataBRParaTimestamp(b[3]) - converterDataBRParaTimestamp(a[3]);
+  });
+
+  if (abaHist.getFilter()) abaHist.getFilter().remove();
+  if (abaHist.getLastRow() > 1) abaHist.getRange(2, 1, abaHist.getLastRow() - 1, 12).clearContent();
+  if (listaH.length > 0) {
+    abaHist.getRange(2, 2, listaH.length, 2).setNumberFormat('@');
+    abaHist.getRange(2, 1, listaH.length, 12).setValues(listaH);
+    aplicarFiltroNativoSeNaoExistir(abaHist, 12);
+  }
+  return movidos.length;
 }
 
 function configurarValidacaoStatusAuditoria() {
