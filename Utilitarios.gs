@@ -98,7 +98,7 @@ function estimarFreteDbaAmazon(valorUnitario, qtd) {
   return Math.round(6.50 * q * 100) / 100;
 }
 
-// 3. ATUALIZA A DATA DE VENCIMENTO E TAXA NO TINY ERP USANDO O FORMATO OFICIAL DA API 2.0
+// 3. ATUALIZA A DATA DE VENCIMENTO DO TÍTULO NO TINY ERP VIA XML OFICIAL
 function atualizarTituloDiferidoNoTiny(tinyToken, idTitulo, novaDataVencimento, novaTaxa) {
   try {
     var respObter = UrlFetchApp.fetch('https://api.tiny.com.br/api2/conta.receber.obter.php', {
@@ -109,7 +109,7 @@ function atualizarTituloDiferidoNoTiny(tinyToken, idTitulo, novaDataVencimento, 
     var jsonObter = JSON.parse(respObter.getContentText());
 
     if (!jsonObter.retorno || jsonObter.retorno.status !== 'OK' || !jsonObter.retorno.conta) {
-      return { sucesso: false, mensagem: '⚠️ Erro ao obter conta ' + idTitulo + ' no Tiny' };
+      return { sucesso: false, mensagem: '⚠️ Não foi possível obter o título no Tiny' };
     }
 
     var orig = jsonObter.retorno.conta;
@@ -117,7 +117,6 @@ function atualizarTituloDiferidoNoTiny(tinyToken, idTitulo, novaDataVencimento, 
     var docValor = parseFloat(orig.valor) || 0;
     var taxaVal = parseFloat(novaTaxa) || 0;
 
-    // 1ª Tentativa: Envio em XML Oficial da API 2.0 do Tiny ERP para conta.receber.alterar.php
     var xmlAlterar = '<?xml version="1.0" encoding="UTF-8"?>' +
       '<conta>' +
       '<id>' + idTitulo + '</id>' +
@@ -129,7 +128,6 @@ function atualizarTituloDiferidoNoTiny(tinyToken, idTitulo, novaDataVencimento, 
       '<nro_documento>' + escaparXmlTiny(orig.nro_documento || '') + '</nro_documento>' +
       '<historico>' + escaparXmlTiny(orig.historico || '') + '</historico>' +
       '<categoria>' + escaparXmlTiny(orig.categoria || '') + '</categoria>' +
-      '<portador>' + escaparXmlTiny(orig.portador || orig.forma_pagamento || '') + '</portador>' +
       '<cliente>' +
       '<nome>' + escaparXmlTiny(nomeCli) + '</nome>' +
       '</cliente>' +
@@ -146,36 +144,15 @@ function atualizarTituloDiferidoNoTiny(tinyToken, idTitulo, novaDataVencimento, 
       muteHttpExceptions: true
     });
     var jsonXml = JSON.parse(respXml.getContentText());
+    
     if (jsonXml.retorno && jsonXml.retorno.status === 'OK') {
       return { sucesso: true, mensagem: '📅 VENC. ATUALIZADO NO TINY (' + novaDataVencimento + ')' };
+    } else {
+      var err = jsonXml.retorno && jsonXml.retorno.erros ? JSON.stringify(jsonXml.retorno.erros) : 'Erro na alteração';
+      return { sucesso: false, mensagem: '⚠️ ' + err };
     }
-
-    // 2ª Tentativa: Objeto JSON preservando estrutura original com vencimento atualizado
-    orig.id = Number(idTitulo);
-    orig.vencimento = novaDataVencimento;
-    orig.data_vencimento = novaDataVencimento;
-    orig.taxa = Number(taxaVal.toFixed(2));
-    orig.valor_taxa = Number(taxaVal.toFixed(2));
-
-    var respJson = UrlFetchApp.fetch('https://api.tiny.com.br/api2/conta.receber.alterar.php', {
-      method: 'post',
-      payload: {
-        token: tinyToken,
-        id: idTitulo,
-        formato: 'json',
-        conta: JSON.stringify({ conta: orig })
-      },
-      muteHttpExceptions: true
-    });
-    var resJ = JSON.parse(respJson.getContentText());
-    if (resJ.retorno && resJ.retorno.status === 'OK') {
-      return { sucesso: true, mensagem: '📅 VENC. ATUALIZADO NO TINY (' + novaDataVencimento + ')' };
-    }
-
-    var detErro = (resJ.retorno && resJ.retorno.erros) ? JSON.stringify(resJ.retorno.erros) : 'Restrição de edição no Tiny';
-    return { sucesso: false, mensagem: '⚠️ ' + detErro };
   } catch (e) {
-    return { sucesso: false, mensagem: '⚠️ Erro: ' + e.message };
+    return { sucesso: false, mensagem: '⚠️ Erro API: ' + e.message };
   }
 }
 
