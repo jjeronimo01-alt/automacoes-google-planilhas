@@ -24,12 +24,11 @@ function onOpen() {
 }
 
 // =========================================================================
-// 1. CONFIGURAÇÃO DE ABAS (COM DIAS_BUSCA_TINY, SEM COLUNA JUROS E COM 5_Auditoria_Desvios)
+// 1. CONFIGURAÇÃO DE ABAS
 // =========================================================================
 function configurarEstruturaSegura() {
   var ss = SpreadsheetApp.getActiveSpreadsheet();
 
-  // Se existir a aba com nome antigo, renomeia preservando o histórico
   var abaAntiga = ss.getSheetByName('5_Auditoria_Desvios_Reembolsos');
   if (abaAntiga && !ss.getSheetByName('5_Auditoria_Desvios')) {
     abaAntiga.setName('5_Auditoria_Desvios');
@@ -136,7 +135,7 @@ function abrirCofreCredenciais() {
 }
 
 // =========================================================================
-// 3. PASSO A1: MERCADO PAGO (VALORES REAIS + AUDITORIA 14%/19% + UPSERT)
+// 3. PASSO A1: MERCADO PAGO (MAPEAMENTO DE ORDER ID E PACK ID)
 // =========================================================================
 function sincronizarMercadoPagoSeguro() {
   var props = PropertiesService.getScriptProperties();
@@ -151,13 +150,10 @@ function sincronizarMercadoPagoSeguro() {
   var hoje = new Date();
   var dataHojeBR = Utilities.formatDate(hoje, Session.getScriptTimeZone(), 'dd/MM/yyyy');
 
-  // Mapa de valores originais dos pedidos no Tiny para expurgar eventual frete extra pago pelo comprador
   var mapaValoresTiny = obterMapaValoresBrutosTiny();
-
   var vendasNovasOuAtualizadas = {};
   var desviosNovosOuAtualizados = {};
 
-  // 1. Leitura complementar da planilha oficial do MP no Drive (se existir na subpasta)
   if (rootFolderId) {
     try {
       var pastaMes = obterSubpastaMensalDrive(rootFolderId, hoje);
@@ -173,6 +169,7 @@ function sincronizarMercadoPagoSeguro() {
           var h = dadosMpPlan[0].map(function(c) { return c.toString().trim().toUpperCase(); });
           var colExt = h.indexOf('EXTERNAL REFERENCE');
           var colOrder = h.indexOf('ORDER ID');
+          var colPack = h.indexOf('PACK ID');
           var colSource = h.indexOf('SOURCE ID');
           var colStatus = h.indexOf('TRANSACTION TYPE');
           var colBruto = h.indexOf('TRANSACTION AMOUNT');
@@ -188,7 +185,10 @@ function sincronizarMercadoPagoSeguro() {
           for (var r = 1; r < dadosMpPlan.length; r++) {
             var rowP = dadosMpPlan[r];
             var tipoTrans = rowP[colStatus] ? rowP[colStatus].trim() : '';
-            var idChave = limparIdCientifico(colExt !== -1 ? rowP[colExt] : '') || limparIdCientifico(colOrder !== -1 ? rowP[colOrder] : '');
+            var idExt = limparIdCientifico(colExt !== -1 ? rowP[colExt] : '');
+            var idOrd = limparIdCientifico(colOrder !== -1 ? rowP[colOrder] : '');
+            var idPack = limparIdCientifico(colPack !== -1 ? rowP[colPack] : '');
+            var idChave = idExt || idOrd;
             if (!idChave || idChave.indexOf('[') !== -1) continue;
 
             var idPag = limparIdCientifico(colSource !== -1 ? rowP[colSource] : '');
@@ -201,17 +201,17 @@ function sincronizarMercadoPagoSeguro() {
             var dtVenda = (colDataOp !== -1 && rowP[colDataOp]) ? formatarDataParaTinyBR(rowP[colDataOp]) : '';
             var isRelStr = (colRel !== -1 && rowP[colRel]) ? rowP[colRel].toString().toUpperCase() : '';
             var jaLiberado = (isRelStr === 'TRUE' || isRelStr === 'VERDADEIRO' || dataJaPassouOuHoje(dtLib, hoje));
-
-            // Desconto de campanha (fee_discount) concedido pelo ML no METADATA
             var feeDiscount = extrairFeeDiscountMetadata(colMeta !== -1 ? rowP[colMeta] : '');
 
-            // Verifica se é Reembolso / Contestação / Mediação
             var tipoLower = tipoTrans.toLowerCase();
             if (tipoLower.indexOf('contesta') !== -1 || tipoLower.indexOf('media') !== -1 || tipoLower.indexOf('reembols') !== -1 || tipoLower.indexOf('devolu') !== -1 || transAmt < 0) {
-              vendasNovasOuAtualizadas[idChave] = [
+              var linReemb = [
                 idChave, idPag, dtVenda, dtLib, 'Reembolsado (' + tipoTrans + ')',
                 'NÃO', Math.abs(transAmt), vShipBruto, vMkpBruto, -Math.abs(vLiq), 'Planilha Oficial MP'
               ];
+              vendasNovasOuAtualizadas[idChave] = linReemb;
+              if (idPack && idPack !== idChave) vendasNovasOuAtualizadas[idPack] = linReemb;
+
               var chaveDesv = 'MP_REEMB_' + idChave;
               desviosNovosOuAtualizados[chaveDesv] = [
                 chaveDesv, dataHojeBR, 'Mercado Livre', idChave, 'Reembolso / Contestação (' + tipoTrans + ')',
@@ -222,16 +222,23 @@ function sincronizarMercadoPagoSeguro() {
             }
 
             if (tipoLower.indexOf('aprovado') !== -1 || tipoLower.indexOf('approved') !== -1) {
-              // FÓRMULA DO ITEM 4: Expurga juros de parcelamento e frete extra pagos pelo comprador
               var calc = calcularValoresReaisVendedorML(idChave, transAmt, vShipBruto, vMkpBruto, vFinBruto, vLiq, feeDiscount, mapaValoresTiny);
-
-              vendasNovasOuAtualizadas[idChave] = [
+              var linAprov = [
                 idChave, idPag, dtVenda, dtLib, 'approved',
                 jaLiberado ? 'SIM' : 'NÃO', calc.valorPedidoReal, calc.freteRealNosso,
                 calc.comissaoRealNossa, calc.valorLiquidoReal, 'Planilha Oficial MP'
               ];
 
-              // AUDITORIA DO ITEM 6: Verifica se a comissão está em 13,98%-14,02% ou 18,98%-19,02%
+              vendasNovasOuAtualizadas[idChave] = linAprov;
+              // Mapeia também o PACK ID para cruzar com títulos de carrinho do Tiny
+              if (idPack && idPack !== idChave) {
+                vendasNovasOuAtualizadas[idPack] = [
+                  idPack, idPag, dtVenda, dtLib, 'approved',
+                  jaLiberado ? 'SIM' : 'NÃO', calc.valorPedidoReal, calc.freteRealNosso,
+                  calc.comissaoRealNossa, calc.valorLiquidoReal, 'Planilha Oficial MP (Pack ID)'
+                ];
+              }
+
               if (calc.foraDaRegraComissao) {
                 var chaveCom = 'MP_COMISS_' + idChave;
                 desviosNovosOuAtualizados[chaveCom] = [
@@ -251,7 +258,6 @@ function sincronizarMercadoPagoSeguro() {
     }
   }
 
-  // 2. Consulta API do Mercado Pago (Paginada cobrindo DIAS_BUSCA_MP)
   if (mpToken) {
     var dataInicio = new Date(hoje.getTime() - (diasBuscaMp * 24 * 60 * 60 * 1000));
     var isoInicio = Utilities.formatDate(dataInicio, "GMT-03:00", "yyyy-MM-dd'T'00:00:00.000-03:00");
@@ -282,7 +288,6 @@ function sincronizarMercadoPagoSeguro() {
                             statusDetail.indexOf('refund') !== -1 || statusDetail.indexOf('chargeback') !== -1 ||
                             (p.refunds && p.refunds.length > 0) || (parseFloat(p.transaction_amount_refunded) > 0));
 
-        // Se já veio detalhado pela planilha oficial e não sofreu novo reembolso na API, preserva a planilha
         if (vendasNovasOuAtualizadas[idPedido] && !temReembolso) continue;
 
         var vBrutoAPI = parseFloat(p.transaction_amount) || 0;
@@ -301,7 +306,6 @@ function sincronizarMercadoPagoSeguro() {
 
         if (p.fee_details && p.fee_details.length > 0) {
           p.fee_details.forEach(function(fd) {
-            // Desconsidera taxas cujo pagador seja o comprador (payer)
             if (fd.fee_payer === 'payer') return;
             var valF = Math.abs(parseFloat(fd.amount) || 0);
             var tF = (fd.type || '').toLowerCase();
@@ -358,16 +362,13 @@ function sincronizarMercadoPagoSeguro() {
     }
   }
 
-  // Upsert na aba 2_Base_MercadoPago (atualiza existentes e insere novas sem apagar histórico)
   var totalMp = fazerUpsertNaAba(abaMp, 0, vendasNovasOuAtualizadas, [1, 2], 2, 'DESC');
-  // Upsert na aba 5_Auditoria_Desvios preservando o Status Auditoria (CONFERIDO / ALARME FALSO) já preenchido por você
   fazerUpsertDesviosPreservandoStatus(abaDesvios, desviosNovosOuAtualizados);
-
-  SpreadsheetApp.getUi().alert('✅ Mercado Pago sincronizado e atualizado! Total de registros na base: ' + totalMp);
+  SpreadsheetApp.getUi().alert('✅ Mercado Pago sincronizado! Total na base: ' + totalMp + ' vendas.');
 }
 
 // =========================================================================
-// 4. PASSO A2: AMAZON COM CONTROLE DE ARQUIVOS LIDOS E UPSERT DE DEVOLUÇÕES
+// 4. PASSO A2: AMAZON VIA Utilities.parseCsv
 // =========================================================================
 function importarAmazonSubpastaMensal() {
   var props = PropertiesService.getScriptProperties();
@@ -385,7 +386,6 @@ function importarAmazonSubpastaMensal() {
 
   if (!arqUnified.hasNext()) throw new Error('CustomUnifiedTransaction não encontrado na subpasta ' + nomeSubpastaAlvo);
 
-  // Registro de arquivos já processados (evita releitura desnecessária, mas processa arquivos novos/atualizados)
   var regProcessados = JSON.parse(props.getProperty('ARQUIVOS_AMAZON_PROCESSADOS') || '{}');
   var dictPrevisto = {};
 
@@ -514,12 +514,11 @@ function importarAmazonSubpastaMensal() {
 
   var totalAmz = fazerUpsertNaAba(abaAmz, 0, mapaUpsertAmz, [1], 2, 'DESC');
   fazerUpsertDesviosPreservandoStatus(abaDesvios, desviosAmz);
-
   SpreadsheetApp.getUi().alert('✅ Amazon sincronizada com Upsert! ' + totalAmz + ' pedidos consolidados na base.');
 }
 
 // =========================================================================
-// 5. PASSO B: CONCILIAÇÃO COM TINY (COM RANGE DIAS_BUSCA_TINY E UPSERT)
+// 5. PASSO B: CONCILIAÇÃO COMPLETA (SEM DESCARTAR NENHUM TÍTULO DO TINY)
 // =========================================================================
 function conciliarComTinyAPI() {
   var props = PropertiesService.getScriptProperties();
@@ -602,12 +601,13 @@ function conciliarComTinyAPI() {
   var mapaUpsertCentral = {};
   titulosTiny.forEach(function(t) {
     var idTit = t.id.toString().trim();
-    var oc = extrairOcHistorico(t.historico);
+    var oc = extrairOcHistorico(t.historico) || 'SEM_OC';
     var valorTitulo = parseFloat(t.valor) || 0;
     var matchParcela = t.historico ? t.historico.match(/\(parcela\s+\d+\/\d+\)/i) : null;
     var labelParcela = matchParcela ? matchParcela[0] : 'Única';
+    var canalTitulo = (t.categoria && t.categoria.toLowerCase().indexOf('amazon') !== -1) ? 'Amazon' : ((t.categoria && t.categoria.toLowerCase().indexOf('mercado') !== -1) ? 'Mercado Livre' : (t.categoria || 'Outros'));
 
-    if (oc && mapaMkt[oc]) {
+    if (oc !== 'SEM_OC' && mapaMkt[oc]) {
       var m = mapaMkt[oc];
       var somaOc = somaTinyPorOc[oc] || valorTitulo;
       var proporcao = somaOc > 0 ? (valorTitulo / somaOc) : 1;
@@ -632,6 +632,14 @@ function conciliarComTinyAPI() {
         formatarDataParaTinyBR(t.vencimento || t.data_vencimento), m.dataRepasse, valorTitulo,
         freteProp, comissaoProp, taxaEfetivaTiny, liquidoProp,
         statusConc, statusSincPadrao
+      ];
+    } else {
+      // INCLUSÃO DOS TÍTULOS PENDENTES DE VINCULAÇÃO (NUNCA MAIS PERDE NENHUM DOS 77 TÍTULOS!)
+      mapaUpsertCentral[idTit] = [
+        idTit, canalTitulo, t.nome_cliente, oc, labelParcela,
+        formatarDataParaTinyBR(t.vencimento || t.data_vencimento), formatarDataParaTinyBR(t.vencimento || t.data_vencimento), valorTitulo,
+        0, 0, 0, valorTitulo,
+        '⚪ AGUARDANDO BASE MARKETPLACE', 'PENDENTE'
       ];
     }
   });
@@ -680,14 +688,14 @@ function estornarContasBaixadasNoTiny() {
       abaCentral.getRange(i + 1, 14).setValue('PENDENTE (ESTORNADO NO TINY)');
       estornados++;
     }
-    Utilities.sleep(600);
+    Utilities.sleep(300);
   }
 
   SpreadsheetApp.getUi().alert('Estorno concluído! ' + estornados + ' títulos voltaram para "Em aberto" no Tiny.');
 }
 
 // =========================================================================
-// 8 & 9. PASSO C: ATUALIZAÇÃO DE DIFERIDOS CORRIGIDA + BAIXA DE LIBERADOS INTACTA
+// 8 & 9. PASSO C: BAIXA AUTOMÁTICA OTIMIZADA COM TRAVA ANTI-TIMEOUT
 // =========================================================================
 function testarBaixaPequenaEscala() {
   baixarTitulosNoTiny(true);
@@ -710,12 +718,22 @@ function baixarTitulosNoTiny(modoTeste) {
   var limite = modoTeste ? 5 : 9999;
   var processados = 0;
 
+  var startTime = new Date().getTime();
+  var tempoMaximoMs = 270000; // 4 minutos e meio (trava de segurança para nunca dar timeout no Google)
+
   for (var i = 1; i < dados.length; i++) {
     if (processados >= limite) break;
+
+    // Trava de segurança anti-timeout
+    if (new Date().getTime() - startTime > tempoMaximoMs) {
+      SpreadsheetApp.getUi().alert('⏱️ Rodada encerrada por segurança (limite de tempo do Google atingido).\nForam processados ' + processados + ' títulos.\nClique novamente no Passo 9 para continuar os restantes!');
+      ordenarCentralTiny(abaCentral);
+      return;
+    }
+
     var statusConc = dados[i][12] ? dados[i][12].toString() : '';
     var statusProc = dados[i][13] ? dados[i][13].toString() : '';
 
-    // Se for Reembolsado (🔴), marca como CANCELADO / REEMBOLSADO e bloqueia baixa
     if (statusConc.indexOf('🔴') !== -1) {
       if (statusProc.indexOf('CANCELADO') === -1) {
         abaCentral.getRange(i + 1, 14).setValue('🚫 CANCELADO / BLOQUEADO (REEMBOLSO)');
@@ -723,7 +741,8 @@ function baixarTitulosNoTiny(modoTeste) {
       continue;
     }
 
-    // Ignora títulos que já estão finalizados com ✅
+    // Pula títulos que não estejam prontos ou que já foram baixados/processados com sucesso
+    if (statusConc.indexOf('🟢') === -1 && statusConc.indexOf('🟡') === -1) continue;
     if (statusProc.indexOf('✅') !== -1) continue;
 
     var idTitulo = dados[i][0].toString().trim();
@@ -739,33 +758,20 @@ function baixarTitulosNoTiny(modoTeste) {
     var valorDoc = parseFloat(dados[i][7]) || 0;
     var taxaDescontada = Math.round((parseFloat(dados[i][10]) || 0) * 100) / 100;
     var liquidoRecebido = Math.round((valorDoc - taxaDescontada) * 100) / 100;
-
     var isAmazon = (canal.toUpperCase().indexOf('AMAZON') !== -1);
     var nomeContaDestino = isAmazon ? 'AMAZON' : 'MERCADO PAGO';
 
-    // =========================================================================
-    // CORREÇÃO DO ITEM 1°: TRATAMENTO EXCLUSIVO PARA PEDIDOS DIFERIDOS (🟡)
-    // Busca o registro original via conta.receber.obter.php e envia o objeto completo + id na raiz
-    // =========================================================================
+    // 1. Tratamento para Pedidos Diferidos (🟡): Atualiza data prevista e taxa
     if (statusConc.indexOf('🟡') !== -1) {
       var resAlteracao = atualizarTituloDiferidoNoTiny(tinyToken, idTitulo, dataRepasse, taxaDescontada);
       abaCentral.getRange(i + 1, 14).setValue(resAlteracao.mensagem);
       if (resAlteracao.sucesso) processados++;
-      Utilities.sleep(800);
+      Utilities.sleep(300);
       continue;
     }
 
-    // =========================================================================
-    // ETAPA DE BAIXA PARA PEDIDOS LIBERADOS (🟢) — MANTIDA EXATAMENTE COMO FUNCIONOU!
-    // =========================================================================
+    // 2. Tratamento para Pedidos Liberados (🟢): Baixa financeira direta no Tiny
     if (statusConc.indexOf('🟢') !== -1) {
-      UrlFetchApp.fetch('https://api.tiny.com.br/api2/conta.receber.estornar.php', {
-        method: 'post',
-        payload: { token: tinyToken, id: idTitulo, formato: 'json' },
-        muteHttpExceptions: true
-      });
-      Utilities.sleep(600);
-
       var payloadBaixar = {
         token: tinyToken,
         formato: 'json',
@@ -790,6 +796,26 @@ function baixarTitulosNoTiny(modoTeste) {
 
       var resJson = JSON.parse(respBaixa.getContentText());
 
+      // Auto-estorno inteligente: se o título estiver baixado de testes anteriores, estorna e repete
+      if (resJson.retorno && resJson.retorno.erros) {
+        var strErro = JSON.stringify(resJson.retorno.erros).toLowerCase();
+        if (strErro.indexOf('baixada') !== -1 || strErro.indexOf('liquidada') !== -1 || strErro.indexOf('ja se encontra') !== -1) {
+          UrlFetchApp.fetch('https://api.tiny.com.br/api2/conta.receber.estornar.php', {
+            method: 'post',
+            payload: { token: tinyToken, id: idTitulo, formato: 'json' },
+            muteHttpExceptions: true
+          });
+          Utilities.sleep(300);
+
+          respBaixa = UrlFetchApp.fetch('https://api.tiny.com.br/api2/conta.receber.baixar.php', {
+            method: 'post',
+            payload: payloadBaixar,
+            muteHttpExceptions: true
+          });
+          resJson = JSON.parse(respBaixa.getContentText());
+        }
+      }
+
       if (resJson.retorno && resJson.retorno.status === 'OK') {
         abaCentral.getRange(i + 1, 14).setValue(
           '✅ BAIXADO EM ' + nomeContaDestino + ' (Líq: R$ ' + liquidoRecebido.toFixed(2) + ' | Taxa: R$ ' + taxaDescontada.toFixed(2) + ')'
@@ -799,7 +825,7 @@ function baixarTitulosNoTiny(modoTeste) {
         var msgErro = (resJson.retorno && resJson.retorno.erros) ? JSON.stringify(resJson.retorno.erros) : 'Erro na baixa';
         abaCentral.getRange(i + 1, 14).setValue('⚠️ ' + msgErro);
       }
-      Utilities.sleep(1000);
+      Utilities.sleep(300);
     }
   }
 
