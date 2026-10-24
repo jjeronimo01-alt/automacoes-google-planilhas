@@ -709,7 +709,7 @@ function importarAmazonSubpastaMensal() {
 }
 
 // =========================================================================
-// 5. PASSO B: CONCILIAÇÃO (VÍNCULO DIRETO PELO PREFIXO 20000 E REFLEXO DE DATAS)
+// 5. PASSO B: CONCILIAÇÃO VIVA (PROPAGAÇÃO DE DATAS E STATUS DINÂMICO)
 // =========================================================================
 function conciliarComTinyAPI() {
   var props = PropertiesService.getScriptProperties();
@@ -740,7 +740,7 @@ function conciliarComTinyAPI() {
   var mapaMkt = {};
   var listaMpDisponiveis = [];
 
-  // 1. Carrega Base Mercado Pago com a data de repasse mais recente
+  // 1. Carrega Base Mercado Pago com a data de repasse mais recente da API
   for (var i = 1; i < dadosMp.length; i++) {
     var idMp = limparIdCientifico(dadosMp[i][0]);
     if (!idMp) continue;
@@ -840,7 +840,6 @@ function conciliarComTinyAPI() {
     var matchParcela = t.historico ? t.historico.match(/\(parcela\s+\d+\/\d+\)/i) : null;
     var labelParcela = matchParcela ? matchParcela[0] : 'Única';
 
-    // Qualquer OC numérico iniciado em 20000 é identificado como Mercado Livre
     var canalInferido = 'Venda Direta';
     if (/^\d{3}-\d{7}-\d{7}$/.test(oc)) canalInferido = 'Amazon';
     else if (oc.indexOf('20000') === 0 || (t.historico && t.historico.toLowerCase().indexOf('mercado') !== -1)) canalInferido = 'Mercado Livre';
@@ -855,7 +854,7 @@ function conciliarComTinyAPI() {
       var somaOc = somaTinyPorOc[oc] || valorTitulo;
       proporcao = somaOc > 0 ? (valorTitulo / somaOc) : 1;
     }
-    // Nível 2: Casamento por valor e data aproximada da venda
+    // Nível 2: Casamento por valor e janela de data
     else if (canalInferido === 'Mercado Livre') {
       var melhorCand = null;
       var menorDiff = 999;
@@ -863,7 +862,7 @@ function conciliarComTinyAPI() {
       for (var k = 0; k < listaMpDisponiveis.length; k++) {
         var cand = listaMpDisponiveis[k];
         if (cand.usadoNoPack) continue;
-        if (Math.abs(cand.bruto - valorTitulo) > 0.10) continue;
+        if (Math.abs(cand.bruto - valorTitulo) > 0.15) continue;
 
         var tsVendaCand = converterDataBRParaTimestamp(cand.dataVenda);
         var diff = Math.abs(tsVendaEstimada - tsVendaCand) / (1000 * 60 * 60 * 24);
@@ -906,17 +905,21 @@ function conciliarComTinyAPI() {
         statusConc, statusSincPadrao
       ];
     } else {
+      // Se possui canal identificado mas não casou lote específico, assume status de aguardo dinâmico
+      var dtFutura = dataJaPassouOuHoje(dtVencOriginal, hoje);
+      var stDinamico = dtFutura ? '🟢 PRONTO PARA CONCILIAÇÃO' : '🟡 AGUARDANDO REPASSE (DIFERIDO)';
+
       mapaUpsertCentral[idTit] = [
         idTit, canalInferido, t.nome_cliente, oc, labelParcela,
         dtVencOriginal, dtVencOriginal, valorTitulo,
         0, 0, 0, valorTitulo,
-        '⚪ AGUARDANDO BASE MARKETPLACE', 'PENDENTE'
+        stDinamico, 'PENDENTE'
       ];
     }
   });
 
   var totalCentral = fazerUpsertCentralTinyPreservandoBaixados(abaCentral, mapaUpsertCentral);
-  SpreadsheetApp.getUi().alert('✅ Conciliação concluída! Títulos monitorados: ' + totalCentral);
+  SpreadsheetApp.getUi().alert('✅ Conciliação atualizada com sucesso! Títulos monitorados: ' + totalCentral);
 }
 
 // =========================================================================
@@ -1096,6 +1099,9 @@ function executarBaixaCompletaTiny() {
   baixarTitulosNoTiny(false);
 }
 
+// =========================================================================
+// 8 & 9. PASSO C: BAIXA AUTOMÁTICA E ATUALIZAÇÃO SEGURA (RATE LIMIT 700MS)
+// =========================================================================
 function baixarTitulosNoTiny(modoTeste) {
   var props = PropertiesService.getScriptProperties();
   var tinyToken = props.getProperty('TINY_API_TOKEN');
@@ -1111,13 +1117,13 @@ function baixarTitulosNoTiny(modoTeste) {
   var processados = 0;
 
   var startTime = new Date().getTime();
-  var tempoMaximoMs = 270000; // 4,5 minutos (trava de segurança contra timeout)
+  var tempoMaximoMs = 270000;
 
   for (var i = 1; i < dados.length; i++) {
     if (processados >= limite) break;
 
     if (new Date().getTime() - startTime > tempoMaximoMs) {
-      SpreadsheetApp.getUi().alert('⏱️ Rodada pausada por segurança anti-timeout.\nForam processados ' + processados + ' títulos.\nClique novamente no Passo 9 para continuar os restantes!');
+      SpreadsheetApp.getUi().alert('⏱️ Rodada pausada por limite de tempo. Clique no Passo 9 para continuar os restantes.');
       ordenarCentralTiny(abaCentral);
       return;
     }
@@ -1125,29 +1131,21 @@ function baixarTitulosNoTiny(modoTeste) {
     var statusConc = dados[i][12] ? dados[i][12].toString() : '';
     var statusProc = dados[i][13] ? dados[i][13].toString() : '';
 
-    if (statusConc.indexOf('🔴') !== -1) {
-      if (statusProc.indexOf('CANCELADO') === -1) {
-        abaCentral.getRange(i + 1, 14).setValue('🚫 CANCELADO / BLOQUEADO (REEMBOLSO)');
-      }
-      continue;
-    }
-
+    if (statusConc.indexOf('🔴') !== -1 || statusProc.indexOf('✅ BAIXADO') !== -1) continue;
     if (statusConc.indexOf('🟢') === -1 && statusConc.indexOf('🟡') === -1) continue;
-    if (statusProc.indexOf('✅ BAIXADO') !== -1) continue;
 
     var idTitulo = dados[i][0].toString().trim();
     var canal = dados[i][1].toString().trim();
     if (!idTitulo) continue;
 
-    // A DATA ENVIADA AO TINY É ESTRITAMENTE A COLUNA G (índice 6): DATA REPASSE (NOVO VENC.)
+    // A DATA ENVIADA AO TINY É RIGOROSAMENTE A COLUNA G (índice 6)
     var dataRepasseBruta = displayDados[i][6] || dados[i][6];
     var dataRepasse = formatarDataParaTinyBR(dataRepasseBruta);
     if (!dataRepasse || dataRepasse.length < 10) {
       dataRepasse = Utilities.formatDate(hoje, Session.getScriptTimeZone(), 'dd/MM/yyyy');
     }
 
-    // Se o título estava marcado como 🟡 DIFERIDO, mas a Data de Repasse (Coluna G) é <= Hoje (ex: 24/10/2026),
-    // promove automaticamente para 🟢 PRONTO PARA BAIXA AUTOMÁTICA!
+    // Se a data de repasse já passou ou é hoje, promove para baixa
     if (statusConc.indexOf('🟡') !== -1 && dataJaPassouOuHoje(dataRepasse, hoje)) {
       statusConc = '🟢 PRONTO PARA BAIXA AUTOMÁTICA';
       abaCentral.getRange(i + 1, 13).setValue(statusConc);
@@ -1155,7 +1153,7 @@ function baixarTitulosNoTiny(modoTeste) {
 
     var vencAtualTiny = formatarDataParaTinyBR(displayDados[i][5] || dados[i][5]);
 
-    // Se ainda é futuro (🟡 DIFERIDO) e o vencimento no Tiny JÁ foi confirmado para esta mesma dataRepasse, pula
+    // Se já foi atualizado no Tiny exatamente para esta data de repasse da Coluna G, pula redundância
     if (statusConc.indexOf('🟡') !== -1 && statusProc.indexOf('📅 VENC. ATUALIZADO NO TINY (' + dataRepasse + ')') !== -1 && vencAtualTiny === dataRepasse) {
       continue;
     }
@@ -1163,24 +1161,22 @@ function baixarTitulosNoTiny(modoTeste) {
     var valorDoc = parseFloat(dados[i][7]) || 0;
     var taxaDescontada = Math.round((parseFloat(dados[i][10]) || 0) * 100) / 100;
     var liquidoRecebido = Math.round((valorDoc - taxaDescontada) * 100) / 100;
-    var isAmazon = (canal.toUpperCase().indexOf('AMAZON') !== -1);
+    var isAmazon = canal.toUpperCase().indexOf('AMAZON') !== -1;
     var nomeContaDestino = isAmazon ? 'AMAZON' : 'MERCADO PAGO';
 
-    // 1. Sempre atualiza a Data de Vencimento no Tiny para a data da Coluna G (DATA REPASSE)
-    var resAlteracao = atualizarTituloDiferidoNoTiny(tinyToken, idTitulo, dataRepasse, taxaDescontada);
-    if (resAlteracao.sucesso) {
-      abaCentral.getRange(i + 1, 6).setValue(dataRepasse); // Atualiza Coluna F (Vencimento Atual Tiny)
-    }
-
-    // Se a liberação for para uma data futura (🟡 DIFERIDO), para aqui após atualizar o vencimento no Tiny!
+    // 1. Títulos com repasse futuro (🟡 DIFERIDO): Atualiza a data de vencimento no Tiny com a Coluna G
     if (statusConc.indexOf('🟡') !== -1) {
-      abaCentral.getRange(i + 1, 14).setValue(resAlteracao.mensagem);
-      if (resAlteracao.sucesso) processados++;
-      Utilities.sleep(300);
+      var resAlt = atualizarTituloDiferidoNoTiny(tinyToken, idTitulo, dataRepasse, taxaDescontada);
+      abaCentral.getRange(i + 1, 14).setValue(resAlt.mensagem);
+      if (resAlt.sucesso) {
+        abaCentral.getRange(i + 1, 6).setValue(dataRepasse); // Atualiza Coluna F com a nova data confirmada
+        processados++;
+      }
+      Utilities.sleep(700); // Cadência de 700ms (respeita o teto de 120 req/min do Tiny)
       continue;
     }
 
-    // 2. Se a data de repasse é <= Hoje (🟢 LIBERADO): Baixa a conta na data da Coluna G descontando as taxas!
+    // 2. Títulos liberados (🟢): Baixa financeira debitando taxas
     if (statusConc.indexOf('🟢') !== -1) {
       var payloadBaixar = {
         token: tinyToken,
@@ -1214,7 +1210,7 @@ function baixarTitulosNoTiny(modoTeste) {
             payload: { token: tinyToken, id: idTitulo, formato: 'json' },
             muteHttpExceptions: true
           });
-          Utilities.sleep(300);
+          Utilities.sleep(700);
 
           respBaixa = UrlFetchApp.fetch('https://api.tiny.com.br/api2/conta.receber.baixar.php', {
             method: 'post',
@@ -1235,7 +1231,7 @@ function baixarTitulosNoTiny(modoTeste) {
         var msgErro = (resJson.retorno && resJson.retorno.erros) ? JSON.stringify(resJson.retorno.erros) : 'Erro na baixa';
         abaCentral.getRange(i + 1, 14).setValue('⚠️ ' + msgErro);
       }
-      Utilities.sleep(300);
+      Utilities.sleep(700);
     }
   }
 

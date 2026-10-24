@@ -98,46 +98,24 @@ function estimarFreteDbaAmazon(valorUnitario, qtd) {
   return Math.round(6.50 * q * 100) / 100;
 }
 
-// 3. ATUALIZA A DATA DE VENCIMENTO DO TÍTULO NO TINY ERP (CHAMADA DIRETA SEM FALHA DE OBTER)
+// 3. ATUALIZA A DATA DE VENCIMENTO DO TÍTULO NO TINY ERP (DIRETO E SEM CHAMADAS REDUNDANTES)
 function atualizarTituloDiferidoNoTiny(tinyToken, idTitulo, novaDataVencimento, novaTaxa) {
   try {
     var taxaVal = parseFloat(novaTaxa) || 0;
+    var idLimpo = limparIdCientifico(idTitulo);
 
-    // 1ª Tentativa: Envio direto em XML Oficial da API 2.0 do Tiny ERP (conta.receber.alterar.php)
-    // Conforme documentação oficial api2-contas-receber-alterar: requer <id> e <vencimento>
-    var xmlAlterar = '<?xml version="1.0" encoding="UTF-8"?>' +
-      '<conta>' +
-      '<id>' + idTitulo + '</id>' +
-      '<vencimento>' + novaDataVencimento + '</vencimento>' +
-      '<data_vencimento>' + novaDataVencimento + '</data_vencimento>' +
-      '<taxa>' + taxaVal.toFixed(2) + '</taxa>' +
-      '<valor_taxa>' + taxaVal.toFixed(2) + '</valor_taxa>' +
-      '</conta>';
+    // URL oficial com token e id transmitidos na Query String (evita rejeição de rota pelo Tiny)
+    var urlEnvio = 'https://api.tiny.com.br/api2/conta.receber.alterar.php?token=' + encodeURIComponent(tinyToken) +
+                  '&id=' + encodeURIComponent(idLimpo) + '&formato=json';
 
-    var respXml = UrlFetchApp.fetch('https://api.tiny.com.br/api2/conta.receber.alterar.php', {
-      method: 'post',
-      payload: {
-        token: tinyToken,
-        id: idTitulo,
-        formato: 'json',
-        conta: xmlAlterar
-      },
-      muteHttpExceptions: true
-    });
-
-    var jsonXml = JSON.parse(respXml.getContentText());
-    if (jsonXml.retorno && jsonXml.retorno.status === 'OK') {
-      return { sucesso: true, mensagem: '📅 VENC. ATUALIZADO NO TINY (' + novaDataVencimento + ')' };
-    }
-
-    // 2ª Tentativa: Envio direto via JSON encapsulado com parâmetros de URL
-    var urlJson = 'https://api.tiny.com.br/api2/conta.receber.alterar.php?token=' + encodeURIComponent(tinyToken) +
-                  '&id=' + encodeURIComponent(idTitulo) + '&formato=json';
-
+    // Payload JSON oficial com o id e a nova data de vencimento (data de repasse da Coluna G)
     var payloadJson = {
+      token: tinyToken,
+      id: idLimpo,
+      formato: 'json',
       conta: JSON.stringify({
         conta: {
-          id: Number(idTitulo),
+          id: Number(idLimpo),
           vencimento: novaDataVencimento,
           data_vencimento: novaDataVencimento,
           taxa: Number(taxaVal.toFixed(2)),
@@ -146,20 +124,30 @@ function atualizarTituloDiferidoNoTiny(tinyToken, idTitulo, novaDataVencimento, 
       })
     };
 
-    var respJson = UrlFetchApp.fetch(urlJson, {
+    var resp = UrlFetchApp.fetch(urlEnvio, {
       method: 'post',
       payload: payloadJson,
       muteHttpExceptions: true
     });
 
-    var resJ = JSON.parse(respJson.getContentText());
-    if (resJ.retorno && resJ.retorno.status === 'OK') {
-      return { sucesso: true, mensagem: '📅 VENC. ATUALIZADO NO TINY (' + novaDataVencimento + ')' };
+    var resJson = JSON.parse(resp.getContentText());
+
+    // Se o Tiny acusar bloqueio temporário por limite de acessos, aguarda 3 segundos e tenta mais uma vez
+    if (resJson.retorno && resJson.retorno.erros) {
+      var strErro = JSON.stringify(resJson.retorno.erros).toLowerCase();
+      if (strErro.indexOf('excedido o número de acessos') !== -1 || strErro.indexOf('bloqueada') !== -1) {
+        Utilities.sleep(3000);
+        resp = UrlFetchApp.fetch(urlEnvio, { method: 'post', payload: payloadJson, muteHttpExceptions: true });
+        resJson = JSON.parse(resp.getContentText());
+      }
     }
 
-    var erroDetalhe = (resJ.retorno && resJ.retorno.erros) ? JSON.stringify(resJ.retorno.erros) :
-                      ((jsonXml.retorno && jsonXml.retorno.erros) ? JSON.stringify(jsonXml.retorno.erros) : 'Erro na alteração');
-    return { sucesso: false, mensagem: '⚠️ ' + erroDetalhe };
+    if (resJson.retorno && resJson.retorno.status === 'OK') {
+      return { sucesso: true, mensagem: '📅 VENC. ATUALIZADO NO TINY (' + novaDataVencimento + ')' };
+    } else {
+      var erroMsg = (resJson.retorno && resJson.retorno.erros) ? JSON.stringify(resJson.retorno.erros) : 'Erro na alteração';
+      return { sucesso: false, mensagem: '⚠️ ' + erroMsg };
+    }
   } catch (e) {
     return { sucesso: false, mensagem: '⚠️ Erro API: ' + e.message };
   }
@@ -302,7 +290,7 @@ function fazerUpsertNaAba(aba, colChaveZeroBased, mapaNovos, colunasTextoOneBase
   return listaFinal.length;
 }
 
-// 6. UPSERT NA CENTRAL DO TINY (DETECTA ALTERAÇÃO NA DATA DE REPASSE E FORÇA REATUALIZAÇÃO)
+// 6. UPSERT NA CENTRAL DO TINY (COLUNA DE STATUS VIVA E ATUALIZAÇÃO DINÂMICA DE DATAS)
 function fazerUpsertCentralTinyPreservandoBaixados(abaCentral, mapaNovos) {
   var dadosAtuais = abaCentral.getLastRow() > 1 ? abaCentral.getRange(2, 1, abaCentral.getLastRow() - 1, 14).getDisplayValues() : [];
   var mapaConsolidado = {};
@@ -314,8 +302,8 @@ function fazerUpsertCentralTinyPreservandoBaixados(abaCentral, mapaNovos) {
     var ocAntigo = limparIdCientifico(dadosAtuais[i][3]);
     dadosAtuais[i][3] = ocAntigo;
     
-    // Corrige linhas antigas que continham 'Outros' sendo pedidos reais do Mercado Livre
-    if (ocAntigo.indexOf('20000') === 0 && dadosAtuais[i][1] !== 'Mercado Livre') {
+    // Assegura canal Mercado Livre para identificadores de venda do ML
+    if (ocAntigo.indexOf('20000') === 0) {
       dadosAtuais[i][1] = 'Mercado Livre';
     }
     mapaConsolidado[idTit] = dadosAtuais[i];
@@ -324,23 +312,24 @@ function fazerUpsertCentralTinyPreservandoBaixados(abaCentral, mapaNovos) {
   Object.keys(mapaNovos).forEach(function(idTit) {
     var novo = mapaNovos[idTit];
     if (mapaConsolidado[idTit]) {
-      var statusAntigo = mapaConsolidado[idTit][13] ? mapaConsolidado[idTit][13].toString() : '';
-      var dataRepasseAntiga = formatarDataParaTinyBR(mapaConsolidado[idTit][6]); // Coluna G antiga
-      var dataRepasseNova = formatarDataParaTinyBR(novo[6]); // Coluna G atualizada da Base
+      var statusAntigoProc = mapaConsolidado[idTit][13] ? mapaConsolidado[idTit][13].toString() : '';
+      var dataRepasseAntiga = formatarDataParaTinyBR(mapaConsolidado[idTit][6]);
+      var dataRepasseNova = formatarDataParaTinyBR(novo[6]);
 
-      if (statusAntigo.indexOf('✅ BAIXADO') !== -1 && novo[12].indexOf('🔴') === -1) {
-        novo[13] = statusAntigo;
+      // Torna-se estático exclusivamente se a conta já foi liquidada (✅ BAIXADO) e não houve reembolso
+      if (statusAntigoProc.indexOf('✅ BAIXADO') !== -1 && novo[12].indexOf('🔴') === -1) {
+        novo[13] = statusAntigoProc;
       } 
-      // Se a data de repasse da Coluna G mudou na Base, força o status para pendente de atualização no Tiny
+      // Se a conta ainda não foi baixada, mantém a coluna viva: detecta alteração de data de repasse
       else if (novo[12].indexOf('🟡') !== -1) {
         if (dataRepasseAntiga !== dataRepasseNova) {
           novo[13] = 'PENDENTE (DATA REPASSE ATUALIZADA)';
-        } else if (statusAntigo.indexOf('📅 VENC. ATUALIZADO NO TINY (' + dataRepasseNova + ')') !== -1) {
-          novo[13] = statusAntigo;
+        } else if (statusAntigoProc.indexOf('📅 VENC. ATUALIZADO NO TINY (' + dataRepasseNova + ')') !== -1) {
+          novo[13] = statusAntigoProc;
         } else {
           novo[13] = 'PENDENTE (ATUALIZAR VENC. TINY)';
         }
-      } else if (novo[12].indexOf('🟢') !== -1 && statusAntigo.indexOf('✅ BAIXADO') === -1) {
+      } else if (novo[12].indexOf('🟢') !== -1 && statusAntigoProc.indexOf('✅ BAIXADO') === -1) {
         novo[13] = 'PENDENTE (BAIXAR AGORA)';
       }
     }
