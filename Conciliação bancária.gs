@@ -709,7 +709,7 @@ function importarAmazonSubpastaMensal() {
 }
 
 // =========================================================================
-// 5. PASSO B: CONCILIAÇÃO COMPLETA (CORREÇÃO DE PACK IDs E DATAS)
+// 5. PASSO B: CONCILIAÇÃO (VÍNCULO DIRETO PELO PREFIXO 20000 E REFLEXO DE DATAS)
 // =========================================================================
 function conciliarComTinyAPI() {
   var props = PropertiesService.getScriptProperties();
@@ -726,18 +726,31 @@ function conciliarComTinyAPI() {
   var dadosAmz = ss.getSheetByName('3_Base_Amazon').getDataRange().getValues();
   var abaCentral = ss.getSheetByName('4_Central_Conciliacao_Tiny');
 
+  var ocsJaBaixados = {};
+  if (abaCentral.getLastRow() > 1) {
+    var centralAntiga = abaCentral.getRange(2, 1, abaCentral.getLastRow() - 1, 14).getDisplayValues();
+    for (var ca = 0; ca < centralAntiga.length; ca++) {
+      if (centralAntiga[ca][13].indexOf('✅ BAIXADO') !== -1) {
+        var ocAnt = limparIdCientifico(centralAntiga[ca][3]);
+        if (ocAnt) ocsJaBaixados[ocAnt] = true;
+      }
+    }
+  }
+
   var mapaMkt = {};
   var listaMpDisponiveis = [];
 
+  // 1. Carrega Base Mercado Pago com a data de repasse mais recente
   for (var i = 1; i < dadosMp.length; i++) {
     var idMp = limparIdCientifico(dadosMp[i][0]);
     if (!idMp) continue;
     var stMp = dadosMp[i][4] ? dadosMp[i][4].toString() : '';
+    var stMpLow = stMp.toLowerCase();
     var colLiquidoIdx = (dadosMp[0].length >= 12) ? 10 : 9;
 
     var dtVendaMp = formatarDataParaTinyBR(dadosMp[i][2]);
     var dtRepasseMp = formatarDataParaTinyBR(dadosMp[i][3]) || dtVendaMp;
-    var isReemb = stMp.toLowerCase().indexOf('reembols') !== -1 || stMp.toLowerCase().indexOf('cancel') !== -1;
+    var isReemb = stMpLow.indexOf('reembols') !== -1 || stMpLow.indexOf('cancel') !== -1;
     var jaLiberado = (dadosMp[i][5] === 'SIM') || (!isReemb && dataJaPassouOuHoje(dtRepasseMp, hoje));
 
     var objMp = {
@@ -752,14 +765,16 @@ function conciliarComTinyAPI() {
       frete: converterMoedaBR(dadosMp[i][7]),
       comissao: converterMoedaBR(dadosMp[i][8]),
       liquido: converterMoedaBR(dadosMp[i][colLiquidoIdx]),
-      usadoNoPack: false
+      usadoNoPack: ocsJaBaixados[idMp] ? true : false
     };
+
     if (idMp.indexOf('2,000') === -1 && idMp.indexOf('E+') === -1) {
       mapaMkt[idMp] = objMp;
     }
     listaMpDisponiveis.push(objMp);
   }
 
+  // 2. Carrega Base Amazon com a data de repasse mais recente
   for (var j = 1; j < dadosAmz.length; j++) {
     var idAmz = dadosAmz[j][0].toString().trim();
     if (!idAmz) continue;
@@ -784,6 +799,7 @@ function conciliarComTinyAPI() {
     };
   }
 
+  // 3. Consulta Contas a Receber em aberto na API do Tiny
   var pagina = 1;
   var totalPaginas = 1;
   var titulosTiny = [];
@@ -804,9 +820,13 @@ function conciliarComTinyAPI() {
   var somaTinyPorOc = {};
   titulosTiny.forEach(function(t) {
     var oc = extrairOcHistorico(t.historico);
-    if (oc) somaTinyPorOc[oc] = (somaTinyPorOc[oc] || 0) + (parseFloat(t.valor) || 0);
+    if (oc) {
+      somaTinyPorOc[oc] = (somaTinyPorOc[oc] || 0) + (parseFloat(t.valor) || 0);
+      if (mapaMkt[oc]) mapaMkt[oc].usadoNoPack = true;
+    }
   });
 
+  // 4. Conciliação com atualização da Coluna G
   var mapaUpsertCentral = {};
 
   titulosTiny.forEach(function(t) {
@@ -820,18 +840,23 @@ function conciliarComTinyAPI() {
     var matchParcela = t.historico ? t.historico.match(/\(parcela\s+\d+\/\d+\)/i) : null;
     var labelParcela = matchParcela ? matchParcela[0] : 'Única';
 
+    // Qualquer OC numérico iniciado em 20000 é identificado como Mercado Livre
     var canalInferido = 'Venda Direta';
     if (/^\d{3}-\d{7}-\d{7}$/.test(oc)) canalInferido = 'Amazon';
-    else if (oc.indexOf('20000') === 0) canalInferido = 'Mercado Livre';
+    else if (oc.indexOf('20000') === 0 || (t.historico && t.historico.toLowerCase().indexOf('mercado') !== -1)) canalInferido = 'Mercado Livre';
+    else if (t.historico && t.historico.toLowerCase().indexOf('amazon') !== -1) canalInferido = 'Amazon';
 
     var m = null;
     var proporcao = 1;
 
+    // Nível 1: Casamento direto pelo OC
     if (oc !== 'SEM_OC' && mapaMkt[oc]) {
       m = mapaMkt[oc];
       var somaOc = somaTinyPorOc[oc] || valorTitulo;
       proporcao = somaOc > 0 ? (valorTitulo / somaOc) : 1;
-    } else if (canalInferido === 'Mercado Livre') {
+    }
+    // Nível 2: Casamento por valor e data aproximada da venda
+    else if (canalInferido === 'Mercado Livre') {
       var melhorCand = null;
       var menorDiff = 999;
 
@@ -873,8 +898,9 @@ function conciliarComTinyAPI() {
         statusConc = '🟢 PRONTO PARA BAIXA AUTOMÁTICA';
       }
 
+      // Coluna G (índice 6): DATA REPASSE recebe a data mais recente da Base
       mapaUpsertCentral[idTit] = [
-        idTit, m.canal, t.nome_cliente, oc, labelParcela,
+        idTit, canalInferido, t.nome_cliente, oc, labelParcela,
         dtVencOriginal, m.dataRepasse, valorTitulo,
         freteProp, comissaoProp, taxaEfetivaTiny, liquidoProp,
         statusConc, statusSincPadrao
@@ -890,11 +916,11 @@ function conciliarComTinyAPI() {
   });
 
   var totalCentral = fazerUpsertCentralTinyPreservandoBaixados(abaCentral, mapaUpsertCentral);
-  SpreadsheetApp.getUi().alert('✅ Conciliação atualizada com sucesso! Total na Central: ' + totalCentral);
+  SpreadsheetApp.getUi().alert('✅ Conciliação concluída! Títulos monitorados: ' + totalCentral);
 }
 
 // =========================================================================
-// 8 & 9. PASSO C: BAIXA AUTOMÁTICA E ATUALIZAÇÃO DE VENCIMENTOS
+// 8 & 9. PASSO C: BAIXA AUTOMÁTICA E ATUALIZAÇÃO DE VENCIMENTOS NO TINY
 // =========================================================================
 function baixarTitulosNoTiny(modoTeste) {
   var props = PropertiesService.getScriptProperties();
@@ -917,7 +943,7 @@ function baixarTitulosNoTiny(modoTeste) {
     if (processados >= limite) break;
 
     if (new Date().getTime() - startTime > tempoMaximoMs) {
-      SpreadsheetApp.getUi().alert('⏱️ Rodada pausada por limite de tempo. Clique novamente no Passo 9 para continuar.');
+      SpreadsheetApp.getUi().alert('⏱️ Rodada pausada por limite de tempo. Clique no Passo 9 para continuar os restantes.');
       ordenarCentralTiny(abaCentral);
       return;
     }
@@ -932,14 +958,24 @@ function baixarTitulosNoTiny(modoTeste) {
     var canal = dados[i][1].toString().trim();
     if (!idTitulo) continue;
 
-    var dataRepasse = formatarDataParaTinyBR(displayDados[i][6] || dados[i][6]);
+    // A DATA ENVIADA AO TINY É SEMPRE A DATA DA COLUNA G (índice 6)
+    var dataRepasseBruta = displayDados[i][6] || dados[i][6];
+    var dataRepasse = formatarDataParaTinyBR(dataRepasseBruta);
     if (!dataRepasse || dataRepasse.length < 10) {
       dataRepasse = Utilities.formatDate(hoje, Session.getScriptTimeZone(), 'dd/MM/yyyy');
     }
 
+    // Se o repasse já venceu ou vence hoje, processa a baixa
     if (statusConc.indexOf('🟡') !== -1 && dataJaPassouOuHoje(dataRepasse, hoje)) {
       statusConc = '🟢 PRONTO PARA BAIXA AUTOMÁTICA';
       abaCentral.getRange(i + 1, 13).setValue(statusConc);
+    }
+
+    var vencAtualTiny = formatarDataParaTinyBR(displayDados[i][5] || dados[i][5]);
+
+    // Se o vencimento no Tiny já corresponde à data da Coluna G, pula alteração redundante
+    if (statusConc.indexOf('🟡') !== -1 && statusProc.indexOf('📅 VENC. ATUALIZADO NO TINY (' + dataRepasse + ')') !== -1 && vencAtualTiny === dataRepasse) {
+      continue;
     }
 
     var valorDoc = parseFloat(dados[i][7]) || 0;
@@ -948,19 +984,19 @@ function baixarTitulosNoTiny(modoTeste) {
     var isAmazon = canal.toUpperCase().indexOf('AMAZON') !== -1;
     var nomeContaDestino = isAmazon ? 'AMAZON' : 'MERCADO PAGO';
 
-    // 1. Títulos Diferidos (🟡): Atualiza vencimento para a DATA REPASSE
+    // 1. Pedidos com repasse futuro (🟡 DIFERIDO): Atualiza a data de vencimento no Tiny com a Coluna G
     if (statusConc.indexOf('🟡') !== -1) {
       var resAlt = atualizarTituloDiferidoNoTiny(tinyToken, idTitulo, dataRepasse, taxaDescontada);
       abaCentral.getRange(i + 1, 14).setValue(resAlt.mensagem);
       if (resAlt.sucesso) {
-        abaCentral.getRange(i + 1, 6).setValue(dataRepasse);
+        abaCentral.getRange(i + 1, 6).setValue(dataRepasse); // Atualiza Coluna F com a nova data confirmada
         processados++;
       }
       Utilities.sleep(300);
       continue;
     }
 
-    // 2. Títulos Liberados (🟢): Baixa financeira com valor líquido e taxas
+    // 2. Pedidos liberados (🟢): Executa a baixa com valor líquido e taxas debitadas
     if (statusConc.indexOf('🟢') !== -1) {
       var payloadBaixar = {
         token: tinyToken,
@@ -987,7 +1023,9 @@ function baixarTitulosNoTiny(modoTeste) {
 
       if (resJson.retorno && resJson.retorno.status === 'OK') {
         abaCentral.getRange(i + 1, 6).setValue(dataRepasse);
-        abaCentral.getRange(i + 1, 14).setValue('✅ BAIXADO EM ' + nomeContaDestino + ' (Líq: R$ ' + liquidoRecebido.toFixed(2) + ' | Taxa: R$ ' + taxaDescontada.toFixed(2) + ')');
+        abaCentral.getRange(i + 1, 14).setValue(
+          '✅ BAIXADO EM ' + nomeContaDestino + ' (Líq: R$ ' + liquidoRecebido.toFixed(2) + ' | Taxa: R$ ' + taxaDescontada.toFixed(2) + ' | Data: ' + dataRepasse + ')'
+        );
         processados++;
       } else {
         var msgErro = (resJson.retorno && resJson.retorno.erros) ? JSON.stringify(resJson.retorno.erros) : 'Erro na baixa';
