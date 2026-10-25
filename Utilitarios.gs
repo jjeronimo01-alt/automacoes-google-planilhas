@@ -1,6 +1,6 @@
 /**
  * ARQUIVO 2: Utilitarios.gs
- * FUNÇÕES UTILITÁRIAS DE GOVERNANÇA, API DE PEDIDOS DO TINY (AMAZON), ARQUIVAMENTO E CÁLCULOS
+ * GATEWAY DE COMUNICAÇÃO TINY ERP (COM BACKOFF ANTI-BLOQUEIO), GOVERNANÇA, UPSERT VIVO E CÁLCULOS
  */
 
 function lerParametrosNegocio() {
@@ -15,19 +15,86 @@ function lerParametrosNegocio() {
   return mapa;
 }
 
+function obterTokenTinySanitizado() {
+  var tk = PropertiesService.getScriptProperties().getProperty('TINY_API_TOKEN') || '';
+  return tk.toString().replace(/\s+/g, '').trim();
+}
+
+function obterTokenMpSanitizado() {
+  var tk = PropertiesService.getScriptProperties().getProperty('MP_ACCESS_TOKEN') || '';
+  return tk.toString().replace(/\s+/g, '').trim();
+}
+
+function obterDataInicialBuscaRetroativa(hoje, diasPadrao, strDataFixa) {
+  var dtPorDias = new Date(hoje.getTime() - ((diasPadrao || 60) * 24 * 60 * 60 * 1000));
+  var tsFixo = converterDataBRParaTimestamp(strDataFixa || '01/09/2026');
+  if (tsFixo > 0 && tsFixo < dtPorDias.getTime()) {
+    return new Date(tsFixo);
+  }
+  return dtPorDias;
+}
+
+// =========================================================================
+// GATEWAY CENTRAL DA API TINY ERP (ELIMINA TOKEN DUPLICADO E TRATA RATE LIMIT)
+// =========================================================================
+function requisitarTinyAPI(endpoint, payloadObj, aplicarPausaEscrita) {
+  var url = 'https://api.tiny.com.br/api2/' + endpoint;
+
+  // Garante token limpo e nunca mistura Query String na URL com corpo POST
+  if (payloadObj && payloadObj.token) {
+    payloadObj.token = payloadObj.token.toString().replace(/\s+/g, '').trim();
+  }
+
+  var maxTentativas = 4;
+  for (var tent = 1; tent <= maxTentativas; tent++) {
+    if (aplicarPausaEscrita) {
+      Utilities.sleep(1100); // Cadência segura (~54 req/min) que evita bloqueio da API Tiny
+    } else {
+      Utilities.sleep(350);
+    }
+
+    var resp = UrlFetchApp.fetch(url, {
+      method: 'post',
+      payload: payloadObj,
+      muteHttpExceptions: true
+    });
+
+    var texto = resp.getContentText();
+    var json = null;
+    try {
+      json = JSON.parse(texto);
+    } catch (e) {
+      return { retorno: { status: 'Erro', erros: [{ erro: 'Resposta inválida do servidor Tiny' }] } };
+    }
+
+    // Verifica se o Tiny sinalizou bloqueio temporário por limite de acessos (Rate Limit)
+    if (json && json.retorno && json.retorno.erros) {
+      var strErro = JSON.stringify(json.retorno.erros).toLowerCase();
+      if (strErro.indexOf('bloqueada') !== -1 || strErro.indexOf('excedido') !== -1 || strErro.indexOf('aguarde') !== -1) {
+        if (tent < maxTentativas) {
+          // Backoff progressivo: espera 15s, 30s, 45s para o Tiny liberar o token e repete!
+          Utilities.sleep(tent * 15000);
+          continue;
+        }
+      }
+    }
+    return json;
+  }
+}
+
 // 1. VALIDA SE O ID É UM PEDIDO DE VENDA REAL DO MERCADO LIVRE (16 DÍGITOS INICIADOS EM 20000...)
 function ehIdPedidoVendaValidoML(idStr) {
   if (!idStr) return false;
   var s = limparIdCientifico(idStr);
-  // Exclui explicitamente MELIPAYMENTS, cashback, arrays [...] e Shipping IDs de 11 dígitos (47.../48...)
   if (s.indexOf('MELIPAYMENTS') !== -1 || s.indexOf('cashback') !== -1 || s.indexOf('[') !== -1) return false;
   return /^20000\d{10,12}$/.test(s);
 }
 
-// 2. BUSCA OS PEDIDOS DE VENDA DA AMAZON DIRETO PELA API DO TINY ERP (pedidos.pesquisa.php + pedido.obter.php)
-function buscarPedidosVendaAmazonNoTiny(tinyToken, diasRetroativos) {
+// 2. BUSCA OS PEDIDOS DE VENDA DA AMAZON DIRETO PELA API DO TINY ERP
+function buscarPedidosVendaAmazonNoTiny(tinyToken, diasRetroativos, strDataFixa) {
   var hoje = new Date();
-  var dataIni = Utilities.formatDate(new Date(hoje.getTime() - (diasRetroativos * 24 * 60 * 60 * 1000)), Session.getScriptTimeZone(), 'dd/MM/yyyy');
+  var dtIni = obterDataInicialBuscaRetroativa(hoje, diasRetroativos, strDataFixa);
+  var dataIni = Utilities.formatDate(dtIni, Session.getScriptTimeZone(), 'dd/MM/yyyy');
   var dataFim = Utilities.formatDate(hoje, Session.getScriptTimeZone(), 'dd/MM/yyyy');
 
   var pagina = 1;
@@ -35,24 +102,18 @@ function buscarPedidosVendaAmazonNoTiny(tinyToken, diasRetroativos) {
   var pedidosResumo = [];
 
   while (pagina <= totalPaginas && pagina <= 10) {
-    var resp = UrlFetchApp.fetch('https://api.tiny.com.br/api2/pedidos.pesquisa.php', {
-      method: 'post',
-      payload: {
-        token: tinyToken,
-        dataInicial: dataIni,
-        dataFinal: dataFim,
-        formato: 'json',
-        pagina: pagina
-      },
-      muteHttpExceptions: true
-    });
-    var json = JSON.parse(resp.getContentText());
-    if (!json.retorno || json.retorno.status !== 'OK') break;
+    var json = requisitarTinyAPI('pedidos.pesquisa.php', {
+      token: tinyToken,
+      dataInicial: dataIni,
+      dataFinal: dataFim,
+      formato: 'json',
+      pagina: pagina
+    }, false);
+    if (!json || !json.retorno || json.retorno.status !== 'OK') break;
     totalPaginas = parseInt(json.retorno.numero_paginas, 10) || 1;
     (json.retorno.pedidos || []).forEach(function(p) {
       var ped = p.pedido;
       var numEcom = ped.numero_ecommerce ? ped.numero_ecommerce.toString().trim() : '';
-      // Filtra exclusivamente pedidos cujo código de e-commerce segue o padrão Amazon (000-0000000-0000000)
       if (/^\d{3}-\d{7}-\d{7}$/.test(numEcom)) {
         pedidosResumo.push(ped);
       }
@@ -70,7 +131,6 @@ function buscarPedidosVendaAmazonNoTiny(tinyToken, diasRetroativos) {
     var sit = (pr.situacao || '').toLowerCase();
     var isCancelado = (sit.indexOf('cancelado') !== -1 || sit.indexOf('devolvido') !== -1);
 
-    // Calcula Frete DBA (pacotes <= 200g) e comissão esperada da categoria (Moda > Cintos/Carteiras)
     var freteDba = estimarFreteDbaAmazon(valBruto, 1);
     var comissaoEsp = Math.round(valBruto * 0.155 * 100) / 100;
 
@@ -98,69 +158,64 @@ function estimarFreteDbaAmazon(valorUnitario, qtd) {
   return Math.round(6.50 * q * 100) / 100;
 }
 
-// 3. ATUALIZA A DATA DE VENCIMENTO DO TÍTULO NO TINY ERP (DIRETO E SEM CHAMADAS REDUNDANTES)
+// 3. ATUALIZA O VENCIMENTO E A TAXA DO TÍTULO NO TINY ERP SEGUINDO O LAYOUT OFICIAL COMPLETO
 function atualizarTituloDiferidoNoTiny(tinyToken, idTitulo, novaDataVencimento, novaTaxa) {
   try {
-    var taxaVal = parseFloat(novaTaxa) || 0;
     var idLimpo = limparIdCientifico(idTitulo);
+    var taxaVal = parseFloat(novaTaxa) || 0;
 
-    // URL oficial com token e id transmitidos na Query String (evita rejeição de rota pelo Tiny)
-    var urlEnvio = 'https://api.tiny.com.br/api2/conta.receber.alterar.php?token=' + encodeURIComponent(tinyToken) +
-                  '&id=' + encodeURIComponent(idLimpo) + '&formato=json';
+    // Passo 1: Obtém os dados cadastrais obrigatórios do título no Tiny (cliente, data emissão, valor, histórico)
+    var jsonObter = requisitarTinyAPI('conta.receber.obter.php', {
+      token: tinyToken,
+      id: idLimpo,
+      formato: 'json'
+    }, false);
 
-    // Payload JSON oficial com o id e a nova data de vencimento (data de repasse da Coluna G)
-    var payloadJson = {
+    if (!jsonObter || !jsonObter.retorno || jsonObter.retorno.status !== 'OK' || !jsonObter.retorno.conta) {
+      var errObter = (jsonObter && jsonObter.retorno && jsonObter.retorno.erros)
+        ? JSON.stringify(jsonObter.retorno.erros)
+        : 'Falha ao ler título ' + idLimpo;
+      return { sucesso: false, mensagem: '⚠️ ' + errObter };
+    }
+
+    var orig = jsonObter.retorno.conta;
+    var docValor = parseFloat(orig.valor) || 0;
+    var dataEmissao = orig.data || novaDataVencimento;
+
+    // Monta o objeto JSON completo exigido pela especificação oficial do Tiny ERP (api2-contas-receber-alterar)
+    var contaCompleta = {
+      id: Number(idLimpo),
+      data: dataEmissao,
+      vencimento: novaDataVencimento,
+      data_vencimento: novaDataVencimento,
+      valor: Number(docValor.toFixed(2)),
+      taxa: Number(taxaVal.toFixed(2)),
+      valor_taxa: Number(taxaVal.toFixed(2)),
+      nro_documento: orig.nro_documento || '',
+      historico: orig.historico || '',
+      categoria: orig.categoria || '',
+      cliente: orig.cliente || { nome: orig.nome_cliente || '' }
+    };
+
+    if (orig.forma_pagamento) contaCompleta.forma_pagamento = orig.forma_pagamento;
+    if (orig.meio_pagamento) contaCompleta.meio_pagamento = orig.meio_pagamento;
+
+    var resAlt = requisitarTinyAPI('conta.receber.alterar.php', {
       token: tinyToken,
       id: idLimpo,
       formato: 'json',
-      conta: JSON.stringify({
-        conta: {
-          id: Number(idLimpo),
-          vencimento: novaDataVencimento,
-          data_vencimento: novaDataVencimento,
-          taxa: Number(taxaVal.toFixed(2)),
-          valor_taxa: Number(taxaVal.toFixed(2))
-        }
-      })
-    };
+      conta: JSON.stringify({ conta: contaCompleta })
+    }, true);
 
-    var resp = UrlFetchApp.fetch(urlEnvio, {
-      method: 'post',
-      payload: payloadJson,
-      muteHttpExceptions: true
-    });
-
-    var resJson = JSON.parse(resp.getContentText());
-
-    // Se o Tiny acusar bloqueio temporário por limite de acessos, aguarda 3 segundos e tenta mais uma vez
-    if (resJson.retorno && resJson.retorno.erros) {
-      var strErro = JSON.stringify(resJson.retorno.erros).toLowerCase();
-      if (strErro.indexOf('excedido o número de acessos') !== -1 || strErro.indexOf('bloqueada') !== -1) {
-        Utilities.sleep(3000);
-        resp = UrlFetchApp.fetch(urlEnvio, { method: 'post', payload: payloadJson, muteHttpExceptions: true });
-        resJson = JSON.parse(resp.getContentText());
-      }
-    }
-
-    if (resJson.retorno && resJson.retorno.status === 'OK') {
+    if (resAlt && resAlt.retorno && resAlt.retorno.status === 'OK') {
       return { sucesso: true, mensagem: '📅 VENC. ATUALIZADO NO TINY (' + novaDataVencimento + ')' };
-    } else {
-      var erroMsg = (resJson.retorno && resJson.retorno.erros) ? JSON.stringify(resJson.retorno.erros) : 'Erro na alteração';
-      return { sucesso: false, mensagem: '⚠️ ' + erroMsg };
     }
+
+    var erroMsg = (resAlt && resAlt.retorno && resAlt.retorno.erros) ? JSON.stringify(resAlt.retorno.erros) : 'Erro na alteração';
+    return { sucesso: false, mensagem: '⚠️ ' + erroMsg };
   } catch (e) {
     return { sucesso: false, mensagem: '⚠️ Erro API: ' + e.message };
   }
-}
-
-function escaparXmlTiny(texto) {
-  if (!texto) return '';
-  return texto.toString()
-    .replace(/&/g, '&amp;')
-    .replace(/</g, '&lt;')
-    .replace(/>/g, '&gt;')
-    .replace(/"/g, '&quot;')
-    .replace(/'/g, '&apos;');
 }
 
 // 4. FÓRMULA MATEMÁTICA ESTRITA DO MERCADO LIVRE (14% CLÁSSICO / 19% PREMIUM)
@@ -243,7 +298,6 @@ function fazerUpsertNaAba(aba, colChaveZeroBased, mapaNovos, colunasTextoOneBase
     var ch = limparIdCientifico(linha[colChaveZeroBased]);
     if (!ch || ch.indexOf('2,000') !== -1 || ch.indexOf('E+') !== -1) continue;
 
-    // Na aba do Mercado Pago, limpa automaticamente registros antigos que não sejam vendas reais (20000...)
     if (aba.getName() === '2_Base_MercadoPago' && !ehIdPedidoVendaValidoML(ch)) continue;
 
     linha[colChaveZeroBased] = ch;
@@ -290,7 +344,7 @@ function fazerUpsertNaAba(aba, colChaveZeroBased, mapaNovos, colunasTextoOneBase
   return listaFinal.length;
 }
 
-// 6. UPSERT NA CENTRAL DO TINY (COLUNA DE STATUS VIVA E ATUALIZAÇÃO DINÂMICA DE DATAS)
+// 6. UPSERT NA CENTRAL DO TINY (COLUNA DE STATUS 100% VIVA ATÉ A BAIXA DEFINITIVA)
 function fazerUpsertCentralTinyPreservandoBaixados(abaCentral, mapaNovos) {
   var dadosAtuais = abaCentral.getLastRow() > 1 ? abaCentral.getRange(2, 1, abaCentral.getLastRow() - 1, 14).getDisplayValues() : [];
   var mapaConsolidado = {};
@@ -301,29 +355,35 @@ function fazerUpsertCentralTinyPreservandoBaixados(abaCentral, mapaNovos) {
     dadosAtuais[i][0] = idTit;
     var ocAntigo = limparIdCientifico(dadosAtuais[i][3]);
     dadosAtuais[i][3] = ocAntigo;
-    
-    // Assegura canal Mercado Livre para identificadores de venda do ML
+    dadosAtuais[i][5] = formatarDataParaTinyBR(dadosAtuais[i][5]);
+    dadosAtuais[i][6] = formatarDataParaTinyBR(dadosAtuais[i][6]);
+
     if (ocAntigo.indexOf('20000') === 0) {
       dadosAtuais[i][1] = 'Mercado Livre';
+    }
+    // Se a linha antiga estava com o texto obsoleto "AGUARDANDO BASE MARKETPLACE", atualiza para viva
+    if (dadosAtuais[i][12] && dadosAtuais[i][12].toString().indexOf('AGUARDANDO BASE') !== -1) {
+      dadosAtuais[i][12] = '🟡 AGUARDANDO DADOS DE REPASSE (' + dadosAtuais[i][1].toString().toUpperCase() + ')';
     }
     mapaConsolidado[idTit] = dadosAtuais[i];
   }
 
   Object.keys(mapaNovos).forEach(function(idTit) {
     var novo = mapaNovos[idTit];
+    novo[5] = formatarDataParaTinyBR(novo[5]); // Vencimento Atual no Tiny
+    novo[6] = formatarDataParaTinyBR(novo[6]); // Data Repasse (Novo Venc.)
+
     if (mapaConsolidado[idTit]) {
       var statusAntigoProc = mapaConsolidado[idTit][13] ? mapaConsolidado[idTit][13].toString() : '';
       var dataRepasseAntiga = formatarDataParaTinyBR(mapaConsolidado[idTit][6]);
-      var dataRepasseNova = formatarDataParaTinyBR(novo[6]);
+      var dataRepasseNova = novo[6];
 
-      // Torna-se estático exclusivamente se a conta já foi liquidada (✅ BAIXADO) e não houve reembolso
+      // Só permanece estático se JÁ FOI BAIXADO (✅ BAIXADO) e não virou reembolso
       if (statusAntigoProc.indexOf('✅ BAIXADO') !== -1 && novo[12].indexOf('🔴') === -1) {
         novo[13] = statusAntigoProc;
-      } 
-      // Se a conta ainda não foi baixada, mantém a coluna viva: detecta alteração de data de repasse
-      else if (novo[12].indexOf('🟡') !== -1) {
-        if (dataRepasseAntiga !== dataRepasseNova) {
-          novo[13] = 'PENDENTE (DATA REPASSE ATUALIZADA)';
+      } else if (novo[12].indexOf('🟡') !== -1) {
+        if (dataRepasseAntiga !== dataRepasseNova || novo[5] !== dataRepasseNova) {
+          novo[13] = 'PENDENTE (ATUALIZAR VENC. TINY)';
         } else if (statusAntigoProc.indexOf('📅 VENC. ATUALIZADO NO TINY (' + dataRepasseNova + ')') !== -1) {
           novo[13] = statusAntigoProc;
         } else {
@@ -343,6 +403,7 @@ function fazerUpsertCentralTinyPreservandoBaixados(abaCentral, mapaNovos) {
   if (lista.length > 0) {
     abaCentral.getRange(2, 1, lista.length, 1).setNumberFormat('@');
     abaCentral.getRange(2, 4, lista.length, 1).setNumberFormat('@');
+    abaCentral.getRange(2, 6, lista.length, 2).setNumberFormat('@');
     abaCentral.getRange(2, 1, lista.length, 14).setValues(lista);
     ordenarCentralTiny(abaCentral);
     aplicarFiltroNativoSeNaoExistir(abaCentral, 14);
@@ -372,7 +433,6 @@ function fazerUpsertDesviosPreservandoStatus(abaDesvios, mapaNovosDesvios) {
   var ss = SpreadsheetApp.getActiveSpreadsheet();
   var abaConcluidos = ss.getSheetByName('6_Auditoria_Concluida');
 
-  // Mapa de chaves já conferidas/arquivadas na Aba 6 para nunca recriá-las na Aba 5
   var chavesJaAuditadas = {};
   if (abaConcluidos && abaConcluidos.getLastRow() > 1) {
     var dadosConcl = abaConcluidos.getRange(2, 1, abaConcluidos.getLastRow() - 1, 1).getDisplayValues();
@@ -403,7 +463,7 @@ function fazerUpsertDesviosPreservandoStatus(abaDesvios, mapaNovosDesvios) {
   }
 
   Object.keys(mapaNovosDesvios).forEach(function(ch) {
-    if (chavesJaAuditadas[ch]) return; // Já conferido e arquivado na Aba 6!
+    if (chavesJaAuditadas[ch]) return;
     var novo = mapaNovosDesvios[ch];
     if (mapaConsolidado[ch]) {
       var statusUsuario = mapaConsolidado[ch][10] ? mapaConsolidado[ch][10].toString().trim() : 'PENDENTE';
@@ -432,7 +492,6 @@ function fazerUpsertDesviosPreservandoStatus(abaDesvios, mapaNovosDesvios) {
     aplicarFiltroNativoSeNaoExistir(abaDesvios, 11);
   }
 
-  // Move imediatamente qualquer item marcado como CONFERIDO para a Aba 6
   arquivarDesviosConcluidos();
 }
 
@@ -461,7 +520,6 @@ function arquivarDesviosConcluidos() {
 
   if (moverParaAba6.length === 0) return 0;
 
-  // Grava na aba 6_Auditoria_Concluida
   var mapaConcl = {};
   if (abaConcl.getLastRow() > 1) {
     var atuais6 = abaConcl.getRange(2, 1, abaConcl.getLastRow() - 1, 12).getDisplayValues();
@@ -480,7 +538,6 @@ function arquivarDesviosConcluidos() {
     aplicarFiltroNativoSeNaoExistir(abaConcl, 12);
   }
 
-  // Atualiza a aba 5_Auditoria_Desvios apenas com os PENDENTES
   if (abaDesvios.getFilter()) abaDesvios.getFilter().remove();
   abaDesvios.getRange(2, 1, abaDesvios.getLastRow() - 1, 11).clearContent();
   if (manterNaAba5.length > 0) {
@@ -493,7 +550,7 @@ function arquivarDesviosConcluidos() {
   return moverParaAba6.length;
 }
 
-// 9. MOVE VENDAS CONCLUÍDAS COM MAIS DE 60 DIAS (MP E AMAZON) PARA A ABA UNIFICADA 7_Historico_Vendas_Antigas
+// 9. MOVE VENDAS CONCLUÍDAS ANTIGAS (MP E AMAZON) PARA A ABA UNIFICADA 7_Historico_Vendas_Antigas
 function arquivarVendasAntigasUnificadas(diasJanelaAtiva) {
   var ss = SpreadsheetApp.getActiveSpreadsheet();
   var abaMp = ss.getSheetByName('2_Base_MercadoPago');
@@ -507,7 +564,6 @@ function arquivarVendasAntigasUnificadas(diasJanelaAtiva) {
   var dataArq = Utilities.formatDate(hoje, Session.getScriptTimeZone(), 'dd/MM/yyyy');
   var movidos = [];
 
-  // 1. Verifica 2_Base_MercadoPago
   if (abaMp && abaMp.getLastRow() > 1) {
     var dadosMp = abaMp.getRange(2, 1, abaMp.getLastRow() - 1, 11).getDisplayValues();
     var manterMp = [];
@@ -537,7 +593,6 @@ function arquivarVendasAntigasUnificadas(diasJanelaAtiva) {
     }
   }
 
-  // 2. Verifica 3_Base_Amazon
   if (abaAmz && abaAmz.getLastRow() > 1) {
     var dadosAmz = abaAmz.getRange(2, 1, abaAmz.getLastRow() - 1, 10).getDisplayValues();
     var manterAmz = [];
