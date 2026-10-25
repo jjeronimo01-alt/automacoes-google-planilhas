@@ -311,7 +311,9 @@ function buscarPedidosVendaAmazonNoTiny(tinyToken, diasRetroativos, strDataFixa)
     var sit = (pr.situacao || '').toLowerCase();
     var isCancelado = (sit.indexOf('cancelado') !== -1 || sit.indexOf('devolvido') !== -1);
 
-    var freteDba = estimarFreteDbaAmazon(valBruto, 1);
+    // Regra de Caixa Amazon: o frete DBA não é descontado no momento do depósito/repasse da venda
+    // (é cobrado separadamente em outro momento). Portanto, não deve ser abatido do Contas a Receber.
+    var freteDba = 0;
     var comissaoEsp = Math.round(valBruto * 0.155 * 100) / 100;
 
     mapaPedidosAmz[idAmz] = {
@@ -576,41 +578,160 @@ function baixarContaReceberNoTiny(tinyToken, idTitulo, nomeContaDestino, dataBai
   };
 }
 
-// 4. FÓRMULA MATEMÁTICA ESTRITA DO MERCADO LIVRE (14% CLÁSSICO / 19% PREMIUM)
+// 4. FÓRMULA MATEMÁTICA ESTRITA DO MERCADO LIVRE (14% CLÁSSICO / 19% PREMIUM + TAXA FIXA / FRETE ABAIXO DE R$ 79,00)
 function calcularValoresReaisVendedorML(idPedido, transAmt, freteBrutoMP, mkpFeeBruto, finFeeBruto, liquidoRealMP, feeDiscountML, mapaValoresTiny) {
   var valorTiny = mapaValoresTiny[idPedido] || 0;
   var valorPedidoReal = transAmt;
   var freteExtraPagoComprador = 0;
+  var descontoIncentivo = Math.abs(parseFloat(feeDiscountML) || 0);
 
+  // 1. Determina o Valor Real do Produto (descontando frete ou juros pagos pelo comprador quando transAmt > valorTiny)
   if (valorTiny > 0 && Math.abs(transAmt - valorTiny) > 0.05) {
     valorPedidoReal = valorTiny;
     var diferencaCobradaComprador = Math.round((transAmt - valorTiny) * 100) / 100;
-    if (Math.abs(diferencaCobradaComprador - finFeeBruto) > 0.50 && diferencaCobradaComprador > 0 && freteBrutoMP >= diferencaCobradaComprador) {
+    if (diferencaCobradaComprador > 0 && freteBrutoMP >= diferencaCobradaComprador) {
       freteExtraPagoComprador = diferencaCobradaComprador;
     }
   } else if (valorTiny === 0 && finFeeBruto > 3.50 && transAmt < 95.00 && Math.abs((mkpFeeBruto / (transAmt - finFeeBruto)) - 0.14) < 0.015) {
     valorPedidoReal = Math.round((transAmt - finFeeBruto) * 100) / 100;
   }
 
+  var retencaoTotalReal = Math.max(0, Math.round((valorPedidoReal - liquidoRealMP) * 100) / 100);
   var freteRealNosso = Math.max(0, Math.round((freteBrutoMP - freteExtraPagoComprador) * 100) / 100);
-  var comissaoRealNossa = Math.max(0, Math.round((valorPedidoReal - freteRealNosso - liquidoRealMP) * 100) / 100);
 
-  if (freteBrutoMP === 0 && comissaoRealNossa > 0 && valorPedidoReal > 0) {
-    var comiss14 = Math.round((valorPedidoReal * 0.14 - feeDiscountML) * 100) / 100;
-    var comiss19 = Math.round((valorPedidoReal * 0.19 - feeDiscountML) * 100) / 100;
-    var resto14 = Math.round((comissaoRealNossa - comiss14) * 100) / 100;
-    var resto19 = Math.round((comissaoRealNossa - comiss19) * 100) / 100;
+  // 2. Proteção para pedidos < R$ 79,00 onde a linha do Mercado Pago trouxe no freteBrutoMP o frete total da etiqueta
+  //    (ex.: R$ 18,38 ou R$ 18,84, que inclui o frete pago pelo comprador) em vez de apenas a Tarifa Fixa de Envio do vendedor (R$ 6,00 a R$ 6,85):
+  if (valorPedidoReal > 0 && valorPedidoReal < 79.00 && freteRealNosso > 10.00) {
+    var c14BrutaPre = Math.round((valorPedidoReal * 0.14) * 100) / 100;
+    var c19BrutaPre = Math.round((valorPedidoReal * 0.19) * 100) / 100;
+    var c14LiqPre = Math.max(0, Math.round((c14BrutaPre - descontoIncentivo) * 100) / 100);
+    var c19LiqPre = Math.max(0, Math.round((c19BrutaPre - descontoIncentivo) * 100) / 100);
 
-    if (resto14 >= 6.00 && resto14 <= 22.00) {
-      freteRealNosso = resto14;
-      comissaoRealNossa = comiss14;
-    } else if (resto19 >= 6.00 && resto19 <= 22.00) {
-      freteRealNosso = resto19;
-      comissaoRealNossa = comiss19;
+    // Determina a comissão real do pedido (respeitando eventual incentivo já embutido em mkpFeeBruto ou em descontoIncentivo):
+    var comissRealPre = c14LiqPre;
+    if (mkpFeeBruto > 0 && (mkpFeeBruto / valorPedidoReal) <= 0.205) {
+      var pctMkpPre = (mkpFeeBruto / valorPedidoReal) * 100;
+      var ehBrutaExata = (pctMkpPre >= 13.85 && pctMkpPre <= 14.05) || (pctMkpPre >= 18.85 && pctMkpPre <= 19.05);
+      comissRealPre = (ehBrutaExata && descontoIncentivo > 0)
+        ? Math.max(0, Math.round((mkpFeeBruto - descontoIncentivo) * 100) / 100)
+        : Math.round(mkpFeeBruto * 100) / 100;
+    } else if (mkpFeeBruto > c14BrutaPre && Math.abs(mkpFeeBruto - c19BrutaPre) <= 0.30) {
+      comissRealPre = c19LiqPre;
+    }
+
+    // Se a diferença entre o frete bruto (ex.: R$ 18,38) e o excesso da comissão (ex.: R$ 3,79 - R$ 3,33 = R$ 0,46) era o que faltava,
+    // ou se o líquido da linha já estava correto (ex.: R$ 16,88 -> retencaoTotalReal = R$ 10,18), extrai o frete real a partir da retenção real;
+    // caso o líquido também estivesse reduzido pelo frete do comprador (ex.: R$ 4,89), aplica a tarifa fixa real de envios do pedido (R$ 6,85 ou R$ 6,00) e recompõe o líquido!
+    var fretePelaRetencao = Math.round((retencaoTotalReal - comissRealPre) * 100) / 100;
+    if (fretePelaRetencao >= 5.00 && fretePelaRetencao <= 10.00) {
+      freteRealNosso = fretePelaRetencao;
+    } else {
+      // Quando o frete do comprador (ex.: R$ 11,99 ou R$ 11,53) estava descontado de liquidoRealMP:
+      // Verifica se há incentivo de campanha implícito na diferença de 18,84 vs 18,38 (18,84 - 18,38 = 0,46 de incentivo!)
+      if (descontoIncentivo === 0 && freteBrutoMP > 10.00 && Math.abs(comissRealPre - c14BrutaPre) <= 0.05) {
+        var retencaoAparente = Math.round((freteBrutoMP + comissRealPre) * 100) / 100;
+        // Se freteBrutoMP (18,38) já veio abatido do incentivo (18,84 - 0,46 = 18,38) mientras comissRealPre veio bruta (3,79):
+        var possivelIncentivo = Math.round((18.84 - freteBrutoMP) * 100) / 100;
+        if (possivelIncentivo > 0.05 && possivelIncentivo <= Math.round(valorPedidoReal * 0.03 * 100) / 100) {
+          descontoIncentivo = possivelIncentivo;
+          comissRealPre = Math.round((c14BrutaPre - descontoIncentivo) * 100) / 100;
+        }
+      }
+      var taxaFixaEnvio = (freteBrutoMP >= 18.00 || valorPedidoReal <= 35.00) ? 6.85 : 6.00;
+      freteRealNosso = taxaFixaEnvio;
+      liquidoRealMP = Math.round((valorPedidoReal - freteRealNosso - comissRealPre) * 100) / 100;
+      retencaoTotalReal = Math.round((freteRealNosso + comissRealPre) * 100) / 100;
     }
   }
 
-  var comissaoSemDescontoCampanha = comissaoRealNossa + feeDiscountML;
+  // 3. Proteção geral: o frete pago pelo vendedor NUNCA pode superar a retenção total real (valorPedidoReal - liquidoRealMP)
+  if (freteRealNosso > retencaoTotalReal) {
+    freteRealNosso = 0;
+  }
+
+  var comissaoRealNossa = Math.max(0, Math.round((retencaoTotalReal - freteRealNosso) * 100) / 100);
+
+  // 4. Separação exata entre Comissão (14% Clássico / 19% Premium - Incentivos/Campanhas) e Frete/Taxa Fixa (Envios):
+  if (valorPedidoReal > 0 && retencaoTotalReal > 0) {
+    var c14Bruta = Math.round((valorPedidoReal * 0.14) * 100) / 100;
+    var c19Bruta = Math.round((valorPedidoReal * 0.19) * 100) / 100;
+    var c14 = Math.max(0, Math.round((c14Bruta - descontoIncentivo) * 100) / 100);
+    var c19 = Math.max(0, Math.round((c19Bruta - descontoIncentivo) * 100) / 100);
+
+    var aliqAtual = (comissaoRealNossa / valorPedidoReal) * 100;
+    var jaEsta14ou19 = (aliqAtual >= 13.85 && aliqAtual <= 14.05) || (aliqAtual >= 18.85 && aliqAtual <= 19.05);
+
+    if (valorPedidoReal < 79.00) {
+      var comissCandidata = 0;
+      if (mkpFeeBruto > 0 && mkpFeeBruto < retencaoTotalReal && (mkpFeeBruto / valorPedidoReal) <= 0.205) {
+        var pctM = (mkpFeeBruto / valorPedidoReal) * 100;
+        var ehBruta = (pctM >= 13.85 && pctM <= 14.05) || (pctM >= 18.85 && pctM <= 19.05);
+        comissCandidata = (ehBruta && descontoIncentivo > 0)
+          ? Math.max(0, Math.round((mkpFeeBruto - descontoIncentivo) * 100) / 100)
+          : Math.round(mkpFeeBruto * 100) / 100;
+      } else if (descontoIncentivo > 0) {
+        var f14Desc = Math.round((retencaoTotalReal - c14) * 100) / 100;
+        var f19Desc = Math.round((retencaoTotalReal - c19) * 100) / 100;
+        if (f14Desc >= 5.00 && f14Desc <= 21.00) comissCandidata = c14;
+        else if (f19Desc >= 5.00 && f19Desc <= 21.00) comissCandidata = c19;
+      }
+
+      if (comissCandidata === 0) {
+        // Verifica se a retenção total menos uma taxa fixa padrão do ML (R$ 6,85, R$ 6,00, R$ 6,50, R$ 6,75, R$ 6,25) resulta em 14% ou 19% (com até 2,5% de incentivo/campanha)
+        var taxasFixasPadraoML = [6.85, 6.00, 6.50, 6.75, 6.25];
+        for (var tfIdx = 0; tfIdx < taxasFixasPadraoML.length; tfIdx++) {
+          var tfTeste = taxasFixasPadraoML[tfIdx];
+          var comissRestante = Math.round((retencaoTotalReal - tfTeste) * 100) / 100;
+          if (comissRestante > 0) {
+            var pctRestante = (comissRestante / valorPedidoReal) * 100;
+            if ((pctRestante >= 11.80 && pctRestante <= 14.10) || (pctRestante >= 16.80 && pctRestante <= 19.10)) {
+              comissCandidata = comissRestante;
+              break;
+            }
+          }
+        }
+      }
+
+      if (comissCandidata === 0 && !jaEsta14ou19) {
+        var freteSe14 = Math.round((retencaoTotalReal - c14) * 100) / 100;
+        var freteSe19 = Math.round((retencaoTotalReal - c19) * 100) / 100;
+        if (freteSe14 >= 5.00 && freteSe14 <= 21.00) comissCandidata = c14;
+        else if (freteSe19 >= 5.00 && freteSe19 <= 21.00) comissCandidata = c19;
+      }
+
+      if (comissCandidata > 0 && comissCandidata <= retencaoTotalReal) {
+        comissaoRealNossa = comissCandidata;
+        freteRealNosso = Math.round((retencaoTotalReal - comissaoRealNossa) * 100) / 100;
+        if (descontoIncentivo === 0) {
+          var diffCamp14 = Math.round((c14Bruta - comissaoRealNossa) * 100) / 100;
+          var diffCamp19 = Math.round((c19Bruta - comissaoRealNossa) * 100) / 100;
+          if (diffCamp14 > 0 && diffCamp14 <= (valorPedidoReal * 0.03)) descontoIncentivo = diffCamp14;
+          else if (diffCamp19 > 0 && diffCamp19 <= (valorPedidoReal * 0.03)) descontoIncentivo = diffCamp19;
+        }
+      }
+    } else if (!jaEsta14ou19) {
+      // Pedidos >= R$ 79,00 onde o frete foi embutido na comissão ou onde parte do freteBrutoMP foi paga pelo comprador
+      var freteAcima14 = Math.round((retencaoTotalReal - c14) * 100) / 100;
+      var freteAcima19 = Math.round((retencaoTotalReal - c19) * 100) / 100;
+      var okAcima14 = (freteAcima14 >= 5.00 && freteAcima14 <= 45.00);
+      var okAcima19 = (freteAcima19 >= 5.00 && freteAcima19 <= 45.00);
+      if (mkpFeeBruto > 0 && Math.abs(mkpFeeBruto - c19) <= 0.25 && okAcima19) {
+        freteRealNosso = freteAcima19;
+        comissaoRealNossa = c19;
+      } else if (mkpFeeBruto > 0 && Math.abs(mkpFeeBruto - c14) <= 0.25 && okAcima14) {
+        freteRealNosso = freteAcima14;
+        comissaoRealNossa = c14;
+      } else if (okAcima19 && freteBrutoMP === 0 && freteAcima19 >= 6.00 && freteAcima19 <= 25.00) {
+        freteRealNosso = freteAcima19;
+        comissaoRealNossa = c19;
+      } else if (okAcima14 && freteBrutoMP === 0 && freteAcima14 >= 6.00 && freteAcima14 <= 25.00) {
+        freteRealNosso = freteAcima14;
+        comissaoRealNossa = c14;
+      }
+    }
+  }
+
+  var comissaoSemDescontoCampanha = comissaoRealNossa + descontoIncentivo;
   var aliquotaContratualPct = valorPedidoReal > 0 ? ((comissaoSemDescontoCampanha / valorPedidoReal) * 100) : 0;
   var aliquotaEfetivaPct = valorPedidoReal > 0 ? ((comissaoRealNossa / valorPedidoReal) * 100) : 0;
 
@@ -732,22 +853,50 @@ function fazerUpsertCentralTinyPreservandoBaixados(abaCentral, mapaNovos) {
     novo[6] = formatarDataParaTinyBR(novo[6]); // Data Repasse (Novo Venc.)
 
     if (mapaConsolidado[idTit]) {
-      var statusAntigoProc = mapaConsolidado[idTit][13] ? mapaConsolidado[idTit][13].toString() : '';
-      var dataRepasseAntiga = formatarDataParaTinyBR(mapaConsolidado[idTit][6]);
+      var antigo = mapaConsolidado[idTit];
+      var statusAntigoProc = antigo[13] ? antigo[13].toString() : '';
+      var dataRepasseAntiga = formatarDataParaTinyBR(antigo[6]);
       var dataRepasseNova = novo[6];
 
-      // Só permanece estático se JÁ FOI BAIXADO (✅ BAIXADO) e não virou reembolso
-      if (statusAntigoProc.indexOf('✅ BAIXADO') !== -1 && novo[12].indexOf('🔴') === -1) {
+      var freteAntigo = Math.round(converterMoedaBR(antigo[8]) * 100) / 100;
+      var comissAntiga = Math.round(converterMoedaBR(antigo[9]) * 100) / 100;
+      var taxaAntiga = Math.round(converterMoedaBR(antigo[10]) * 100) / 100;
+      var liqAntigo = Math.round(converterMoedaBR(antigo[11]) * 100) / 100;
+
+      var freteNovo = Math.round(converterMoedaBR(novo[8]) * 100) / 100;
+      var comissNova = Math.round(converterMoedaBR(novo[9]) * 100) / 100;
+      var taxaNova = Math.round(converterMoedaBR(novo[10]) * 100) / 100;
+      var liqNovo = Math.round(converterMoedaBR(novo[11]) * 100) / 100;
+
+      var mudouValoresFinanceiros = (Math.abs(taxaAntiga - taxaNova) > 0.01) ||
+                                    (Math.abs(liqAntigo - liqNovo) > 0.01) ||
+                                    (Math.abs(freteAntigo - freteNovo) > 0.01) ||
+                                    (Math.abs(comissAntiga - comissNova) > 0.01);
+
+      var marcadorEsperado = montarMarcadorVencimentoTiny(dataRepasseNova, taxaNova);
+
+      if (novo[12].indexOf('🔴') !== -1) {
+        // Se o pedido entrou em Reembolso / Contestação / Mediação: bloqueia imediatamente e alerta mesmo se já havia sido baixado antes
+        if (statusAntigoProc.indexOf('✅ BAIXADO') !== -1) {
+          novo[13] = '⚠️ REEMBOLSO APÓS BAIXA (ESTORNAR/CANCELAR NO TINY)';
+        } else {
+          novo[13] = 'CANCELADO / REEMBOLSADO';
+        }
+      } else if (statusAntigoProc.indexOf('✅ BAIXADO') !== -1) {
+        // Já foi baixado e não virou reembolso: preserva o registro de baixa
         novo[13] = statusAntigoProc;
-      } else if (novo[12].indexOf('🟡') !== -1) {
-        if (dataRepasseAntiga !== dataRepasseNova || novo[5] !== dataRepasseNova) {
-          novo[13] = 'PENDENTE (ATUALIZAR VENC. TINY)';
-        } else if (statusAntigoProc.indexOf('📅 VENC. ATUALIZADO NO TINY (' + dataRepasseNova + ')') !== -1) {
+      } else if (novo[12].indexOf('🟡') !== -1 && novo[12].indexOf('AGUARDANDO DADOS DE REPASSE') === -1) {
+        // Título diferido (repasse futuro): verifica se data de repasse, vencimento no Tiny ou taxas/frete mudaram
+        if (dataRepasseAntiga !== dataRepasseNova || novo[5] !== dataRepasseNova || mudouValoresFinanceiros) {
+          novo[13] = 'PENDENTE (ATUALIZAR VENC./TAXA TINY)';
+        } else if (statusAntigoProc.indexOf(marcadorEsperado) !== -1) {
+          novo[13] = statusAntigoProc;
+        } else if (statusAntigoProc.indexOf('📅 VENC. ATUALIZADO NO TINY (' + dataRepasseNova + ')') !== -1 && !mudouValoresFinanceiros) {
           novo[13] = statusAntigoProc;
         } else {
-          novo[13] = 'PENDENTE (ATUALIZAR VENC. TINY)';
+          novo[13] = 'PENDENTE (ATUALIZAR VENC./TAXA TINY)';
         }
-      } else if (novo[12].indexOf('🟢') !== -1 && statusAntigoProc.indexOf('✅ BAIXADO') === -1) {
+      } else if (novo[12].indexOf('🟢') !== -1) {
         novo[13] = 'PENDENTE (BAIXAR AGORA)';
       }
     }
@@ -830,6 +979,14 @@ function fazerUpsertDesviosPreservandoStatus(abaDesvios, mapaNovosDesvios) {
   }
 
   Object.keys(mapaNovosDesvios).forEach(function(ch) {
+    if (ch.indexOf('__REMOVER__') === 0) {
+      var chAlvo = ch.replace('__REMOVER__', '');
+      if (mapaConsolidado[chAlvo]) {
+        var stAnt = mapaConsolidado[chAlvo][10] ? mapaConsolidado[chAlvo][10].toString().trim() : 'PENDENTE';
+        if (stAnt === 'PENDENTE') delete mapaConsolidado[chAlvo];
+      }
+      return;
+    }
     if (chavesJaAuditadas[ch]) return;
     var novo = mapaNovosDesvios[ch];
     if (mapaConsolidado[ch]) {
@@ -1050,10 +1207,122 @@ function obterSubpastaMensalDrive(rootFolderId, dataRef) {
   return null;
 }
 
+/**
+ * Retorna as subpastas mensais do Drive que cobrem toda a janela retroativa (ex.: 60 dias),
+ * ordenadas da mais antiga para a mais recente para que planilhas mais recentes atualizem o status de pedidos do mês anterior.
+ */
+function obterSubpastasMensaisJanelaDrive(rootFolderId, dataFim, diasJanela) {
+  var pastas = [];
+  if (!rootFolderId) return pastas;
+  try {
+    var pastaRaiz = DriveApp.getFolderById(rootFolderId);
+    var meses = ['JANEIRO', 'FEVEREIRO', 'MARCO', 'ABRIL', 'MAIO', 'JUNHO', 'JULHO', 'AGOSTO', 'SETEMBRO', 'OUTUBRO', 'NOVEMBRO', 'DEZEMBRO'];
+    var dtIni = new Date(dataFim.getTime() - ((diasJanela || 60) * 24 * 60 * 60 * 1000));
+
+    var nomesAlvo = [];
+    var vistos = {};
+    var cursor = new Date(dtIni.getFullYear(), dtIni.getMonth(), 1);
+    var limite = new Date(dataFim.getFullYear(), dataFim.getMonth(), 1);
+
+    while (cursor.getTime() <= limite.getTime()) {
+      var chave = meses[cursor.getMonth()] + '_' + cursor.getFullYear();
+      if (!vistos[chave]) {
+        vistos[chave] = true;
+        nomesAlvo.push(chave);
+      }
+      cursor.setMonth(cursor.getMonth() + 1);
+    }
+
+    var mapaSubpastas = {};
+    var subpastas = pastaRaiz.getFolders();
+    while (subpastas.hasNext()) {
+      var f = subpastas.next();
+      var n = f.getName().toUpperCase().trim().replace('MARÇO_', 'MARCO_');
+      mapaSubpastas[n] = f;
+    }
+
+    for (var i = 0; i < nomesAlvo.length; i++) {
+      if (mapaSubpastas[nomesAlvo[i]]) {
+        pastas.push(mapaSubpastas[nomesAlvo[i]]);
+      }
+    }
+  } catch (e) {
+    Logger.log('Aviso obterSubpastasMensaisJanelaDrive: ' + e.message);
+  }
+  return pastas;
+}
+
 function extrairFeeDiscountMetadata(metaStr) {
   if (!metaStr) return 0;
-  var m = metaStr.toString().match(/"fee_discount"\s*:\s*"([\d.,]+)"/i);
-  return m ? (parseFloat(m[1].replace(',', '.')) || 0) : 0;
+  var s = metaStr.toString();
+  var m = s.match(/"(?:fee_discount|discount_amount|campaign_discount|meli_campaign|rebate_amount|incentive_amount|bonus_amount)"\s*:\s*"?([\d.,]+)"?/i);
+  if (m) return parseFloat(m[1].replace(',', '.')) || 0;
+  return 0;
+}
+
+/**
+ * Extrai de forma abrangente o incentivo/desconto de campanha do Mercado Livre a partir do objeto payment da API do Mercado Pago.
+ * Inspeciona p.metadata, p.charges_details (créditos para collector ou estornos na tarifa) e a diferença entre a comissão bruta (14%/19%) e o mkp_fee cobrado.
+ */
+function extrairIncentivoCampanhaPaymentMP(p, valorProdutoBase, comissaoMkpExtraida) {
+  if (!p) return 0;
+  var incentivo = 0;
+
+  // 1. Inspeciona todos os campos do objeto metadata (ex.: fee_discount, campaign_discount, discount, rebate, etc.)
+  if (p.metadata && typeof p.metadata === 'object') {
+    if (p.metadata.fee_discount !== undefined) {
+      incentivo = parseFloat(p.metadata.fee_discount) || 0;
+    }
+    if (incentivo === 0) {
+      var chavesMeta = Object.keys(p.metadata);
+      for (var k = 0; k < chavesMeta.length; k++) {
+        var nomeK = chavesMeta[k].toLowerCase();
+        if (nomeK.indexOf('fee_discount') !== -1 || nomeK.indexOf('campaign') !== -1 || nomeK.indexOf('incentiv') !== -1 || nomeK.indexOf('rebate') !== -1 || nomeK === 'discount') {
+          var vMeta = parseFloat(p.metadata[chavesMeta[k]]) || 0;
+          if (vMeta > 0 && vMeta < 50) {
+            incentivo = vMeta;
+            break;
+          }
+        }
+      }
+    }
+  }
+
+  // 2. Inspeciona charges_details (bônus de campanha creditado ao collector ou refunded parcial na fee)
+  if (incentivo === 0 && p.charges_details && p.charges_details.length > 0) {
+    var somaBonusCharges = 0;
+    for (var c = 0; c < p.charges_details.length; c++) {
+      var cd = p.charges_details[c];
+      var nC = (cd.name || cd.type || '').toLowerCase();
+      var tipoC = (cd.type || '').toLowerCase();
+      var fromR = (cd.accounts && cd.accounts.from) ? cd.accounts.from.toString().toLowerCase() : '';
+      var toR = (cd.accounts && cd.accounts.to) ? cd.accounts.to.toString().toLowerCase() : '';
+      var vO = (cd.amounts && cd.amounts.original !== undefined) ? Math.abs(parseFloat(cd.amounts.original) || 0) : 0;
+      var vR = (cd.amounts && cd.amounts.refunded !== undefined) ? Math.abs(parseFloat(cd.amounts.refunded) || 0) : 0;
+
+      if (toR === 'collector' && vO > 0 && nC.indexOf('shipping') === -1 && tipoC.indexOf('shipping') === -1) {
+        somaBonusCharges += vO;
+      } else if (tipoC === 'fee' && fromR === 'collector' && vR > 0 && nC.indexOf('shipping') === -1) {
+        somaBonusCharges += vR;
+      }
+    }
+    if (somaBonusCharges > 0) incentivo = Math.round(somaBonusCharges * 100) / 100;
+  }
+
+  // 3. Se a própria tarifa de venda extraída (mkp_fee / mercadolibre_fee) já veio menor que 14% (ou 19%) exatos por causa do incentivo (ex.: R$ 3,33 vs R$ 3,79 = R$ 0,46):
+  if (incentivo === 0 && valorProdutoBase > 0 && comissaoMkpExtraida > 0) {
+    var c14Bruto = Math.round(valorProdutoBase * 0.14 * 100) / 100;
+    var c19Bruto = Math.round(valorProdutoBase * 0.19 * 100) / 100;
+    var diff14 = Math.round((c14Bruto - comissaoMkpExtraida) * 100) / 100;
+    var diff19 = Math.round((c19Bruto - comissaoMkpExtraida) * 100) / 100;
+    if (diff14 > 0.05 && diff14 <= Math.round(valorProdutoBase * 0.035 * 100) / 100) {
+      incentivo = diff14;
+    } else if (diff19 > 0.05 && diff19 <= Math.round(valorProdutoBase * 0.035 * 100) / 100) {
+      incentivo = diff19;
+    }
+  }
+
+  return Math.round(incentivo * 100) / 100;
 }
 
 function dataJaPassouOuHoje(dataBR, hoje) {
@@ -1078,6 +1347,23 @@ function extrairOcHistorico(historico) {
   if (!historico) return null;
   var m = historico.toString().match(/OC\s*n[º°o]?\s*([A-Za-z0-9\-]+)/i);
   return m ? limparIdCientifico(m[1].trim()) : null;
+}
+
+function extrairTodosOcsHistorico(historico) {
+  if (!historico) return [];
+  var str = historico.toString();
+  var regex = /OC\s*n[º°o]?\s*([A-Za-z0-9\-]+)/gi;
+  var match;
+  var ocs = [];
+  var vistos = {};
+  while ((match = regex.exec(str)) !== null) {
+    var ocLimpo = limparIdCientifico(match[1].trim());
+    if (ocLimpo && !vistos[ocLimpo]) {
+      vistos[ocLimpo] = true;
+      ocs.push(ocLimpo);
+    }
+  }
+  return ocs;
 }
 
 function converterMoedaBR(val) {
