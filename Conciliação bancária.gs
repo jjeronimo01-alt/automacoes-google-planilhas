@@ -974,145 +974,611 @@ function estornarContasBaixadasNoTiny() {
 }
 
 // =========================================================================
-// 8 & 9. PASSO C: BAIXA E ATUALIZAÇÃO DE VENCIMENTOS NO TINY (SEM DUPLICIDADE E COM ANTI-BLOQUEIO)
+// 8 & 9. PASSO C: ATUALIZAÇÃO DE VENCIMENTO/TAXA E BAIXA EM MASSA NO TINY ERP
+// -------------------------------------------------------------------------
+// Arquitetura (núcleo único compartilhado pelo TESTE e pelo OFICIAL):
+//   lerLinhaCentralTiny()        -> normaliza os dados da linha da aba 4
+//   classificarLinhaCentralTiny() -> decide a ação: BAIXAR | ATUALIZAR | PULAR | BLOQUEAR
+//   processarTituloNoTiny()       -> executa as chamadas à API (sem tocar na planilha)
+//   aplicarResultadoNaMemoria()   -> registra o resultado nas colunas F / M / N em memória
+//   gravarColunasCentralTiny()    -> grava F / M / N em lote (3 chamadas por checkpoint)
+// Regra de governança: se vencimento (Col G) e taxa (Col K) não forem atualizados no Tiny,
+// a baixa é ESTRITAMENTE PROIBIDA.
 // =========================================================================
+var INICIO_EXECUCAO_SCRIPT_MS = new Date().getTime();
+
+var PASSO_C_COL = { ID: 0, CANAL: 1, OC: 3, VENC_TINY: 5, DATA_REPASSE: 6, VALOR_DOC: 7, TAXA: 10, STATUS_CONC: 12, STATUS_PROC: 13 };
+var PASSO_C_PROP_LOTE = 'PASSO_C_LOTE_EM_ANDAMENTO';
+var PASSO_C_PROP_ULTIMO_RESUMO = 'PASSO_C_ULTIMO_RESUMO';
+var PASSO_C_HANDLER_CONTINUACAO = 'continuarBaixaEmMassaTiny';
+var PASSO_C_ORCAMENTO_FUNCAO_MS = 240000;   // 4 min de processamento por execução
+var PASSO_C_TETO_EXECUCAO_MS = 290000;      // teto absoluto (limite Google = 6 min), considerando a rotina diária
+var PASSO_C_CHECKPOINT_TITULOS = 10;        // grava a planilha a cada 10 títulos processados
+var PASSO_C_VALIDADE_LOTE_MS = 3 * 60 * 60 * 1000; // lote pausado expira após 3h
+
 function testarBaixaPequenaEscala() {
-  baixarTitulosNoTiny(true);
+  executarDiagnosticoBaixaCincoLinhas();
 }
 
 function executarBaixaCompletaTiny() {
   baixarTitulosNoTiny(false);
 }
 
-function baixarTitulosNoTiny(modoTeste) {
-  var tinyToken = obterTokenTinySanitizado();
-  if (!tinyToken) throw new Error('Token do Tiny não configurado no Cofre.');
+// Gatilho temporário criado automaticamente quando o lote é pausado pelo limite de tempo do Google
+function continuarBaixaEmMassaTiny() {
+  removerGatilhosContinuacaoPassoC();
+  baixarTitulosNoTiny(false, { continuacao: true });
+}
 
-  var ss = SpreadsheetApp.getActiveSpreadsheet();
-  var abaCentral = ss.getSheetByName('4_Central_Conciliacao_Tiny');
-  var hoje = new Date();
+function notificarUsuarioSeguro(msg) {
+  Logger.log(msg);
+  try {
+    SpreadsheetApp.getUi().alert(msg);
+  } catch (e) {
+    // Execução via gatilho (sem interface): mensagem fica registrada no Logger / Execuções
+  }
+}
 
-  var dados = abaCentral.getDataRange().getValues();
-  var displayDados = abaCentral.getDataRange().getDisplayValues();
-  var limite = modoTeste ? 5 : 9999;
-  var processados = 0;
+function toastSeguro(msg, titulo) {
+  try {
+    SpreadsheetApp.getActiveSpreadsheet().toast(msg, titulo || 'Passo C - Tiny', 5);
+  } catch (e) {}
+}
 
-  var startTime = new Date().getTime();
-  var tempoMaximoMs = 260000; // 4m20s (garante margem segura antes do limite de 6 min do Google)
+function removerGatilhosContinuacaoPassoC() {
+  ScriptApp.getProjectTriggers().forEach(function(t) {
+    if (t.getHandlerFunction() === PASSO_C_HANDLER_CONTINUACAO) ScriptApp.deleteTrigger(t);
+  });
+}
 
+function agendarContinuacaoPassoC() {
+  removerGatilhosContinuacaoPassoC();
+  ScriptApp.newTrigger(PASSO_C_HANDLER_CONTINUACAO).timeBased().after(60 * 1000).create();
+}
+
+function lerLinhaCentralTiny(dados, displayDados, i) {
+  var C = PASSO_C_COL;
+  var row = dados[i];
+  var canal = row[C.CANAL] ? row[C.CANAL].toString().trim() : '';
+  var valorDoc = Math.round(converterMoedaBR(row[C.VALOR_DOC]) * 100) / 100;
+  var taxa = Math.round(converterMoedaBR(row[C.TAXA]) * 100) / 100;
+  var isAmazon = canal.toUpperCase().indexOf('AMAZON') !== -1;
+  return {
+    idx: i,
+    numLinha: i + 1,
+    idTitulo: limparIdCientifico(row[C.ID]),
+    canal: canal,
+    oc: row[C.OC] ? row[C.OC].toString().trim() : '',
+    vencAtualTiny: formatarDataParaTinyBR(displayDados[i][C.VENC_TINY] || row[C.VENC_TINY]),
+    dataRepasse: formatarDataParaTinyBR(displayDados[i][C.DATA_REPASSE] || row[C.DATA_REPASSE]),
+    valorDoc: valorDoc,
+    taxa: taxa,
+    liquido: Math.round((valorDoc - taxa) * 100) / 100,
+    statusConc: row[C.STATUS_CONC] ? row[C.STATUS_CONC].toString().trim() : '',
+    statusProc: row[C.STATUS_PROC] ? row[C.STATUS_PROC].toString().trim() : '',
+    contaDestino: isAmazon ? 'AMAZON' : 'MERCADO PAGO'
+  };
+}
+
+/**
+ * Decide a ação para a linha. Pode promover 🟡 -> 🟢 (linha.promovidoParaVerde = true)
+ * quando a Data de Repasse já chegou (<= hoje) e a taxa já está calculada.
+ * Retorna: 'BAIXAR' | 'ATUALIZAR' | 'JA_SINCRONIZADO' | 'BLOQUEADO_REEMBOLSO' | 'IGNORAR'
+ */
+function classificarLinhaCentralTiny(linha, hoje) {
+  var sc = linha.statusConc;
+  var sp = linha.statusProc;
+
+  if (!linha.idTitulo) return 'IGNORAR';
+  if (sc.indexOf('🔴') !== -1) return 'BLOQUEADO_REEMBOLSO';
+  if (sc.indexOf('AGUARDANDO DADOS DE REPASSE') !== -1 || sc.indexOf('⚪') !== -1) return 'IGNORAR';
+  if (sp.indexOf('✅ BAIXADO') !== -1 || sp.indexOf('já se encontra pago/baixado') !== -1) return 'IGNORAR';
+  if (sc.indexOf('🟢') === -1 && sc.indexOf('🟡') === -1) return 'IGNORAR';
+
+  if (sc.indexOf('🟡') !== -1 && dataJaPassouOuHoje(linha.dataRepasse, hoje) && linha.taxa > 0) {
+    linha.statusConc = '🟢 PRONTO PARA BAIXA AUTOMÁTICA';
+    linha.promovidoParaVerde = true;
+    return 'BAIXAR';
+  }
+
+  if (sc.indexOf('🟡') !== -1) {
+    var marcador = montarMarcadorVencimentoTiny(linha.dataRepasse, linha.taxa);
+    if (linha.vencAtualTiny === linha.dataRepasse && sp.indexOf(marcador) !== -1) return 'JA_SINCRONIZADO';
+    return 'ATUALIZAR';
+  }
+  return 'BAIXAR';
+}
+
+/**
+ * Núcleo da esteira: executa as chamadas no Tiny para UM título (sem escrever na planilha).
+ * @param {Object} opcoes { consultarAntes: boolean } (true no modo diagnóstico)
+ */
+function processarTituloNoTiny(tinyToken, linha, acao, opcoes) {
+  opcoes = opcoes || {};
+  var diag = {
+    linha: linha.numLinha,
+    idTitulo: linha.idTitulo,
+    canal: linha.canal,
+    oc: linha.oc,
+    valorDoc: linha.valorDoc,
+    taxa: linha.taxa,
+    liquido: linha.liquido,
+    contaDestino: linha.contaDestino,
+    vencAtualTiny: linha.vencAtualTiny,
+    dataRepasse: linha.dataRepasse,
+    statusConc: linha.statusConc,
+    acao: acao,
+    tipoOperacao: acao === 'BAIXAR'
+      ? '1° Venda Recebida (<= Hoje) • Atualizar Venc./Taxa + Baixar'
+      : '2° Conta Futura (> Hoje) • Atualizar Vencimento/Taxa',
+    etapa: '',
+    sucesso: false,
+    resultado: '',          // ATUALIZADO | BAIXADO | JA_BAIXADO | FALHA
+    mensagemSucesso: '',
+    mensagemErro: '',
+    respostaRaw: '',
+    novoStatusProc: '',
+    atualizarVencF: false
+  };
+
+  function falhar(etapa, msg, raw, prefixo) {
+    diag.etapa = etapa;
+    diag.resultado = 'FALHA';
+    diag.mensagemErro = msg;
+    diag.respostaRaw = raw ? JSON.stringify(raw) : '';
+    diag.novoStatusProc = (prefixo || '❌ ERRO') + ' [' + etapa + ']: ' + msg;
+    return diag;
+  }
+
+  // ETAPA 1: Validação local (sem chamadas à API)
+  var etapa1 = 'ETAPA 1 (Validação de Parâmetros Locais)';
+  if (!linha.idTitulo || isNaN(Number(linha.idTitulo))) {
+    return falhar(etapa1, 'ID do Título Tiny inválido ou ausente: "' + linha.idTitulo + '"');
+  }
+  if (!/^\d{2}\/\d{2}\/\d{4}$/.test(linha.dataRepasse || '')) {
+    return falhar(etapa1, 'DATA REPASSE (Col G) ausente/inválida: "' + linha.dataRepasse + '" — vencimento não pode ser atualizado', null, '🚫 BAIXA PROIBIDA');
+  }
+  if (linha.valorDoc <= 0) {
+    return falhar(etapa1, 'Valor do documento zerado ou inválido: R$ ' + linha.valorDoc);
+  }
+  if (acao === 'BAIXAR' && linha.liquido <= 0) {
+    return falhar(etapa1, 'Líquido calculado <= 0 (Valor R$ ' + linha.valorDoc.toFixed(2) + ' - Taxa R$ ' + linha.taxa.toFixed(2) + ')');
+  }
+
+  // ETAPA 2/3: Consulta opcional + Alteração obrigatória de Vencimento (Col G) e Taxa (Col K)
+  var etapa3 = 'ETAPA 3 (Alteração Vencimento/Taxa - conta.receber.alterar.php)';
+  var resAlt = atualizarTituloDiferidoNoTiny(tinyToken, linha.idTitulo, linha.dataRepasse, linha.taxa, {
+    consultarAntes: !!opcoes.consultarAntes
+  });
+
+  if (resAlt.jaBaixado) {
+    diag.etapa = 'ETAPA 2 (Consulta Tiny - conta.receber.obter.php)';
+    diag.sucesso = true;
+    diag.resultado = 'JA_BAIXADO';
+    diag.mensagemSucesso = resAlt.mensagem;
+    diag.novoStatusProc = resAlt.mensagem;
+    return diag;
+  }
+
+  if (!resAlt.sucesso) {
+    var etapaFalha = resAlt.etapa === 'OBTER_TITULO' ? 'ETAPA 2 (Consulta Tiny - conta.receber.obter.php)' : etapa3;
+    var prefixo = acao === 'BAIXAR' ? '🚫 BAIXA PROIBIDA' : '❌ ERRO';
+    return falhar(etapaFalha, resAlt.mensagem, resAlt.detalhes || resAlt, prefixo);
+  }
+
+  diag.atualizarVencF = true;
+
+  if (acao === 'ATUALIZAR') {
+    diag.etapa = etapa3;
+    diag.sucesso = true;
+    diag.resultado = 'ATUALIZADO';
+    diag.mensagemSucesso = resAlt.mensagem;
+    diag.novoStatusProc = resAlt.mensagem;
+    return diag;
+  }
+
+  // ETAPA 4: Baixa financeira
+  var etapa4 = 'ETAPA 4 (Baixa Financeira - conta.receber.baixar.php)';
+  var resBaixa = baixarContaReceberNoTiny(tinyToken, linha.idTitulo, linha.contaDestino, linha.dataRepasse, linha.taxa, linha.liquido);
+  if (!resBaixa.sucesso) {
+    var f = falhar(etapa4, resBaixa.mensagem, resBaixa.detalhes || resBaixa);
+    f.novoStatusProc = '❌ ERRO [BAIXA TINY] (venc./taxa já atualizados): ' + resBaixa.mensagem;
+    return f;
+  }
+
+  diag.etapa = etapa4;
+  diag.sucesso = true;
+  diag.resultado = 'BAIXADO';
+  diag.mensagemSucesso = '✅ BAIXADO EM ' + linha.contaDestino + ' (Líq: R$ ' + linha.liquido.toFixed(2) +
+    ' | Taxa: R$ ' + linha.taxa.toFixed(2) + ' | Data: ' + linha.dataRepasse + ')';
+  diag.novoStatusProc = diag.mensagemSucesso;
+  return diag;
+}
+
+function aplicarResultadoNaMemoria(diag, linha, colF, colM, colN) {
+  var k = linha.idx - 1; // arrays de colunas começam na linha 2
+  if (linha.promovidoParaVerde) colM[k][0] = linha.statusConc;
+  if (diag.atualizarVencF) colF[k][0] = linha.dataRepasse;
+  if (diag.novoStatusProc) colN[k][0] = diag.novoStatusProc;
+}
+
+function extrairColunasCentralTiny(dados) {
+  var C = PASSO_C_COL;
+  var colF = [], colM = [], colN = [];
   for (var i = 1; i < dados.length; i++) {
-    if (processados >= limite) break;
+    colF.push([dados[i][C.VENC_TINY]]);
+    colM.push([dados[i][C.STATUS_CONC]]);
+    colN.push([dados[i][C.STATUS_PROC]]);
+  }
+  return { colF: colF, colM: colM, colN: colN };
+}
 
-    if (new Date().getTime() - startTime > tempoMaximoMs) {
-      ordenarCentralTiny(abaCentral);
-      SpreadsheetApp.getUi().alert('⏱️ Pausa preventiva anti-timeout do Google.\nForam atualizados/baixados ' + processados + ' títulos nesta rodada.\nClique novamente no Passo 9 para continuar os restantes!');
+function gravarColunasCentralTiny(abaCentral, cols) {
+  var n = cols.colF.length;
+  if (n === 0) return;
+  abaCentral.getRange(2, PASSO_C_COL.VENC_TINY + 1, n, 1).setValues(cols.colF);
+  abaCentral.getRange(2, PASSO_C_COL.STATUS_CONC + 1, n, 1).setValues(cols.colM);
+  abaCentral.getRange(2, PASSO_C_COL.STATUS_PROC + 1, n, 1).setValues(cols.colN);
+  SpreadsheetApp.flush();
+}
+
+function novoLotePassoC() {
+  return {
+    inicio: new Date().getTime(),
+    atualizadoEm: new Date().getTime(),
+    cursor: 1,
+    execucoes: 0,
+    baixados: 0,
+    atualizados: 0,
+    jaBaixados: 0,
+    jaSincronizados: 0,
+    bloqueados: 0,
+    falhas: 0,
+    falhasLista: []
+  };
+}
+
+function registrarDiagNoLote(lote, diag) {
+  if (diag.resultado === 'BAIXADO') lote.baixados++;
+  else if (diag.resultado === 'ATUALIZADO') lote.atualizados++;
+  else if (diag.resultado === 'JA_BAIXADO') lote.jaBaixados++;
+  else {
+    lote.falhas++;
+    if (lote.falhasLista.length < 40) {
+      lote.falhasLista.push('L' + diag.linha + ' #' + diag.idTitulo + ': ' + (diag.mensagemErro || '').substring(0, 140));
+    }
+  }
+}
+
+function montarResumoLotePassoC(lote, concluido) {
+  var dur = Math.round((new Date().getTime() - lote.inicio) / 1000);
+  var txt = (concluido ? '✅ Passo C (OFICIAL) concluído!' : '⏱️ Passo C (OFICIAL) pausado (limite de tempo do Google).') + '\n\n' +
+    '• Baixados (venc./taxa + baixa): ' + lote.baixados + '\n' +
+    '• Vencimento/taxa atualizados (futuros): ' + lote.atualizados + '\n' +
+    '• Já estavam baixados no Tiny: ' + lote.jaBaixados + '\n' +
+    '• Já sincronizados (sem chamada à API): ' + lote.jaSincronizados + '\n' +
+    '• Bloqueados por reembolso: ' + lote.bloqueados + '\n' +
+    '• Falhas: ' + lote.falhas + '\n' +
+    '• Execuções: ' + lote.execucoes + ' | Tempo total: ' + dur + 's';
+  if (lote.falhasLista.length > 0) {
+    txt += '\n\nFalhas (detalhe completo na Coluna N):\n- ' + lote.falhasLista.slice(0, 15).join('\n- ');
+  }
+  return txt;
+}
+
+/**
+ * ETAPA DE TESTE E DIAGNÓSTICO PROFUNDO (MÁXIMO 5 LINHAS)
+ * Usa o mesmo núcleo do processamento em massa, com consulta prévia do título (ETAPA 2) para diagnóstico completo.
+ */
+function executarDiagnosticoBaixaCincoLinhas() {
+  var tinyToken = obterTokenTinySanitizado();
+  if (!tinyToken) {
+    notificarUsuarioSeguro('❌ Erro: Token do Tiny não configurado no Cofre de Credenciais (Menu item 2).');
+    return;
+  }
+
+  var lock = LockService.getScriptLock();
+  if (!lock.tryLock(10000)) {
+    notificarUsuarioSeguro('⏳ Já existe um processamento do Passo C em andamento. Aguarde a conclusão.');
+    return;
+  }
+
+  try {
+    var ss = SpreadsheetApp.getActiveSpreadsheet();
+    var abaCentral = ss.getSheetByName('4_Central_Conciliacao_Tiny');
+    if (!abaCentral || abaCentral.getLastRow() <= 1) {
+      notificarUsuarioSeguro('❌ Aba 4_Central_Conciliacao_Tiny não encontrada ou vazia.');
       return;
     }
 
-    var statusConc = dados[i][12] ? dados[i][12].toString() : '';
-    var statusProc = dados[i][13] ? dados[i][13].toString() : '';
+    var hoje = new Date();
+    var rng = abaCentral.getRange(1, 1, abaCentral.getLastRow(), 14);
+    var dados = rng.getValues();
+    var displayDados = rng.getDisplayValues();
+    var cols = extrairColunasCentralTiny(dados);
 
-    // 1. Títulos bloqueados por reembolso (🔴) ou vendas sem taxa ainda (AGUARDANDO DADOS DE REPASSE)
-    if (statusConc.indexOf('🔴') !== -1) {
-      if (statusProc.indexOf('CANCELADO') === -1) {
-        abaCentral.getRange(i + 1, 14).setValue('🚫 CANCELADO / BLOQUEADO (REEMBOLSO)');
-      }
+    // Seleciona até 5 linhas equilibrando os 2 cenários (até 3 para baixa + até 2 futuras)
+    var candBaixar = [];
+    var candAtualizar = [];
+    for (var i = 1; i < dados.length; i++) {
+      var lin = lerLinhaCentralTiny(dados, displayDados, i);
+      var acao = classificarLinhaCentralTiny(lin, hoje);
+      if (acao === 'BAIXAR') candBaixar.push({ linha: lin, acao: acao });
+      else if (acao === 'ATUALIZAR' || acao === 'JA_SINCRONIZADO') candAtualizar.push({ linha: lin, acao: 'ATUALIZAR' });
+    }
+
+    var selecionados = candBaixar.slice(0, 3);
+    for (var f1 = 0; f1 < candAtualizar.length && selecionados.length < 5; f1++) selecionados.push(candAtualizar[f1]);
+    for (var r2 = 3; r2 < candBaixar.length && selecionados.length < 5; r2++) selecionados.push(candBaixar[r2]);
+
+    if (selecionados.length === 0) {
+      notificarUsuarioSeguro(
+        'ℹ️ Nenhum título pendente com status 🟢 (Pronto para Baixa) ou 🟡 (Diferido) foi encontrado para teste.\n\n' +
+        'Certifique-se de executar o Passo A1, Passo A2 e Passo B antes de testar a baixa.'
+      );
+      return;
+    }
+
+    var relatorio = [];
+    var totalSucessos = 0;
+    var totalFalhas = 0;
+
+    for (var s = 0; s < selecionados.length; s++) {
+      var item = selecionados[s];
+      var diag = processarTituloNoTiny(tinyToken, item.linha, item.acao, { consultarAntes: true });
+      aplicarResultadoNaMemoria(diag, item.linha, cols.colF, cols.colM, cols.colN);
+      relatorio.push(diag);
+      if (diag.sucesso) totalSucessos++; else totalFalhas++;
+    }
+
+    gravarColunasCentralTiny(abaCentral, cols);
+    exibirPainelDiagnostico(relatorio, totalSucessos, totalFalhas, {
+      titulo: '🧪 Diagnóstico de Baixa Tiny ERP (5 Linhas)'
+    });
+  } finally {
+    lock.releaseLock();
+  }
+}
+
+/**
+ * Exibe o relatório em modal interativo (quando há interface) e sempre no Logger.
+ * @param {Object} [opcoesPainel] { titulo: string, maxSucessosDetalhados: number }
+ */
+function exibirPainelDiagnostico(relatorio, totalSucessos, totalFalhas, opcoesPainel) {
+  opcoesPainel = opcoesPainel || {};
+  var titulo = opcoesPainel.titulo || '🧪 Diagnóstico de Baixa Tiny ERP';
+  var maxSucessos = opcoesPainel.maxSucessosDetalhados === undefined ? 9999 : opcoesPainel.maxSucessosDetalhados;
+
+  var logTexto = '=== ' + titulo + ' ===\n';
+  logTexto += 'Sucessos: ' + totalSucessos + ' | Falhas: ' + totalFalhas + ' | Total avaliado: ' + relatorio.length + '\n\n';
+
+  var html = '<!DOCTYPE html><html><head><meta charset="utf-8">';
+  html += '<style>';
+  html += 'body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Arial, sans-serif; padding: 16px; background: #f8fafc; color: #1e293b; line-height: 1.4; font-size: 13px; }';
+  html += 'h2 { margin: 0 0 12px 0; color: #0f172a; font-size: 17px; display: flex; align-items: center; gap: 8px; }';
+  html += '.summary-bar { display: flex; gap: 14px; margin-bottom: 14px; padding: 10px 14px; background: #ffffff; border-radius: 8px; border: 1px solid #cbd5e1; font-weight: bold; }';
+  html += '.badge-success { color: #15803d; } .badge-danger { color: #b91c1c; }';
+  html += '.card { background: #ffffff; border-radius: 8px; border: 1px solid #cbd5e1; margin-bottom: 12px; padding: 12px; box-shadow: 0 1px 3px rgba(0,0,0,0.04); }';
+  html += '.card-header { display: flex; justify-content: space-between; align-items: center; margin-bottom: 6px; border-bottom: 1px solid #f1f5f9; padding-bottom: 6px; font-weight: bold; }';
+  html += '.tag { padding: 2px 8px; border-radius: 4px; font-size: 11px; font-weight: bold; text-transform: uppercase; }';
+  html += '.tag-ok { background: #dcfce7; color: #166534; }';
+  html += '.tag-err { background: #fee2e2; color: #991b1b; }';
+  html += '.item-detail { margin: 3px 0; }';
+  html += '.label { font-weight: 600; color: #475569; }';
+  html += '.box-erro { background: #fff1f2; border-left: 4px solid #e11d48; padding: 8px 10px; margin-top: 8px; border-radius: 0 4px 4px 0; font-family: Consolas, monospace; font-size: 12px; color: #9f1239; word-break: break-all; }';
+  html += '.box-success { background: #f0fdf4; border-left: 4px solid #22c55e; padding: 8px 10px; margin-top: 8px; border-radius: 0 4px 4px 0; color: #166534; font-weight: 500; }';
+  html += '.mini { font-size: 12px; padding: 4px 0; border-bottom: 1px dashed #e2e8f0; }';
+  html += '.btn-close { display: block; width: 100%; padding: 10px; margin-top: 14px; background: #1b365d; color: #ffffff; border: none; border-radius: 6px; font-size: 13px; font-weight: bold; cursor: pointer; text-align: center; }';
+  html += '.btn-close:hover { background: #0f233d; }';
+  html += '</style></head><body>';
+
+  html += '<h2>' + escaparXmlTiny(titulo) + '</h2>';
+  html += '<div class="summary-bar">';
+  html += '<span>Total Processados: ' + relatorio.length + '</span>';
+  html += '<span class="badge-success">✅ Sucessos: ' + totalSucessos + '</span>';
+  html += '<span class="badge-danger">❌ Falhas: ' + totalFalhas + '</span>';
+  html += '</div>';
+
+  // Falhas primeiro (sempre detalhadas), depois sucessos
+  var ordenado = relatorio.filter(function(r) { return !r.sucesso; }).concat(relatorio.filter(function(r) { return r.sucesso; }));
+  var sucessosDetalhados = 0;
+  var sucessosCompactos = [];
+
+  for (var k = 0; k < ordenado.length; k++) {
+    var it = ordenado[k];
+    logTexto += '--- [Linha ' + it.linha + '] Título ' + it.idTitulo + ' (' + it.canal + ' | ' + it.oc + ') ---\n';
+    logTexto += 'Cenário: ' + (it.tipoOperacao || '') + '\n';
+    logTexto += 'Etapa: ' + it.etapa + '\n';
+    logTexto += (it.sucesso ? 'STATUS: SUCESSO - ' + it.mensagemSucesso : 'STATUS: FALHA - ' + it.mensagemErro) + '\n';
+    if (it.respostaRaw) logTexto += 'Raw API: ' + it.respostaRaw + '\n';
+    logTexto += '\n';
+
+    if (it.sucesso && sucessosDetalhados >= maxSucessos) {
+      sucessosCompactos.push('<div class="mini">L' + it.linha + ' • #' + it.idTitulo + ' • ' + escaparXmlTiny(it.mensagemSucesso) + '</div>');
       continue;
     }
-    if (statusConc.indexOf('AGUARDANDO DADOS DE REPASSE') !== -1 || statusConc.indexOf('⚪') !== -1) continue;
-    if (statusProc.indexOf('✅ BAIXADO') !== -1) continue;
-    if (statusConc.indexOf('🟢') === -1 && statusConc.indexOf('🟡') === -1) continue;
+    if (it.sucesso) sucessosDetalhados++;
 
-    var idTitulo = limparIdCientifico(dados[i][0]);
-    var canal = dados[i][1] ? dados[i][1].toString().trim() : '';
-    if (!idTitulo) continue;
+    html += '<div class="card">';
+    html += '<div class="card-header">';
+    html += '<span>Linha ' + it.linha + ' • Título Tiny #' + it.idTitulo + ' (' + escaparXmlTiny(it.canal) + ')</span>';
+    html += '<span class="tag ' + (it.sucesso ? 'tag-ok">Sucesso' : 'tag-err">Falha') + '</span>';
+    html += '</div>';
 
-    // A DATA ENVIADA AO TINY É SEMPRE A DATA DA COLUNA G (índice 6): DATA REPASSE (NOVO VENC.)
-    var vencAtualTiny = formatarDataParaTinyBR(displayDados[i][5] || dados[i][5]);
-    var dataRepasse = formatarDataParaTinyBR(displayDados[i][6] || dados[i][6]);
-    if (!dataRepasse || dataRepasse.length < 10) {
-      dataRepasse = Utilities.formatDate(hoje, Session.getScriptTimeZone(), 'dd/MM/yyyy');
+    html += '<div class="item-detail"><span class="label">Cenário:</span> ' + escaparXmlTiny(it.tipoOperacao || '') + '</div>';
+    html += '<div class="item-detail"><span class="label">Pedido/OC:</span> ' + escaparXmlTiny(it.oc) + ' | <span class="label">Conta Destino:</span> ' + it.contaDestino + '</div>';
+    html += '<div class="item-detail"><span class="label">Venc. Atual Tiny (Col F):</span> ' + (it.vencAtualTiny || '-') + ' ➔ <span class="label">Novo Venc. / Repasse (Col G):</span> ' + it.dataRepasse + '</div>';
+    html += '<div class="item-detail"><span class="label">Valor Doc:</span> R$ ' + Number(it.valorDoc).toFixed(2) + ' (Líq: R$ ' + Number(it.liquido).toFixed(2) + ' | Taxa: R$ ' + Number(it.taxa).toFixed(2) + ')</div>';
+    html += '<div class="item-detail"><span class="label">Etapa Alcançada:</span> ' + escaparXmlTiny(it.etapa) + '</div>';
+
+    if (it.sucesso) {
+      html += '<div class="box-success">' + escaparXmlTiny(it.mensagemSucesso) + '</div>';
+    } else {
+      html += '<div class="box-erro"><strong>❌ Retorno Exato da API Tiny:</strong><br>' + escaparXmlTiny(it.mensagemErro);
+      if (it.respostaRaw) {
+        html += '<br><br><strong>📦 Payload/Resposta Bruta:</strong><br>' + escaparXmlTiny(it.respostaRaw.substring(0, 950));
+      }
+      html += '</div>';
+    }
+    html += '</div>';
+  }
+
+  if (sucessosCompactos.length > 0) {
+    html += '<div class="card"><div class="card-header"><span>Demais sucessos (' + sucessosCompactos.length + ')</span></div>';
+    html += sucessosCompactos.slice(0, 400).join('');
+    html += '</div>';
+  }
+
+  html += '<button class="btn-close" onclick="google.script.host.close()">Fechar Painel</button>';
+  html += '</body></html>';
+
+  Logger.log(logTexto.substring(0, 50000));
+
+  try {
+    var htmlOutput = HtmlService.createHtmlOutput(html).setWidth(720).setHeight(520);
+    SpreadsheetApp.getUi().showModalDialog(htmlOutput, titulo);
+  } catch (errUi) {
+    try {
+      SpreadsheetApp.getUi().alert(titulo + '\n\n' + logTexto.substring(0, 1500));
+    } catch (semUi) {
+      // Execução via gatilho: relatório registrado no Logger
+    }
+  }
+}
+
+/**
+ * PASSO C (OFICIAL) — PROCESSAMENTO EM MASSA
+ * • Lock de script (evita duas execuções simultâneas: menu + gatilho)
+ * • Cursor persistente + continuação automática por gatilho quando o tempo do Google se esgota
+ * • Gravação em lote na planilha (checkpoint a cada N títulos)
+ * • Títulos 🟡 já sincronizados (Col F == Col G e mesma taxa) não geram chamadas à API
+ */
+function baixarTitulosNoTiny(modoTeste, opcoes) {
+  if (modoTeste) {
+    executarDiagnosticoBaixaCincoLinhas();
+    return;
+  }
+  opcoes = opcoes || {};
+
+  var tinyToken = obterTokenTinySanitizado();
+  if (!tinyToken) {
+    notificarUsuarioSeguro('❌ Token do Tiny não configurado no Cofre (Menu item 2).');
+    return;
+  }
+
+  var lock = LockService.getScriptLock();
+  if (!lock.tryLock(10000)) {
+    notificarUsuarioSeguro('⏳ Já existe um processamento do Passo C em andamento. Aguarde a conclusão.');
+    return;
+  }
+
+  var props = PropertiesService.getScriptProperties();
+
+  try {
+    var ss = SpreadsheetApp.getActiveSpreadsheet();
+    var abaCentral = ss.getSheetByName('4_Central_Conciliacao_Tiny');
+    if (!abaCentral || abaCentral.getLastRow() <= 1) {
+      notificarUsuarioSeguro('❌ Aba 4_Central_Conciliacao_Tiny não encontrada ou vazia.');
+      return;
     }
 
-    var valorDoc = converterMoedaBR(dados[i][7]);
-    var taxaDescontada = Math.round(converterMoedaBR(dados[i][10]) * 100) / 100;
-    var liquidoRecebido = Math.round((valorDoc - taxaDescontada) * 100) / 100;
-
-    // Se estava como 🟡 DIFERIDO, mas a Data de Repasse (Coluna G) já é <= Hoje (e possui taxa calculada), promove para 🟢 BAIXA!
-    if (statusConc.indexOf('🟡') !== -1 && dataJaPassouOuHoje(dataRepasse, hoje) && taxaDescontada > 0) {
-      statusConc = '🟢 PRONTO PARA BAIXA AUTOMÁTICA';
-      abaCentral.getRange(i + 1, 13).setValue(statusConc);
+    // Recupera lote pausado (se ainda válido) ou inicia um novo
+    var lote = null;
+    try {
+      var loteStr = props.getProperty(PASSO_C_PROP_LOTE);
+      if (loteStr) lote = JSON.parse(loteStr);
+    } catch (eLote) { lote = null; }
+    if (!lote || (new Date().getTime() - (lote.atualizadoEm || 0)) > PASSO_C_VALIDADE_LOTE_MS) {
+      lote = novoLotePassoC();
     }
+    lote.execucoes++;
 
-    // 2. Títulos Diferidos com liberação futura (🟡): Atualiza a Data de Vencimento no Tiny para a Coluna G
-    if (statusConc.indexOf('🟡') !== -1) {
-      // Se o Vencimento Atual no Tiny (Coluna F) JÁ É IGUAL à Data de Repasse (Coluna G) e já está confirmado, não gasta API!
-      if (vencAtualTiny === dataRepasse && statusProc.indexOf('📅 VENC. ATUALIZADO NO TINY (' + dataRepasse + ')') !== -1) {
+    var inicioFuncao = new Date().getTime();
+    var limiteMs = Math.min(inicioFuncao + PASSO_C_ORCAMENTO_FUNCAO_MS, INICIO_EXECUCAO_SCRIPT_MS + PASSO_C_TETO_EXECUCAO_MS);
+
+    var hoje = new Date();
+    var rng = abaCentral.getRange(1, 1, abaCentral.getLastRow(), 14);
+    var dados = rng.getValues();
+    var displayDados = rng.getDisplayValues();
+    var cols = extrairColunasCentralTiny(dados);
+
+    var relatorio = [];
+    var desdeCheckpoint = 0;
+    var inicioCursor = Math.max(1, Math.min(lote.cursor || 1, dados.length));
+    if (lote.execucoes === 1) toastSeguro('Processando ' + (dados.length - 1) + ' linhas da Central...', 'Passo C (OFICIAL)');
+
+    for (var i = inicioCursor; i < dados.length; i++) {
+      // Pausa preventiva: salva progresso e agenda continuação automática
+      if (new Date().getTime() > limiteMs) {
+        gravarColunasCentralTiny(abaCentral, cols);
+        lote.cursor = i;
+        lote.atualizadoEm = new Date().getTime();
+        props.setProperty(PASSO_C_PROP_LOTE, JSON.stringify(lote));
+        agendarContinuacaoPassoC();
+        var resumoPausa = montarResumoLotePassoC(lote, false) +
+          '\n\n▶️ Continuação automática agendada para ~1 minuto (linha ' + (i + 1) + ' de ' + dados.length + '). Não é necessário clicar novamente.';
+        props.setProperty(PASSO_C_PROP_ULTIMO_RESUMO, resumoPausa);
+        if (!opcoes.continuacao) notificarUsuarioSeguro(resumoPausa); else Logger.log(resumoPausa);
+        return;
+      }
+
+      var linha = lerLinhaCentralTiny(dados, displayDados, i);
+      var acao = classificarLinhaCentralTiny(linha, hoje);
+
+      if (acao === 'IGNORAR') continue;
+      if (acao === 'JA_SINCRONIZADO') { lote.jaSincronizados++; continue; }
+      if (acao === 'BLOQUEADO_REEMBOLSO') {
+        if (linha.statusProc.indexOf('CANCELADO') === -1) {
+          cols.colN[i - 1][0] = '🚫 CANCELADO / BLOQUEADO (REEMBOLSO)';
+          lote.bloqueados++;
+        }
         continue;
       }
 
-      var resAlt = atualizarTituloDiferidoNoTiny(tinyToken, idTitulo, dataRepasse, taxaDescontada);
-      abaCentral.getRange(i + 1, 14).setValue(resAlt.mensagem);
-      if (resAlt.sucesso) {
-        abaCentral.getRange(i + 1, 6).setValue(dataRepasse); // Sincroniza Coluna F com a nova data gravada no Tiny
-        processados++;
+      var diag = processarTituloNoTiny(tinyToken, linha, acao, { consultarAntes: false });
+      aplicarResultadoNaMemoria(diag, linha, cols.colF, cols.colM, cols.colN);
+      registrarDiagNoLote(lote, diag);
+      relatorio.push(diag);
+
+      desdeCheckpoint++;
+      if (desdeCheckpoint >= PASSO_C_CHECKPOINT_TITULOS) {
+        gravarColunasCentralTiny(abaCentral, cols);
+        lote.cursor = i + 1;
+        lote.atualizadoEm = new Date().getTime();
+        props.setProperty(PASSO_C_PROP_LOTE, JSON.stringify(lote));
+        toastSeguro('Linha ' + (i + 1) + '/' + dados.length + ' • Baixados: ' + lote.baixados + ' • Atualizados: ' + lote.atualizados + ' • Falhas: ' + lote.falhas, 'Passo C (OFICIAL)');
+        desdeCheckpoint = 0;
       }
-      SpreadsheetApp.flush();
-      continue;
     }
 
-    // 3. Títulos Liberados (🟢): Atualiza vencimento/taxa e executa a Baixa Financeira na data da Coluna G
-    if (statusConc.indexOf('🟢') !== -1) {
-      var isAmazon = canal.toUpperCase().indexOf('AMAZON') !== -1;
-      var nomeContaDestino = isAmazon ? 'AMAZON' : 'MERCADO PAGO';
+    // Lote concluído: grava, ordena, limpa estado e reporta
+    gravarColunasCentralTiny(abaCentral, cols);
+    ordenarCentralTiny(abaCentral);
+    props.deleteProperty(PASSO_C_PROP_LOTE);
+    removerGatilhosContinuacaoPassoC();
 
-      // Garante que o vencimento e a taxa estejam atualizados no cadastro do título antes da baixa
-      if (vencAtualTiny !== dataRepasse || isAmazon) {
-        atualizarTituloDiferidoNoTiny(tinyToken, idTitulo, dataRepasse, taxaDescontada);
-      }
+    var resumoFinal = montarResumoLotePassoC(lote, true);
+    props.setProperty(PASSO_C_PROP_ULTIMO_RESUMO, resumoFinal);
+    Logger.log(resumoFinal);
 
-      var payloadBaixar = {
-        token: tinyToken,
-        formato: 'json',
-        conta: JSON.stringify({
-          conta: {
-            id: Number(idTitulo),
-            contaDestino: nomeContaDestino,
-            data: dataRepasse,
-            valorTaxas: Number(taxaDescontada.toFixed(2)),
-            valorJuros: 0,
-            valorDesconto: 0,
-            valorPago: Number(liquidoRecebido.toFixed(2))
-          }
-        })
-      };
-
-      var resJson = requisitarTinyAPI('conta.receber.baixar.php', payloadBaixar, true);
-
-      if (resJson && resJson.retorno && resJson.retorno.erros) {
-        var strErro = JSON.stringify(resJson.retorno.erros).toLowerCase();
-        if (strErro.indexOf('baixada') !== -1 || strErro.indexOf('liquidada') !== -1 || strErro.indexOf('ja se encontra') !== -1) {
-          requisitarTinyAPI('conta.receber.estornar.php', { token: tinyToken, id: idTitulo, formato: 'json' }, true);
-          resJson = requisitarTinyAPI('conta.receber.baixar.php', payloadBaixar, true);
-        }
-      }
-
-      if (resJson && resJson.retorno && resJson.retorno.status === 'OK') {
-        abaCentral.getRange(i + 1, 6).setValue(dataRepasse);
-        abaCentral.getRange(i + 1, 14).setValue(
-          '✅ BAIXADO EM ' + nomeContaDestino + ' (Líq: R$ ' + liquidoRecebido.toFixed(2) + ' | Taxa: R$ ' + taxaDescontada.toFixed(2) + ' | Data: ' + dataRepasse + ')'
-        );
-        processados++;
-      } else {
-        var msgErro = (resJson && resJson.retorno && resJson.retorno.erros) ? JSON.stringify(resJson.retorno.erros) : 'Erro na baixa';
-        abaCentral.getRange(i + 1, 14).setValue('⚠️ ' + msgErro);
-      }
-      SpreadsheetApp.flush();
+    if (!opcoes.continuacao && relatorio.length > 0) {
+      var sucessos = relatorio.filter(function(r) { return r.sucesso; }).length;
+      exibirPainelDiagnostico(relatorio, sucessos, relatorio.length - sucessos, {
+        titulo: '🚀 Passo C (OFICIAL) • Baixados: ' + lote.baixados + ' • Atualizados: ' + lote.atualizados,
+        maxSucessosDetalhados: 10
+      });
+    } else if (!opcoes.continuacao) {
+      notificarUsuarioSeguro(resumoFinal);
     }
+  } catch (err) {
+    var msgErro = '❌ Erro inesperado no Passo C (OFICIAL): ' + err.message;
+    Logger.log(msgErro + '\n' + err.stack);
+    props.setProperty(PASSO_C_PROP_ULTIMO_RESUMO, msgErro);
+    if (!opcoes.continuacao) notificarUsuarioSeguro(msgErro);
+    throw err;
+  } finally {
+    lock.releaseLock();
   }
-
-  ordenarCentralTiny(abaCentral);
-  SpreadsheetApp.getUi().alert('✅ Processamento concluído! ' + processados + ' títulos foram atualizados/baixados no Tiny.');
 }
 
 // =========================================================================

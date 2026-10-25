@@ -37,14 +37,167 @@ function obterDataInicialBuscaRetroativa(hoje, diasPadrao, strDataFixa) {
 // =========================================================================
 // GATEWAY CENTRAL DA API TINY ERP (ELIMINA TOKEN DUPLICADO E TRATA RATE LIMIT)
 // =========================================================================
+
+/**
+ * Escapa entidades especiais XML para compatibilidade estrita com a API 2.0 do Tiny ERP.
+ */
+function escaparXmlTiny(str) {
+  if (str === null || str === undefined) return '';
+  return str.toString()
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;')
+    .replace(/'/g, '&apos;');
+}
+
+/**
+ * Extrai mensagens de erro em respostas não-JSON (XML ou HTML de falha de gateway/servidor).
+ */
+function extrairErroDeTextoOuXml(texto, httpCode) {
+  if (!texto) return 'Resposta vazia do servidor Tiny (HTTP ' + httpCode + ')';
+
+  // Extrai pares <erro> e <campo> (sejam irmãos dentro de <erros> ou aninhados) de respostas XML da API 2.0 do Tiny
+  var partesXml = [];
+  var regexBlocoErros = /<erros>([\s\S]*?)<\/erros>/gi;
+  var mErros;
+  while ((mErros = regexBlocoErros.exec(texto)) !== null) {
+    var bloco = mErros[1];
+    var mE = bloco.match(/<erro>([\s\S]*?)<\/erro>/i);
+    var mC = bloco.match(/<campo>([\s\S]*?)<\/campo>/i);
+    if (mE && mC && mE[1] && mC[1]) {
+      var strE = mE[1].replace(/<[^>]+>/g, '').trim();
+      var strC = mC[1].replace(/<[^>]+>/g, '').trim();
+      partesXml.push(strE + ': ' + strC);
+    }
+  }
+
+  if (partesXml.length === 0) {
+    var regexBlocoErro = /<erro>([\s\S]*?)<\/erro>/gi;
+    var match;
+    while ((match = regexBlocoErro.exec(texto)) !== null) {
+      var conteudo = match[1];
+      var mCampo = conteudo.match(/<campo>([\s\S]*?)<\/campo>/i);
+      var mSubErro = conteudo.match(/<erro>([\s\S]*?)<\/erro>/i);
+      if (mCampo && mCampo[1]) {
+        var nomeCampo = mSubErro && mSubErro[1] ? mSubErro[1].trim() + ': ' : '';
+        partesXml.push(nomeCampo + mCampo[1].replace(/<!\[CDATA\[(.*?)\]\]>/g, '$1').trim());
+      } else {
+        var limpo = conteudo.replace(/<[^>]+>/g, ' ').replace(/<!\[CDATA\[(.*?)\]\]>/g, '$1').replace(/\s+/g, ' ').trim();
+        if (limpo) partesXml.push(limpo);
+      }
+    }
+  }
+
+  if (partesXml.length > 0) {
+    var mCod = texto.match(/<codigo_erro>\s*(\d+)\s*<\/codigo_erro>/i);
+    var prefixCod = mCod && mCod[1] ? '[Cód. ' + mCod[1] + '] ' : '';
+    return prefixCod + partesXml.join(' | ');
+  }
+
+  // Se for página de erro HTML (502, 503, 403, Cloudflare, etc.)
+  if (texto.indexOf('<html') !== -1 || texto.indexOf('<!DOCTYPE') !== -1) {
+    var mTitle = texto.match(/<title>(.*?)<\/title>/i);
+    var titulo = mTitle ? mTitle[1].trim() : 'Página de erro HTML';
+    return 'Servidor Tiny retornou HTTP ' + httpCode + ' (' + titulo + ')';
+  }
+
+  return 'HTTP ' + httpCode + ': ' + texto.substring(0, 200).replace(/\s+/g, ' ').trim();
+}
+
+/**
+ * Extrai e formata com precisão todos os erros detalhados retornados pela API do Tiny ERP.
+ */
+function extrairMensagemErroTiny(json) {
+  if (!json) return 'Sem resposta do servidor Tiny (null/undefined)';
+  if (typeof json === 'string') return json;
+  if (!json.retorno) return JSON.stringify(json);
+
+  var ret = json.retorno;
+  var msgs = [];
+
+  if (ret.erros && Array.isArray(ret.erros)) {
+    ret.erros.forEach(function(e) {
+      if (typeof e === 'string') {
+        msgs.push(e);
+      } else if (e && e.erro && e.campo) {
+        msgs.push(e.erro + ': ' + e.campo);
+      } else if (e && e.campo) {
+        msgs.push(e.campo);
+      } else if (e && e.erro) {
+        msgs.push(e.erro);
+      } else if (e) {
+        msgs.push(JSON.stringify(e));
+      }
+    });
+  }
+
+  // Também extrai erros aninhados em retorno.registros[].registro.erros (usado em baixar.php e incluir.php)
+  if (ret.registros && Array.isArray(ret.registros)) {
+    ret.registros.forEach(function(item) {
+      var reg = item && item.registro ? item.registro : item;
+      if (reg && reg.erros && Array.isArray(reg.erros)) {
+        reg.erros.forEach(function(er) {
+          if (typeof er === 'string') msgs.push(er);
+          else if (er && er.erro && er.campo) msgs.push(er.erro + ': ' + er.campo);
+          else if (er && er.erro) msgs.push(er.erro);
+          else if (er) msgs.push(JSON.stringify(er));
+        });
+      }
+    });
+  }
+
+  if (msgs.length === 0 && ret.mensagem) msgs.push(ret.mensagem);
+  if (msgs.length === 0 && ret._rawText) {
+    msgs.push(ret._rawText.substring(0, 200).replace(/\s+/g, ' ').trim());
+  }
+
+  var cod = ret.codigo_erro ? '[Cód. ' + ret.codigo_erro + '] ' : '';
+  var http = ret._httpCode && ret._httpCode !== 200 ? '(HTTP ' + ret._httpCode + ') ' : '';
+  return http + cod + (msgs.length > 0 ? msgs.join(' | ') : (ret.status || 'Erro desconhecido'));
+}
+
 function requisitarTinyAPI(endpoint, payloadObj, aplicarPausaEscrita) {
   var url = 'https://api.tiny.com.br/api2/' + endpoint;
 
-  // Garante token limpo e nunca mistura Query String na URL com corpo POST
-  if (payloadObj && payloadObj.token) {
+  // Garante token limpo e serialização explícita application/x-www-form-urlencoded (padrão $_POST PHP do Tiny)
+  if (payloadObj && typeof payloadObj === 'object' && payloadObj.token) {
     payloadObj.token = payloadObj.token.toString().replace(/\s+/g, '').trim();
   }
 
+  var formBody = '';
+  if (typeof payloadObj === 'string') {
+    formBody = payloadObj;
+  } else if (payloadObj && typeof payloadObj === 'object') {
+    formBody = Object.keys(payloadObj).map(function(k) {
+      var val = (payloadObj[k] === null || payloadObj[k] === undefined) ? '' : payloadObj[k].toString();
+      return encodeURIComponent(k) + '=' + encodeURIComponent(val);
+    }).join('&');
+  }
+
+  return executarFetchTinyComRetry(url, 'application/x-www-form-urlencoded; charset=UTF-8', formBody, aplicarPausaEscrita);
+}
+
+/**
+ * Requisição para endpoints REST híbridos da API 2.0 do Tiny (ex: conta.receber.alterar.php, produto.atualizar.precos.php)
+ * onde os "Parâmetros do serviço" (token, formato) vão na Query String da URL ($_GET/$_REQUEST)
+ * e o "Conteúdo do body" (JSON/XML bruto) vai direto no corpo HTTP POST (lido via php://input).
+ */
+function requisitarTinyRestBody(endpoint, queryParamsObj, rawBodyStr, contentTypeStr, aplicarPausaEscrita) {
+  var qs = '';
+  if (queryParamsObj && typeof queryParamsObj === 'object') {
+    qs = Object.keys(queryParamsObj).map(function(k) {
+      var val = (queryParamsObj[k] === null || queryParamsObj[k] === undefined) ? '' : queryParamsObj[k].toString();
+      if (k === 'token') val = val.replace(/\s+/g, '').trim();
+      return encodeURIComponent(k) + '=' + encodeURIComponent(val);
+    }).join('&');
+  }
+  var url = 'https://api.tiny.com.br/api2/' + endpoint + (qs ? ('?' + qs) : '');
+  var cType = contentTypeStr || 'application/json; charset=UTF-8';
+  return executarFetchTinyComRetry(url, cType, rawBodyStr, aplicarPausaEscrita);
+}
+
+function executarFetchTinyComRetry(url, contentTypeStr, bodyPayload, aplicarPausaEscrita) {
   var maxTentativas = 4;
   for (var tent = 1; tent <= maxTentativas; tent++) {
     if (aplicarPausaEscrita) {
@@ -55,16 +208,43 @@ function requisitarTinyAPI(endpoint, payloadObj, aplicarPausaEscrita) {
 
     var resp = UrlFetchApp.fetch(url, {
       method: 'post',
-      payload: payloadObj,
+      contentType: contentTypeStr,
+      payload: bodyPayload,
       muteHttpExceptions: true
     });
 
+    var httpCode = resp.getResponseCode();
     var texto = resp.getContentText();
     var json = null;
+
     try {
       json = JSON.parse(texto);
     } catch (e) {
-      return { retorno: { status: 'Erro', erros: [{ erro: 'Resposta inválida do servidor Tiny' }] } };
+      // Se o endpoint respondeu em XML com <status>OK</status>, converte para objeto de sucesso padrão
+      if (texto && /<status>\s*OK\s*<\/status>/i.test(texto)) {
+        return {
+          retorno: {
+            status: 'OK',
+            status_processamento: '3',
+            _httpCode: httpCode,
+            _rawText: texto
+          }
+        };
+      }
+      var erroExtraido = extrairErroDeTextoOuXml(texto, httpCode);
+      return {
+        retorno: {
+          status: 'Erro',
+          _httpCode: httpCode,
+          _rawText: texto,
+          erros: [{ erro: erroExtraido }]
+        }
+      };
+    }
+
+    if (json && json.retorno) {
+      json.retorno._httpCode = httpCode;
+      json.retorno._rawText = texto;
     }
 
     // Verifica se o Tiny sinalizou bloqueio temporário por limite de acessos (Rate Limit)
@@ -158,64 +338,242 @@ function estimarFreteDbaAmazon(valorUnitario, qtd) {
   return Math.round(6.50 * q * 100) / 100;
 }
 
-// 3. ATUALIZA O VENCIMENTO E A TAXA DO TÍTULO NO TINY ERP SEGUINDO O LAYOUT OFICIAL COMPLETO
-function atualizarTituloDiferidoNoTiny(tinyToken, idTitulo, novaDataVencimento, novaTaxa) {
-  try {
-    var idLimpo = limparIdCientifico(idTitulo);
-    var taxaVal = parseFloat(novaTaxa) || 0;
+// 3. OPERAÇÕES DE ESCRITA NO TINY ERP (ALTERAÇÃO DE VENCIMENTO/TAXA + BAIXA FINANCEIRA) — PRONTAS PARA EXECUÇÃO EM MASSA
+//
+// Formato validado em produção (diagnóstico 5/5 OK em 25/10/2026):
+// • conta.receber.alterar.php -> "Parâmetros do serviço" (token, formato) na Query String da URL
+//                                 + "Conteúdo do body" { conta: { id, vencimento, taxa } } como JSON bruto (php://input).
+// • conta.receber.baixar.php  -> padrão legado application/x-www-form-urlencoded (token, formato, conta=<JSON>), com fallback XML.
+var FORMATO_BAIXAR_VENCEDOR = null;
 
-    // Passo 1: Obtém os dados cadastrais obrigatórios do título no Tiny (cliente, data emissão, valor, histórico)
-    var jsonObter = requisitarTinyAPI('conta.receber.obter.php', {
-      token: tinyToken,
-      id: idLimpo,
-      formato: 'json'
-    }, false);
+function situacaoTinyEhBaixada(situacao) {
+  var s = (situacao || '').toString().toLowerCase().trim();
+  return s === 'pago' || s === 'paga' || s === 'liquidada' || s === 'baixada' || s === 'recebido' || s === 'recebida';
+}
 
-    if (!jsonObter || !jsonObter.retorno || jsonObter.retorno.status !== 'OK' || !jsonObter.retorno.conta) {
-      var errObter = (jsonObter && jsonObter.retorno && jsonObter.retorno.erros)
-        ? JSON.stringify(jsonObter.retorno.erros)
-        : 'Falha ao ler título ' + idLimpo;
-      return { sucesso: false, mensagem: '⚠️ ' + errObter };
-    }
+// Texto gravado na Coluna N após atualização bem-sucedida. Inclui a taxa para detectar mudanças futuras na Coluna K.
+// (O prefixo "📅 VENC. ATUALIZADO NO TINY (dd/MM/yyyy)" é preservado pelo upsert do Passo B.)
+function montarMarcadorVencimentoTiny(dataVenc, taxa) {
+  return '📅 VENC. ATUALIZADO NO TINY (' + dataVenc + ') | Taxa R$ ' + (Number(taxa) || 0).toFixed(2);
+}
 
-    var orig = jsonObter.retorno.conta;
-    var docValor = parseFloat(orig.valor) || 0;
-    var dataEmissao = orig.data || novaDataVencimento;
+function obterContaReceberTiny(tinyToken, idTitulo) {
+  var json = requisitarTinyAPI('conta.receber.obter.php', {
+    token: tinyToken,
+    id: idTitulo,
+    formato: 'json'
+  }, false);
 
-    // Monta o objeto JSON completo exigido pela especificação oficial do Tiny ERP (api2-contas-receber-alterar)
-    var contaCompleta = {
-      id: Number(idLimpo),
-      data: dataEmissao,
-      vencimento: novaDataVencimento,
-      data_vencimento: novaDataVencimento,
-      valor: Number(docValor.toFixed(2)),
-      taxa: Number(taxaVal.toFixed(2)),
-      valor_taxa: Number(taxaVal.toFixed(2)),
-      nro_documento: orig.nro_documento || '',
-      historico: orig.historico || '',
-      categoria: orig.categoria || '',
-      cliente: orig.cliente || { nome: orig.nome_cliente || '' }
-    };
-
-    if (orig.forma_pagamento) contaCompleta.forma_pagamento = orig.forma_pagamento;
-    if (orig.meio_pagamento) contaCompleta.meio_pagamento = orig.meio_pagamento;
-
-    var resAlt = requisitarTinyAPI('conta.receber.alterar.php', {
-      token: tinyToken,
-      id: idLimpo,
-      formato: 'json',
-      conta: JSON.stringify({ conta: contaCompleta })
-    }, true);
-
-    if (resAlt && resAlt.retorno && resAlt.retorno.status === 'OK') {
-      return { sucesso: true, mensagem: '📅 VENC. ATUALIZADO NO TINY (' + novaDataVencimento + ')' };
-    }
-
-    var erroMsg = (resAlt && resAlt.retorno && resAlt.retorno.erros) ? JSON.stringify(resAlt.retorno.erros) : 'Erro na alteração';
-    return { sucesso: false, mensagem: '⚠️ ' + erroMsg };
-  } catch (e) {
-    return { sucesso: false, mensagem: '⚠️ Erro API: ' + e.message };
+  if (!json || !json.retorno || json.retorno.status !== 'OK') {
+    return { ok: false, erro: extrairMensagemErroTiny(json), retorno: json, conta: {} };
   }
+  var conta = json.retorno.conta || {};
+  return {
+    ok: true,
+    conta: conta,
+    situacao: (conta.situacao || '').toString().toLowerCase(),
+    jaBaixado: situacaoTinyEhBaixada(conta.situacao),
+    retorno: json
+  };
+}
+
+/**
+ * Atualiza vencimento (DATA REPASSE - Col G) e taxa (TAXA EFETIVA - Col K) de uma conta a receber.
+ * @param {Object} [opcoes] { consultarAntes: boolean } — se true, consulta o título antes (modo diagnóstico).
+ *                          Em massa (padrão) a consulta só ocorre se a alteração falhar, para economizar requisições.
+ */
+function atualizarTituloDiferidoNoTiny(tinyToken, idTitulo, novaDataVencimento, novaTaxa, opcoes) {
+  opcoes = opcoes || {};
+  var idLimpo = limparIdCientifico(idTitulo);
+  var taxaVal = Math.round((parseFloat(novaTaxa) || 0) * 100) / 100;
+
+  if (!idLimpo || isNaN(Number(idLimpo))) {
+    return { sucesso: false, etapa: 'VALIDACAO_LOCAL', mensagem: '⚠️ ID do título inválido/vazio: "' + idLimpo + '"' };
+  }
+  if (!/^\d{2}\/\d{2}\/\d{4}$/.test(novaDataVencimento || '')) {
+    return { sucesso: false, etapa: 'VALIDACAO_LOCAL', mensagem: '⚠️ Data de repasse (Col G) inválida: "' + novaDataVencimento + '"' };
+  }
+  if (taxaVal < 0) {
+    return { sucesso: false, etapa: 'VALIDACAO_LOCAL', mensagem: '⚠️ Taxa (Col K) negativa: R$ ' + taxaVal.toFixed(2) };
+  }
+
+  try {
+    var consulta = null;
+    if (opcoes.consultarAntes) {
+      consulta = obterContaReceberTiny(tinyToken, idLimpo);
+      if (!consulta.ok) {
+        return {
+          sucesso: false,
+          etapa: 'OBTER_TITULO',
+          mensagem: '⚠️ Tiny [Obter ID ' + idLimpo + ']: ' + consulta.erro,
+          detalhes: { id: idLimpo, erro: consulta.erro, retorno: consulta.retorno }
+        };
+      }
+      if (consulta.jaBaixado) {
+        return {
+          sucesso: true,
+          etapa: 'TITULO_JA_BAIXADO',
+          jaBaixado: true,
+          mensagem: 'ℹ️ Título ' + idLimpo + ' já se encontra pago/baixado no Tiny (' + consulta.situacao + ')'
+        };
+      }
+    }
+
+    var corpo = JSON.stringify({
+      conta: {
+        id: String(idLimpo),
+        vencimento: novaDataVencimento,
+        taxa: Number(taxaVal.toFixed(2))
+      }
+    });
+
+    var resp = requisitarTinyRestBody(
+      'conta.receber.alterar.php',
+      { token: tinyToken, formato: 'json' },
+      corpo,
+      'application/json; charset=UTF-8',
+      true
+    );
+
+    if (resp && resp.retorno && resp.retorno.status === 'OK') {
+      return {
+        sucesso: true,
+        etapa: 'ALTERACAO_CONCLUIDA',
+        mensagem: montarMarcadorVencimentoTiny(novaDataVencimento, taxaVal)
+      };
+    }
+
+    var msgErr = extrairMensagemErroTiny(resp);
+
+    // Falhou: consulta o título para diferenciar "já baixado no Tiny" de erro real e enriquecer o diagnóstico
+    if (!consulta) consulta = obterContaReceberTiny(tinyToken, idLimpo);
+    if (consulta.ok && consulta.jaBaixado) {
+      return {
+        sucesso: true,
+        etapa: 'TITULO_JA_BAIXADO',
+        jaBaixado: true,
+        mensagem: 'ℹ️ Título ' + idLimpo + ' já se encontra pago/baixado no Tiny (' + consulta.situacao + ')'
+      };
+    }
+
+    var orig = consulta.conta || {};
+    return {
+      sucesso: false,
+      etapa: 'ALTERAR_TITULO',
+      mensagem: '⚠️ Tiny [Alterar ID ' + idLimpo + ']: ' + msgErr,
+      detalhes: {
+        id: idLimpo,
+        vencimentoAtualTiny: orig.vencimento || '',
+        vencimentoEnviado: novaDataVencimento,
+        taxaEnviada: Number(taxaVal.toFixed(2)),
+        situacaoTiny: orig.situacao || (consulta.ok ? '' : ('Falha ao consultar: ' + consulta.erro)),
+        formaRecebimentoTiny: orig.forma_pagamento || orig.formaPagamento || '',
+        corpoEnviado: corpo,
+        retorno: resp
+      }
+    };
+  } catch (e) {
+    return {
+      sucesso: false,
+      etapa: 'EXCECAO_SCRIPT',
+      mensagem: '⚠️ Erro Script: ' + e.message,
+      detalhes: { stack: e.stack }
+    };
+  }
+}
+
+/**
+ * Executa a baixa financeira (conta.receber.baixar.php).
+ * Formato JSON em 1º lugar; XML como fallback; o formato aceito é memorizado durante a execução.
+ * Se o Tiny informar que o título já está baixado, estorna e baixa novamente com os valores corretos.
+ */
+function baixarContaReceberNoTiny(tinyToken, idTitulo, nomeContaDestino, dataBaixa, valorTaxas, valorPago) {
+  var idLimpo = limparIdCientifico(idTitulo);
+  var taxa = Math.round((Number(valorTaxas) || 0) * 100) / 100;
+  var pago = Math.round((Number(valorPago) || 0) * 100) / 100;
+
+  var payloadJson = {
+    token: tinyToken,
+    formato: 'json',
+    conta: JSON.stringify({
+      conta: {
+        id: String(idLimpo),
+        contaDestino: nomeContaDestino,
+        data: dataBaixa,
+        valorTaxas: Number(taxa.toFixed(2)),
+        valorJuros: 0,
+        valorDesconto: 0,
+        valorPago: Number(pago.toFixed(2))
+      }
+    })
+  };
+
+  var payloadXml = {
+    token: tinyToken,
+    formato: 'json',
+    conta: '<?xml version="1.0" encoding="UTF-8"?>' +
+      '<conta>' +
+      '<id>' + escaparXmlTiny(idLimpo) + '</id>' +
+      '<contaDestino>' + escaparXmlTiny(nomeContaDestino) + '</contaDestino>' +
+      '<data>' + escaparXmlTiny(dataBaixa) + '</data>' +
+      '<valorTaxas>' + taxa.toFixed(2) + '</valorTaxas>' +
+      '<valorJuros>0.00</valorJuros>' +
+      '<valorDesconto>0.00</valorDesconto>' +
+      '<valorPago>' + pago.toFixed(2) + '</valorPago>' +
+      '</conta>'
+  };
+
+  var candidatos = [
+    { codigo: 'JSON', payload: payloadJson },
+    { codigo: 'XML', payload: payloadXml }
+  ];
+  if (FORMATO_BAIXAR_VENCEDOR === 'XML') candidatos.reverse();
+
+  var resumos = [];
+  var ultimaResp = null;
+
+  function ehErroJaBaixado(resp) {
+    if (!resp || !resp.retorno || !resp.retorno.erros) return false;
+    var s = JSON.stringify(resp.retorno.erros).toLowerCase();
+    return s.indexOf('baixada') !== -1 || s.indexOf('liquidada') !== -1 || s.indexOf('ja se encontra') !== -1 || s.indexOf('já se encontra') !== -1;
+  }
+
+  for (var c = 0; c < candidatos.length; c++) {
+    var cand = candidatos[c];
+    var resp = requisitarTinyAPI('conta.receber.baixar.php', cand.payload, true);
+    ultimaResp = resp;
+
+    if (resp && resp.retorno && resp.retorno.status === 'OK') {
+      FORMATO_BAIXAR_VENCEDOR = cand.codigo;
+      return { sucesso: true, etapa: 'BAIXA_CONCLUIDA_' + cand.codigo, retorno: resp };
+    }
+
+    if (ehErroJaBaixado(resp)) {
+      requisitarTinyAPI('conta.receber.estornar.php', { token: tinyToken, id: String(idLimpo), formato: 'json' }, true);
+      var resp2 = requisitarTinyAPI('conta.receber.baixar.php', cand.payload, true);
+      ultimaResp = resp2;
+      if (resp2 && resp2.retorno && resp2.retorno.status === 'OK') {
+        FORMATO_BAIXAR_VENCEDOR = cand.codigo;
+        return { sucesso: true, etapa: 'REBAIXA_APOS_ESTORNO_' + cand.codigo, retorno: resp2 };
+      }
+      resumos.push(cand.codigo + ' (após estorno): ' + extrairMensagemErroTiny(resp2));
+      break;
+    }
+
+    resumos.push(cand.codigo + ': ' + extrairMensagemErroTiny(resp));
+    // Só tenta o formato alternativo se o erro indicar problema de estrutura/leitura (ex.: Cód. 31 / campo id)
+    var strErr = resp && resp.retorno ? JSON.stringify(resp.retorno) : '';
+    if (strErr.indexOf('31') === -1 && strErr.indexOf('"id"') === -1 && strErr.toLowerCase().indexOf('xml') === -1 && strErr.toLowerCase().indexOf('json') === -1) {
+      break;
+    }
+  }
+
+  return {
+    sucesso: false,
+    etapa: 'BAIXAR_TITULO',
+    mensagem: '⚠️ Tiny [Baixar ID ' + idLimpo + ']: ' + (resumos[0] || extrairMensagemErroTiny(ultimaResp)),
+    detalhes: { id: idLimpo, resumoTentativas: resumos.join(' | '), retorno: ultimaResp }
+  };
 }
 
 // 4. FÓRMULA MATEMÁTICA ESTRITA DO MERCADO LIVRE (14% CLÁSSICO / 19% PREMIUM)
@@ -415,11 +773,20 @@ function ordenarCentralTiny(abaCentral) {
   if (abaCentral.getLastRow() <= 1) return;
   var dados = abaCentral.getRange(2, 1, abaCentral.getLastRow() - 1, 14).getValues();
   dados.sort(function(a, b) {
-    var stA = a[13] ? a[13].toString() : '';
-    var stB = b[13] ? b[13].toString() : '';
-    var conclA = (stA.indexOf('✅ BAIXADO') !== -1) ? 1 : 0;
-    var conclB = (stB.indexOf('✅ BAIXADO') !== -1) ? 1 : 0;
-    if (conclA !== conclB) return conclA - conclB;
+    function obterPesoPrioridade(row) {
+      var stConc = row[12] ? row[12].toString() : '';
+      var stProc = row[13] ? row[13].toString() : '';
+      if (stProc.indexOf('✅ BAIXADO') !== -1) return 4;
+      if (stConc.indexOf('🟢') !== -1) return 0; // 1º: Vendas já recebidas (<= hoje) prontas para baixar
+      if (stConc.indexOf('🟡') !== -1 && stProc.indexOf('AGUARDANDO DADOS') === -1) {
+        if (stProc.indexOf('📅 VENC. ATUALIZADO') === -1) return 1; // 2º: Contas futuras pendentes de atualizar vencimento
+        return 2; // 3º: Contas futuras já atualizadas
+      }
+      return 3; // 4º: Aguardando repasse / Bloqueados
+    }
+    var pA = obterPesoPrioridade(a);
+    var pB = obterPesoPrioridade(b);
+    if (pA !== pB) return pA - pB;
     var dtA = converterDataBRParaTimestamp(a[6]);
     var dtB = converterDataBRParaTimestamp(b[6]);
     return dtB - dtA;
